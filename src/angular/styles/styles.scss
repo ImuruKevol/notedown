@@ -1,0 +1,475 @@
+@font-face {
+    font-family: 'SUIT';
+    font-weight: 100;
+    src: local('SUIT Thin'), url('/assets/font/SUIT/SUIT-Thin.woff2') format('woff2');
+    crossorigin: anonymous;
+}
+
+@font-face {
+    font-family: 'SUIT';
+    font-weight: 200;
+    src: local('SUIT ExtraLight'), url('/assets/font/SUIT/SUIT-ExtraLight.woff2') format('woff2');
+    crossorigin: anonymous;
+}
+
+@font-face {
+    font-family: 'SUIT';
+    font-weight: 300;
+    src: local('SUIT Light'), url('/assets/font/SUIT/SUIT-Light.woff2') format('woff2');
+    crossorigin: anonymous;
+}
+
+@font-face {
+    font-family: 'SUIT';
+    font-weight: 400;
+    src: local('SUIT Regular'), url('/assets/font/SUIT/SUIT-Regular.woff2') format('woff2');
+    crossorigin: anonymous;
+}
+
+@font-face {
+    font-family: 'SUIT';
+    font-weight: 500;
+    src: local('SUIT Medium'), url('/assets/font/SUIT/SUIT-Medium.woff2') format('woff2');
+    crossorigin: anonymous;
+}
+
+@font-face {
+    font-family: 'SUIT';
+    font-weight: 600;
+    src: local('SUIT SemiBold'), url('/assets/font/SUIT/SUIT-SemiBold.woff2') format('woff2');
+    crossorigin: anonymous;
+}
+
+@font-face {
+    font-family: 'SUIT';
+    font-weight: 700;
+    src: local('SUIT Bold'), url('/assets/font/SUIT/SUIT-Bold.woff2') format('woff2');
+    crossorigin: anonymous;
+}
+
+@font-face {
+    font-family: 'SUIT';
+    font-weight: 800;
+    src: local('SUIT ExtraBold'), url('/assets/font/SUIT/SUIT-ExtraBold.woff2') format('woff2');
+    crossorigin: anonymous;
+}
+
+@font-face {
+    font-family: 'SUIT';
+    font-weight: 900;
+    src: local('SUIT Heavy'), url('/assets/font/SUIT/SUIT-Heavy.woff2') format('woff2');
+    crossorigin: anonymous;
+}
+
+html,
+body,
+app-root {
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    display: block;
+}
+
+body {
+    margin: 0;
+    font-family: SUIT, Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    background: #fbfbfa;
+    color: #1c1917;
+}
+
+html.dark,
+html.dark body,
+html.dark app-root {
+    background: #09090b;
+    color: #fafafa;
+}
+
+app-root {
+    overflow: auto;
+}
+
+a,
+button,
+select,
+input,
+textarea {
+    font: inherit;
+}
+
+a,
+button {
+    cursor: pointer;
+}
+
+.app-drag {
+    app-region: drag;
+    -webkit-app-region: drag;
+    user-select: none;
+    -webkit-user-select: none;
+}
+
+.app-no-drag,
+.app-drag a,
+.app-drag button,
+.app-drag input,
+.app-drag select,
+.app-drag textarea,
+.app-drag [role="button"],
+a,
+button,
+input,
+select,
+textarea,
+[role="button"],
+.monaco-editor {
+    app-region: no-drag;
+    -webkit-app-region: no-drag;
+}
+
+::selection {
+    background: #dbeafe;
+    color: #172554;
+}
+
+* {
+    scrollbar-width: thin;
+    scrollbar-color: #d6d3d1 transparent;
+}
+
+html.dark * {
+    scrollbar-color: #3f3f46 transparent;
+}
+
+.notedown-preview-flow {
+    display: flex;
+    flex-direction: column;
+    gap: 0.18rem;
+}
+
+.notedown-preview-markdown {
+    flex: 1 1 auto;
+    min-width: 0;
+    line-height: 1.5rem;
+}
+
+.notedown-preview-row,
+.notedown-preview-markdown :where(p, h1, h2, h3, h4, h5, h6, blockquote, li, hr, table, .notedown-task),
+.notedown-preview-code {
+    transition: background-color 120ms ease;
+}
+
+.notedown-preview-row {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.5rem;
+    min-height: 1.5rem;
+    border-radius: 0;
+    margin-left: -0.2rem;
+    margin-right: -0.2rem;
+    padding-left: 0.25rem;
+    padding-right: 0.25rem;
+}
+
+.notedown-preview-row.has-section-style {
+    overflow: hidden;
+}
+
+.notedown-preview-row.has-section-style + .notedown-preview-row.has-section-style {
+    margin-top: -0.18rem;
+}
+
+.notedown-preview-document.has-text-style .notedown-preview-markdown,
+.notedown-preview-document.has-text-style .notedown-preview-markdown :where(p, h1, h2, h3, h4, h5, h6, blockquote, li, th, td, a, strong, em, code, span, del, .notedown-task),
+.notedown-preview-row.has-text-style .notedown-preview-markdown,
+.notedown-preview-row.has-text-style .notedown-preview-markdown :where(p, h1, h2, h3, h4, h5, h6, blockquote, li, th, td, a, strong, em, code, span, del, .notedown-task) {
+    color: inherit !important;
+}
+
+.notedown-preview-line-number {
+    display: flex;
+    flex: 0 0 2rem;
+    flex-direction: column;
+    align-items: flex-end;
+    padding-top: 0;
+    color: #a8a29e;
+    font-family: SFMono-Regular, ui-monospace, Menlo, Monaco, Consolas, monospace;
+    font-size: 0.75rem;
+    font-variant-numeric: tabular-nums;
+    line-height: 1.5rem;
+    text-align: right;
+    user-select: none;
+    -webkit-user-select: none;
+}
+
+.notedown-preview-line-number > span {
+    display: block;
+    height: 1.5rem;
+    line-height: 1.5rem;
+}
+
+html.dark .notedown-preview-line-number {
+    color: #71717a;
+}
+
+.notedown-preview-row.has-section-style .notedown-preview-line-number {
+    color: inherit;
+    opacity: 0.55;
+}
+
+.notedown-preview-content {
+    flex: 1 1 auto;
+    min-width: 0;
+    min-height: 1.5rem;
+}
+
+.notedown-preview-row.cell-blank,
+.notedown-preview-row.cell-blank .notedown-preview-content {
+    min-height: 1.5rem;
+}
+
+.notedown-preview-row.cell-blank .notedown-preview-content::before {
+    content: "\00a0";
+    display: block;
+    height: 1.5rem;
+    line-height: 1.5rem;
+    visibility: hidden;
+}
+
+.notedown-preview-row:hover,
+.notedown-preview-row.is-synced-hover,
+.notedown-preview-markdown :where(p, h1, h2, h3, h4, h5, h6, blockquote, li, hr, table):hover,
+.notedown-preview-markdown .notedown-task:hover,
+.notedown-preview-code:hover {
+    background-color: rgba(120, 113, 108, 0.12);
+}
+
+html.dark .notedown-preview-row:hover,
+html.dark .notedown-preview-row.is-synced-hover,
+html.dark .notedown-preview-markdown :where(p, h1, h2, h3, h4, h5, h6, blockquote, li, hr, table):hover,
+html.dark .notedown-preview-markdown .notedown-task:hover,
+html.dark .notedown-preview-code:hover {
+    background-color: rgba(161, 161, 170, 0.16);
+}
+
+.notedown-preview-markdown :where(p, h1, h2, h3, h4, h5, h6, blockquote, li) {
+    border-radius: 0;
+    margin-left: -0.2rem;
+    margin-right: -0.2rem;
+    padding-left: 0.2rem;
+    padding-right: 0.2rem;
+}
+
+.notedown-preview-markdown :where(p, li) {
+    line-height: 1.5rem;
+}
+
+.notedown-preview-markdown :where(h1, h2, h3, h4, h5, h6) {
+    line-height: 1.28;
+}
+
+.notedown-preview-markdown h1 {
+    font-size: 1.5rem;
+}
+
+.notedown-preview-markdown h2 {
+    font-size: 1.2rem;
+}
+
+.notedown-preview-markdown h3 {
+    font-size: 1.05rem;
+}
+
+.notedown-preview-markdown > :first-child {
+    margin-top: 0;
+}
+
+.notedown-preview-markdown > :last-child {
+    margin-bottom: 0;
+}
+
+.notedown-preview-markdown p:has(.notedown-task) {
+    margin: 0;
+}
+
+.notedown-preview-markdown blockquote {
+    margin: 0;
+    padding: 0 0 0 0.85rem;
+    border-left: 3px solid #d6d3d1;
+    color: #57534e;
+    font-style: normal;
+    quotes: none;
+}
+
+.notedown-preview-markdown blockquote p {
+    margin: 0;
+}
+
+.notedown-preview-markdown blockquote p::before,
+.notedown-preview-markdown blockquote p::after {
+    content: none !important;
+}
+
+html.dark .notedown-preview-markdown blockquote {
+    border-left-color: #52525b;
+    color: #d4d4d8;
+}
+
+.notedown-preview-row.is-quote + .notedown-preview-row.is-quote {
+    margin-top: -0.18rem;
+}
+
+.notedown-preview-row.is-quote,
+.notedown-preview-row.is-quote .notedown-preview-markdown :where(blockquote, p) {
+    border-radius: 0;
+}
+
+.notedown-preview-row.is-quote:not(.is-quote-start) .notedown-preview-markdown blockquote {
+    padding-top: 0;
+}
+
+.notedown-preview-row.is-quote:not(.is-quote-end) .notedown-preview-markdown blockquote {
+    padding-bottom: 0;
+}
+
+.notedown-preview-row.is-divider {
+    align-items: center;
+}
+
+.notedown-preview-row.is-divider .notedown-preview-content,
+.notedown-preview-row.is-divider .notedown-preview-markdown {
+    display: flex;
+    align-items: center;
+    min-height: 1.5rem;
+}
+
+.notedown-preview-row.is-divider .notedown-preview-markdown {
+    width: 100%;
+}
+
+.notedown-preview-row.is-divider .notedown-preview-markdown hr {
+    flex: 1 1 auto;
+    width: 100%;
+    margin: 0;
+    border: 0;
+    border-top: 1px solid #e7e5e4;
+}
+
+html.dark .notedown-preview-row.is-divider .notedown-preview-markdown hr {
+    border-top-color: #3f3f46;
+}
+
+.notedown-preview-row.is-table {
+    margin-top: 0.05rem;
+    margin-bottom: 0.15rem;
+}
+
+.notedown-preview-markdown table {
+    width: 100%;
+    margin: 0;
+    border-collapse: collapse;
+    font-size: 0.92rem;
+    line-height: 1.45;
+}
+
+.notedown-preview-markdown th,
+.notedown-preview-markdown td {
+    border: 1px solid #e7e5e4;
+    padding: 0.42rem 0.55rem;
+    text-align: left;
+    vertical-align: top;
+}
+
+.notedown-preview-markdown th {
+    background: #f5f5f4;
+    color: #292524;
+    font-weight: 600;
+}
+
+html.dark .notedown-preview-markdown th,
+html.dark .notedown-preview-markdown td {
+    border-color: #3f3f46;
+}
+
+html.dark .notedown-preview-markdown th {
+    background: #18181b;
+    color: #f4f4f5;
+}
+
+.notedown-preview-markdown .notedown-task {
+    display: flex;
+    align-items: center;
+    gap: 0.55rem;
+    min-height: 1.5rem;
+    margin: 0;
+    padding: 0;
+    border-radius: 0;
+    cursor: pointer;
+    color: inherit;
+    line-height: 1.5rem;
+    user-select: none;
+    -webkit-user-select: none;
+}
+
+.notedown-preview-markdown .notedown-task input {
+    flex: 0 0 auto;
+    margin: 0;
+    width: 1rem;
+    height: 1rem;
+    accent-color: #2563eb;
+    cursor: pointer;
+}
+
+.notedown-preview-markdown .notedown-task span {
+    transition: color 120ms ease, text-decoration-color 120ms ease;
+}
+
+.notedown-preview-markdown .notedown-task.is-checked span {
+    color: #a8a29e;
+    text-decoration: line-through;
+    text-decoration-thickness: 1px;
+    text-decoration-color: currentColor;
+}
+
+html.dark .notedown-preview-markdown .notedown-task.is-checked span {
+    color: #71717a;
+}
+
+.notedown-preview-markdown a {
+    cursor: pointer;
+}
+
+.notedown-preview-markdown code {
+    color: inherit;
+}
+
+.notedown-preview-code {
+    overflow: visible;
+    border: 1px solid #e7e5e4;
+    border-radius: 0;
+    background: #fafaf9;
+    margin: 0.05rem 0 0.15rem;
+}
+
+html.dark .notedown-preview-code {
+    border-color: #27272a;
+    background: #18181b;
+}
+
+.monaco-editor .margin-view-overlays .cldr,
+.monaco-editor .margin-view-overlays [class*="codicon-folding-"],
+.monaco-editor .sticky-line-number [class*="codicon-folding-"],
+.monaco-editor .inline-folded {
+    cursor: pointer !important;
+}
+
+.monaco-editor .notedown-editor-line-hover,
+.monaco-editor .notedown-editor-line-hover-gutter,
+.monaco-editor .notedown-editor-line-hover-margin {
+    background-color: rgba(120, 113, 108, 0.12) !important;
+}
+
+html.dark .monaco-editor .notedown-editor-line-hover,
+html.dark .monaco-editor .notedown-editor-line-hover-gutter,
+html.dark .monaco-editor .notedown-editor-line-hover-margin {
+    background-color: rgba(161, 161, 170, 0.16) !important;
+}

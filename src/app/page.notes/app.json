@@ -1,0 +1,12 @@
+{
+    "id": "page.notes",
+    "mode": "page",
+    "title": "Notes",
+    "namespace": "notes",
+    "category": "workspace",
+    "viewuri": "/notes",
+    "preview": "",
+    "controller": "base",
+    "layout": "layout.sidebar",
+    "template": "wiz-page-notes()"
+}

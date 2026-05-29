@@ -1,0 +1,476 @@
+import { HostListener, OnDestroy, OnInit } from '@angular/core';
+
+type SortField = 'createdAt' | 'updatedAt' | 'title';
+type SortDirection = 'asc' | 'desc';
+
+interface NoteItem {
+    id: string;
+    icon: string;
+    title: string;
+    body: string;
+    tags: string[];
+    createdAt: string;
+    createdAtMs: number;
+    updatedAt: string;
+    updatedAtMs: number;
+    status: 'draft' | 'active' | 'archived';
+    folder?: string;
+    workspaceName?: string;
+    fileName?: string;
+    relativePath?: string;
+}
+
+interface FolderItem {
+    id: string;
+    label: string;
+}
+
+interface SortOption {
+    value: string;
+    label: string;
+}
+
+export class Component implements OnInit, OnDestroy {
+    private storageKey = 'notedown.notes.v1';
+    private activeNoteKey = 'notedown.activeNoteId.v1';
+    private settingsKey = 'notedown.settings.v1';
+
+    public query = '';
+    public searchOpen = false;
+    public sortOpen = false;
+    public activeFolder = 'all';
+    public activeNoteId = '';
+    public workspaceOpen = false;
+    public sortField: SortField = 'updatedAt';
+    public sortDirection: SortDirection = 'desc';
+    public sortOptions: SortOption[] = [
+        { value: 'updatedAt:desc', label: '수정일 최신순' },
+        { value: 'updatedAt:asc', label: '수정일 오래된순' },
+        { value: 'createdAt:desc', label: '생성일 최신순' },
+        { value: 'createdAt:asc', label: '생성일 오래된순' },
+        { value: 'title:asc', label: '제목 오름차순' },
+        { value: 'title:desc', label: '제목 내림차순' }
+    ];
+    public folders: FolderItem[] = [{ id: 'all', label: '모든 노트' }];
+    public notes: NoteItem[] = [];
+
+    private handleNotesChanged = () => { void this.loadNotes(); };
+
+    public ngOnInit() {
+        void this.loadNotes();
+        window.addEventListener('notedown:notes-changed', this.handleNotesChanged);
+    }
+
+    public ngOnDestroy() {
+        this.emitWorkspaceState(false);
+        window.removeEventListener('notedown:notes-changed', this.handleNotesChanged);
+    }
+
+    public get activeFolderLabel() {
+        return this.folders.find(folder => folder.id === this.activeFolder)?.label || '노트';
+    }
+
+    public get sortValue() {
+        return `${this.sortField}:${this.sortDirection}`;
+    }
+
+    public get currentSortLabel() {
+        return this.sortOptions.find(option => option.value === this.sortValue)?.label || '정렬';
+    }
+
+    public get visibleNotes() {
+        let list = this.notes;
+        if (this.activeFolder !== 'all') {
+            list = list.filter(note => (note.folder || 'memo') === this.activeFolder);
+        }
+
+        const keyword = this.query.trim().toLowerCase();
+        if (keyword) {
+            list = list.filter(note => {
+                return note.title.toLowerCase().includes(keyword)
+                    || note.body.toLowerCase().includes(keyword)
+                    || note.tags.join(' ').toLowerCase().includes(keyword);
+            });
+        }
+
+        return this.sortNotes(list);
+    }
+
+    public folderCount(folder: string) {
+        if (folder === 'all') return this.notes.length;
+        return this.notes.filter(note => (note.folder || 'memo') === folder).length;
+    }
+
+    public selectFolder(folder: string) {
+        this.activeFolder = folder;
+        this.closeWorkspace();
+        const first = this.visibleNotes[0];
+        if (first) this.selectNote(first.id);
+    }
+
+    public selectNote(id: string) {
+        this.activeNoteId = id;
+        localStorage.setItem(this.activeNoteKey, id);
+        window.dispatchEvent(new CustomEvent('notedown:select-note', { detail: id }));
+    }
+
+    public async createNote() {
+        const now = Date.now();
+        const note: NoteItem = {
+            id: `note-${now}`,
+            icon: 'N',
+            title: '새 노트',
+            body: '# 새 노트\n\n',
+            tags: ['draft'],
+            status: 'draft',
+            folder: this.activeFolder === 'all' ? 'memo' : this.activeFolder,
+            workspaceName: this.activeFolder === 'all' ? '메모' : this.activeFolderLabel,
+            createdAt: this.nowLabel(new Date(now)),
+            createdAtMs: now,
+            updatedAt: this.nowLabel(new Date(now)),
+            updatedAtMs: now
+        };
+        this.notes = [note, ...this.notes];
+        this.syncFolders();
+        await this.persistNotes();
+        window.dispatchEvent(new CustomEvent('notedown:notes-changed'));
+        this.selectNote(note.id);
+    }
+
+    public async deleteNote(id: string, event?: Event) {
+        if (event) event.stopPropagation();
+
+        const index = this.notes.findIndex(note => note.id === id);
+        if (index < 0) return;
+
+        const note = this.notes[index];
+        if (this.hasMeaningfulBody(note)) {
+            const confirmed = window.confirm(`'${note.title || '제목 없음'}' 문서를 삭제할까요?`);
+            if (!confirmed) return;
+        }
+
+        const wasActive = this.activeNoteId === id;
+        this.notes = this.notes.filter(item => item.id !== id);
+        this.syncFolders();
+        await this.persistNotes();
+
+        if (!wasActive) {
+            window.dispatchEvent(new CustomEvent('notedown:notes-changed'));
+            return;
+        }
+
+        const nextNote = this.visibleNotes[0] || this.notes[0];
+        this.activeNoteId = nextNote?.id || '';
+
+        if (this.activeNoteId) {
+            localStorage.setItem(this.activeNoteKey, this.activeNoteId);
+        } else {
+            localStorage.removeItem(this.activeNoteKey);
+        }
+
+        window.dispatchEvent(new CustomEvent('notedown:notes-changed'));
+        if (nextNote) {
+            window.dispatchEvent(new CustomEvent('notedown:select-note', { detail: nextNote.id }));
+        }
+    }
+
+    public toggleWorkspace(event?: Event) {
+        if (event) event.stopPropagation();
+        this.workspaceOpen = !this.workspaceOpen;
+        this.emitWorkspaceState(this.workspaceOpen);
+    }
+
+    public closeWorkspace() {
+        if (!this.workspaceOpen) return;
+        this.workspaceOpen = false;
+        this.emitWorkspaceState(false);
+    }
+
+    public toggleSearch() {
+        this.sortOpen = false;
+        this.searchOpen = !this.searchOpen;
+        if (!this.searchOpen) this.query = '';
+    }
+
+    public toggleSort(event?: Event) {
+        if (event) event.stopPropagation();
+        this.sortOpen = !this.sortOpen;
+    }
+
+    public selectSort(value: string) {
+        this.setSortValue(value);
+        this.sortOpen = false;
+    }
+
+    public setSortValue(value: string) {
+        const [field, direction] = value.split(':') as [SortField, SortDirection];
+        if (!['createdAt', 'updatedAt', 'title'].includes(field)) return;
+        if (!['asc', 'desc'].includes(direction)) return;
+        this.sortField = field;
+        this.sortDirection = direction;
+    }
+
+    public noteSummary(note: NoteItem) {
+        return note.body
+            .split('\n')
+            .map(line => line.replace(/^#+\s*/, '').trim())
+            .filter(line => line && line !== note.title)[0] || 'Markdown 노트';
+    }
+
+    public taskProgress(note: NoteItem) {
+        const stats = this.taskStats(note);
+        if (stats.total === 0) return null;
+        return Math.round((stats.done / stats.total) * 100);
+    }
+
+    public workspacePanelClass() {
+        return 'flex h-full w-[236px] shrink-0 flex-col border-r border-stone-300/70 bg-[#e8e6e1] px-3 pb-3 pt-14 transition-[width,opacity] duration-200 dark:border-zinc-800 dark:bg-zinc-900';
+    }
+
+    public folderButtonClass(folder: string) {
+        const base = 'flex h-9 w-full items-center gap-2 rounded-md px-3 text-left text-[13px] font-medium transition-colors';
+        if (this.activeFolder === folder) return `${base} bg-white/80 text-stone-950 shadow-sm dark:bg-zinc-800 dark:text-zinc-50`;
+        return `${base} text-stone-600 hover:bg-white/55 hover:text-stone-950 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:text-zinc-50`;
+    }
+
+    public noteRowClass(id: string) {
+        const base = 'group flex h-8 items-center rounded-md transition-colors';
+        if (this.activeNoteId === id) return `${base} bg-[#ffe99a] text-stone-950 shadow-sm dark:bg-amber-400/85 dark:text-zinc-950`;
+        return `${base} text-stone-700 hover:bg-white/70 dark:text-zinc-300 dark:hover:bg-zinc-800`;
+    }
+
+    public noteTitleButtonClass(id: string) {
+        return 'min-w-0 flex-1 truncate px-2.5 text-left text-[13px] font-medium leading-8';
+    }
+
+    public deleteButtonClass(id: string) {
+        const base = 'mr-1 flex size-6 shrink-0 items-center justify-center rounded-md opacity-0 transition group-hover:opacity-100 focus:opacity-100';
+        if (this.activeNoteId === id) return `${base} text-stone-700 hover:bg-amber-200/70 hover:text-stone-950 dark:text-zinc-950 dark:hover:bg-amber-300/50`;
+        return `${base} text-stone-400 hover:bg-stone-200/80 hover:text-stone-900 dark:text-zinc-500 dark:hover:bg-zinc-700 dark:hover:text-zinc-100`;
+    }
+
+    public searchButtonClass() {
+        const base = 'flex size-9 shrink-0 items-center justify-center rounded-md transition';
+        if (this.searchOpen) return `${base} bg-stone-900 text-white dark:bg-zinc-100 dark:text-zinc-950`;
+        return `${base} text-stone-500 hover:bg-stone-200/70 hover:text-stone-950 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:text-zinc-50`;
+    }
+
+    public sortButtonClass() {
+        const base = 'flex size-9 shrink-0 items-center justify-center rounded-md transition';
+        if (this.sortOpen) return `${base} bg-stone-900 text-white dark:bg-zinc-100 dark:text-zinc-950`;
+        return `${base} text-stone-500 hover:bg-stone-200/70 hover:text-stone-950 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:text-zinc-50`;
+    }
+
+    public sortOptionClass(value: string) {
+        const base = 'flex h-8 w-full items-center justify-between rounded-md px-2.5 text-left text-[12px] font-medium transition-colors';
+        if (this.sortValue === value) return `${base} bg-stone-900 text-white dark:bg-zinc-100 dark:text-zinc-950`;
+        return `${base} text-stone-600 hover:bg-stone-100 hover:text-stone-950 dark:text-zinc-300 dark:hover:bg-zinc-800 dark:hover:text-zinc-50`;
+    }
+
+    @HostListener('document:keydown.escape')
+    public closeOnEscape() {
+        this.closeWorkspace();
+        this.sortOpen = false;
+        if (this.searchOpen && !this.query) this.searchOpen = false;
+    }
+
+    @HostListener('document:click')
+    public closeFloatingMenus() {
+        this.sortOpen = false;
+    }
+
+    private async loadNotes() {
+        const fallback = this.defaultNotes();
+        const fileNotes = await this.loadFileNotes();
+        if (fileNotes) {
+            this.notes = fileNotes;
+            this.syncFolders();
+            this.syncActiveNote();
+            return;
+        }
+
+        try {
+            const stored = localStorage.getItem(this.storageKey);
+            this.notes = stored ? JSON.parse(stored) : fallback;
+            if (!Array.isArray(this.notes) || this.notes.length === 0) this.notes = [];
+            this.notes = this.notes.map((note, index) => this.normalizeNote(note, index));
+            if (!stored) localStorage.setItem(this.storageKey, JSON.stringify(this.notes));
+        } catch (error) {
+            this.notes = fallback;
+            localStorage.setItem(this.storageKey, JSON.stringify(this.notes));
+        }
+
+        this.syncFolders();
+        this.syncActiveNote();
+    }
+
+    private syncActiveNote() {
+        this.activeNoteId = localStorage.getItem(this.activeNoteKey) || this.notes[0]?.id || '';
+        if (this.activeNoteId && this.notes.find(note => note.id === this.activeNoteId) == null) {
+            this.activeNoteId = this.notes[0]?.id || '';
+        }
+        if (this.activeNoteId) localStorage.setItem(this.activeNoteKey, this.activeNoteId);
+    }
+
+    private syncFolders() {
+        const folders = new Map<string, string>();
+        folders.set('all', '모든 노트');
+
+        for (const note of this.notes) {
+            const folder = note.folder || 'memo';
+            folders.set(folder, note.workspaceName || this.defaultFolderLabel(folder));
+        }
+
+        this.folders = Array.from(folders.entries()).map(([id, label]) => ({ id, label }));
+        if (!this.folders.some(folder => folder.id === this.activeFolder)) this.activeFolder = 'all';
+    }
+
+    private defaultFolderLabel(folder: string) {
+        if (folder === 'memo') return '메모';
+        if (folder === 'blog') return '블로그';
+        if (folder === 'project') return '프로젝트';
+        if (folder === 'unfiled') return '미지정 워크스페이스';
+        if (folder === '_imported') return '가져온 문서';
+        return folder;
+    }
+
+    private async persistNotes() {
+        localStorage.setItem(this.storageKey, JSON.stringify(this.notes));
+        const api = (window as any).notedown?.storage;
+        const storagePath = this.storagePath();
+        if (!api?.saveNotes || !storagePath) return;
+
+        try {
+            await api.saveNotes({ storagePath, notes: this.notes });
+        } catch (error) {
+            // Keep localStorage as fallback when file persistence is unavailable.
+        }
+    }
+
+    private async loadFileNotes() {
+        const api = (window as any).notedown?.storage;
+        const storagePath = this.storagePath();
+        if (!api?.loadNotes || !storagePath) return null;
+
+        try {
+            const result = await api.loadNotes({ storagePath });
+            if (!result?.ok || !Array.isArray(result.notes)) return null;
+            if (result.notes.length === 0 && localStorage.getItem(this.storageKey)) return null;
+            const notes = result.notes.map((note: any, index: number) => this.normalizeNote(note, index));
+            localStorage.setItem(this.storageKey, JSON.stringify(notes));
+            return notes;
+        } catch (error) {
+            return null;
+        }
+    }
+
+    private storagePath() {
+        try {
+            const settings = JSON.parse(localStorage.getItem(this.settingsKey) || '{}');
+            return settings.storagePath || '';
+        } catch (error) {
+            return '';
+        }
+    }
+
+    private defaultNotes(): NoteItem[] {
+        const now = Date.now();
+        return [
+            {
+                id: 'today-note',
+                icon: 'N',
+                title: '오늘의 노트',
+                tags: ['daily', 'local'],
+                status: 'active',
+                folder: 'memo',
+                createdAt: this.nowLabel(new Date(now - 600000)),
+                createdAtMs: now - 600000,
+                updatedAt: this.nowLabel(new Date(now - 120000)),
+                updatedAtMs: now - 120000,
+                body: '# 오늘의 노트\n\n- [ ] Electron 앱 셸 정리\n- [ ] 로컬 저장소 구조 설계\n- [ ] Markdown 편집 경험 다듬기\n\n## 메모\n\nNotion처럼 가볍게 열고, Markdown으로 빠르게 남기는 흐름을 기준으로 잡는다.'
+            },
+            {
+                id: 'product-scope',
+                icon: 'P',
+                title: '제품 범위',
+                tags: ['planning'],
+                status: 'draft',
+                folder: 'project',
+                createdAt: this.nowLabel(new Date(now - 360000)),
+                createdAtMs: now - 360000,
+                updatedAt: this.nowLabel(new Date(now - 180000)),
+                updatedAtMs: now - 180000,
+                body: '# 제품 범위\n\n## 화면\n\n- 노트\n- 설정\n\n## 저장\n\n로컬 우선 저장을 기본값으로 둔다.'
+            }
+        ];
+    }
+
+    private normalizeNote(note: any, index = 0): NoteItem {
+        const fallbackTime = Date.now() - (index * 60000);
+        const updatedAtMs = Number.isFinite(note?.updatedAtMs) ? Number(note.updatedAtMs) : fallbackTime;
+        const createdAtMs = Number.isFinite(note?.createdAtMs) ? Number(note.createdAtMs) : updatedAtMs;
+
+        return {
+            id: note?.id || `note-${fallbackTime}`,
+            icon: note?.icon || 'N',
+            title: note?.title || '제목 없음',
+            body: typeof note?.body === 'string' ? note.body : '',
+            tags: Array.isArray(note?.tags) ? note.tags : [],
+            status: note?.status || 'draft',
+            folder: note?.folder || 'memo',
+            workspaceName: note?.workspaceName,
+            fileName: note?.fileName,
+            relativePath: note?.relativePath,
+            createdAt: note?.createdAt || this.nowLabel(new Date(createdAtMs)),
+            createdAtMs,
+            updatedAt: note?.updatedAt || this.nowLabel(new Date(updatedAtMs)),
+            updatedAtMs
+        };
+    }
+
+    private sortNotes(notes: NoteItem[]) {
+        const direction = this.sortDirection === 'asc' ? 1 : -1;
+        return [...notes].sort((left, right) => {
+            if (this.sortField === 'title') {
+                return direction * left.title.localeCompare(right.title, 'ko-KR', { numeric: true, sensitivity: 'base' });
+            }
+
+            const leftTime = this.sortField === 'createdAt' ? left.createdAtMs : left.updatedAtMs;
+            const rightTime = this.sortField === 'createdAt' ? right.createdAtMs : right.updatedAtMs;
+            return direction * ((leftTime || 0) - (rightTime || 0));
+        });
+    }
+
+    private taskStats(note: NoteItem) {
+        return (note.body || '').split('\n').reduce((stats, line) => {
+            const task = /^\s*[-*]\s+\[([ xX])\]\s+/.exec(line);
+            if (!task) return stats;
+
+            stats.total += 1;
+            if (task[1].toLowerCase() === 'x') stats.done += 1;
+            return stats;
+        }, { total: 0, done: 0 });
+    }
+
+    private hasMeaningfulBody(note: NoteItem) {
+        const title = (note.title || '').trim();
+        return (note.body || '')
+            .split('\n')
+            .map(line => line.replace(/^#+\s*/, '').trim())
+            .some(line => line && line !== title);
+    }
+
+    private emitWorkspaceState(open: boolean) {
+        window.dispatchEvent(new CustomEvent('notedown:workspace-panel', { detail: open }));
+    }
+
+    private nowLabel(date = new Date()) {
+        return new Intl.DateTimeFormat('ko-KR', {
+            month: '2-digit',
+            day: '2-digit',
+            hour: '2-digit',
+            minute: '2-digit',
+            second: '2-digit'
+        }).format(date);
+    }
+}

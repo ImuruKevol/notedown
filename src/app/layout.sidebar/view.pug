@@ -1,0 +1,20 @@
+div(class="h-screen overflow-hidden bg-white text-stone-950 dark:bg-zinc-950 dark:text-zinc-50")
+    div(*ngIf="!isSettingsRoute", class="app-drag flex h-12 items-center justify-between border-b border-stone-200 bg-[#fbfbfa]/95 px-3 backdrop-blur lg:hidden dark:border-zinc-800 dark:bg-zinc-950/95")
+        button(type="button", title="Open sidebar", class="flex size-9 items-center justify-center rounded-md text-stone-600 hover:bg-stone-200/70 hover:text-stone-950 dark:text-zinc-300 dark:hover:bg-zinc-800", (click)="toggleSidebar($event)")
+            svg(xmlns="http://www.w3.org/2000/svg", viewBox="0 0 24 24", fill="none", stroke="currentColor", stroke-width="1.8", stroke-linecap="round", stroke-linejoin="round", class="size-5")
+                rect(x="3", y="4", width="18", height="16", rx="2")
+                path(d="M9 4v16")
+        img(src="assets/brand/logo-black.svg", alt="Notedown", class="h-6 w-auto dark:hidden")
+        img(src="assets/brand/logo-white.svg", alt="Notedown", class="hidden h-6 w-auto dark:block")
+        span(class="size-9")
+
+    div(*ngIf="mobileOpen && !isSettingsRoute", class="fixed inset-0 z-50 lg:hidden")
+        button(type="button", title="Close sidebar", class="absolute inset-0 bg-stone-950/30 backdrop-blur-sm", (click)="closeSidebar()")
+        aside([class]="mobileSidebarClass()")
+            wiz-component-nav-sidebar(class="block h-full min-h-0")
+
+    aside(*ngIf="!isSettingsRoute", [class]="desktopSidebarClass()")
+        wiz-component-nav-sidebar(class="block h-full min-h-0")
+
+    main([class]="mainClass()")
+        router-outlet

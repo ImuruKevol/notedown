@@ -1,0 +1,7 @@
+<svg width="158" height="32" viewBox="0 0 158 32" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <rect x="1" y="1" width="30" height="30" rx="8" fill="#FAFAF9"/>
+  <path d="M10 9.5C10 8.67157 10.6716 8 11.5 8H18.25L23 12.75V22.5C23 23.3284 22.3284 24 21.5 24H11.5C10.6716 24 10 23.3284 10 22.5V9.5Z" fill="#18181B"/>
+  <path d="M18 8V13H23" fill="#3F3F46"/>
+  <path d="M13 16H20M13 19H18" stroke="#FAFAF9" stroke-width="1.4" stroke-linecap="round"/>
+  <text x="40" y="21.8" fill="#FAFAF9" font-family="SUIT, Inter, Arial, sans-serif" font-size="18" font-weight="800" letter-spacing="0">Notedown</text>
+</svg>

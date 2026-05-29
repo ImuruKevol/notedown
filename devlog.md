@@ -1,0 +1,49 @@
+| 날짜 | ID | 작업 내용 | 상세 |
+|------|-----|----------|------|
+| 2026-02-21 | 001 | 기존 인프라 page 앱 전체 삭제 및 일반 서비스 샘플 page 앱 생성 | [상세](devlog/2026-02-21/001-sample-pages-rebuild.md) |
+| 2026-04-27 | 001 | Tailwind CSS v4 및 Angular PostCSS 빌드 경로로 전환 | [상세](devlog/2026-04-27/001-tailwind-v4-postcss-migration.md) |
+| 2026-04-27 | 002 | Tailwind CSS를 항상 minify 산출물로 생성하도록 빌드 경로 조정 | [상세](devlog/2026-04-27/002-tailwind-always-minify.md) |
+| 2026-04-27 | 003 | Angular 21 업그레이드 및 zoneless/fetch 전환 | [상세](devlog/2026-04-27/003-angular-21-zoneless-fetch.md) |
+| 2026-04-27 | 004 | Material/CDK 의존성 제거 및 signal 샘플 추가 | [상세](devlog/2026-04-27/004-remove-material-cdk-add-signals.md) |
+| 2026-04-27 | 005 | Angular 21 및 WIZ 변경 요약 문서 추가 | [상세](devlog/2026-04-27/005-angular-21-upgrade-docs.md) |
+| 2026-04-27 | 006 | Angular 21 런타임 부트스트랩 및 라우팅 렌더링 복구 | [상세](devlog/2026-04-27/006-angular-21-runtime-bootstrap-fix.md) |
+| 2026-04-27 | 007 | Dashboard 사이드바 직접 렌더링으로 빈 네비게이션 복구 | [상세](devlog/2026-04-27/007-dashboard-sidebar-inline-render.md) |
+| 2026-04-27 | 008 | Angular 21 중첩 WIZ 컴포넌트 렌더링 복구 | [상세](devlog/2026-04-27/008-angular-21-nested-component-scope-fix.md) |
+| 2026-04-27 | 009 | 글 작성 화면 Monaco/i18n/dark mode 샘플 의존성 명시화 | [상세](devlog/2026-04-27/009-monaco-i18n-darkmode-sample.md) |
+| 2026-04-28 | 001 | Navbar 전역 다국어·다크 모드 및 app.module 의존성 스코프 정리 | [상세](devlog/2026-04-28/001-global-navbar-i18n-theme.md) |
+| 2026-04-28 | 002 | Angular 21 WIZ 컴포넌트 NgModule 스코프 복원 | [상세](devlog/2026-04-28/002-angular21-ngmodule-scope.md) |
+| 2026-04-28 | 003 | Tailwind dark variant 기반 테마 적용 단순화 | [상세](devlog/2026-04-28/003-tailwind-dark-theme-simplification.md) |
+| 2026-05-27 | 001 | Notedown Electron 로컬 노트 앱 스켈레톤 구성 | [상세](devlog/2026-05-27/001-notedown-electron-skeleton.md) |
+| 2026-05-27 | 002 | Electron 로고 에셋 복구 및 macOS 메모형 2단 노트 레이아웃 개선 | [상세](devlog/2026-05-27/002-electron-sidebar-monaco-layout.md) |
+| 2026-05-27 | 003 | 숨김 워크스페이스 패널 및 설정 전체폭 레이아웃 개선 | [상세](devlog/2026-05-27/003-hidden-workspace-settings-layout.md) |
+| 2026-05-27 | 004 | 설정 타이틀바 안전 여백 및 노트 목록 압축 레이아웃 적용 | [상세](devlog/2026-05-27/004-settings-titlebar-compact-note-list.md) |
+| 2026-05-27 | 005 | Electron 드래그 영역 및 노트 삭제 액션 추가 | [상세](devlog/2026-05-27/005-electron-drag-note-delete.md) |
+| 2026-05-27 | 006 | 슬래시 자동완성·미리보기 상호작용·에디터 헤더 정리 | [상세](devlog/2026-05-27/006-slash-preview-editor-settings-polish.md) |
+| 2026-05-27 | 007 | 영어 슬래시 메뉴·체크리스트 달성률·사이드바 정렬/검색 개선 | [상세](devlog/2026-05-27/007-sidebar-sort-search-progress.md) |
+| 2026-05-28 | 001 | 사이드바 정렬 메뉴 및 preview 체크리스트/코드블럭 스타일 정리 | [상세](devlog/2026-05-28/001-sidebar-preview-style-polish.md) |
+| 2026-05-28 | 002 | Notedown 프로젝트 현 상태 점검 | [상세](devlog/2026-05-28/002-project-state-audit.md) |
+| 2026-05-28 | 003 | Preview 및 Monaco editor 행 hover 효과 추가 | [상세](devlog/2026-05-28/003-preview-editor-row-hover.md) |
+| 2026-05-28 | 004 | Preview hover 동기화 보강 및 파일 기반 저장소 화면 구현 | [상세](devlog/2026-05-28/004-file-storage-preview-hover-sync.md) |
+| 2026-05-28 | 005 | 선택 노트 없음 상태 화면 및 저장 가드 추가 | [상세](devlog/2026-05-28/005-no-selected-note-empty-state.md) |
+| 2026-05-28 | 006 | Editor와 Preview 여백 축소 및 Preview 라인번호 추가 | [상세](devlog/2026-05-28/006-editor-preview-spacing-line-numbers.md) |
+| 2026-05-28 | 007 | Preview 라인번호와 렌더링 간격 재정리 | [상세](devlog/2026-05-28/007-preview-line-number-layout-polish.md) |
+| 2026-05-28 | 008 | Preview 빈 줄 포함 1:1 라인번호 매핑 복구 | [상세](devlog/2026-05-28/008-preview-blank-line-one-to-one.md) |
+| 2026-05-28 | 009 | 노트 헤더 저장 시각·PDF 저장 액션 개선 | [상세](devlog/2026-05-28/009-note-header-save-pdf.md) |
+| 2026-05-28 | 010 | Preview quote/table 렌더링 및 PDF 출력 스타일 개선 | [상세](devlog/2026-05-28/010-preview-pdf-rendering-polish.md) |
+| 2026-05-28 | 011 | Quote row radius 제거 및 생성일시 표시 추가 | [상세](devlog/2026-05-28/011-quote-radius-created-at.md) |
+| 2026-05-28 | 012 | 문서 내부 글로벌/구역별 스타일 지시문 추가 | [상세](devlog/2026-05-28/012-document-style-directives.md) |
+| 2026-05-28 | 013 | Divider 기준 스타일 블럭 문법으로 재정리 | [상세](devlog/2026-05-28/013-divider-style-blocks.md) |
+| 2026-05-28 | 014 | 문서 스타일 color 우선순위 보강 | [상세](devlog/2026-05-28/014-style-color-priority.md) |
+| 2026-05-28 | 015 | SCSS형 문서 스타일과 셀 타입 선택자 지원 | [상세](devlog/2026-05-28/015-scss-style-cell-selectors.md) |
+| 2026-05-29 | 001 | 문서 셀 기본 radius 제거 | [상세](devlog/2026-05-29/001-remove-default-cell-radius.md) |
+| 2026-05-29 | 002 | Divider 셀 세로 중앙 정렬 | [상세](devlog/2026-05-29/002-divider-cell-vertical-align.md) |
+| 2026-05-29 | 003 | 설정 화면 사이드바 카드 제거 및 메뉴 통합 | [상세](devlog/2026-05-29/003-settings-sidebar-cleanup.md) |
+| 2026-05-29 | 004 | 설정 항목 정리 및 탭 크기 적용 연결 | [상세](devlog/2026-05-29/004-settings-tab-size-storage-picker.md) |
+| 2026-05-29 | 005 | 저장소 작업 버튼 UX 및 상태 표시 보강 | [상세](devlog/2026-05-29/005-storage-action-feedback.md) |
+| 2026-05-29 | 006 | 저장소 작업 렌더 갱신 및 깊은 문서 가져오기 기본 활성화 | [상세](devlog/2026-05-29/006-storage-render-deep-import-default.md) |
+| 2026-05-29 | 007 | Preview 및 PDF 빈 행 보존 | [상세](devlog/2026-05-29/007-preview-pdf-blank-lines.md) |
+| 2026-05-29 | 008 | 문서 제목 인라인 편집 버튼 방식으로 개선 | [상세](devlog/2026-05-29/008-note-title-edit-button.md) |
+| 2026-05-29 | 009 | 라인번호 기본 비활성화 및 스타일/스크립트 접기 지원 | [상세](devlog/2026-05-29/009-line-number-default-folding.md) |
+| 2026-05-29 | 010 | 실제 본문 편집 시에만 자동 저장되도록 노트 저장 이벤트 개선 | [상세](devlog/2026-05-29/010-autosave-actual-edit-only.md) |
+| 2026-05-29 | 011 | Monaco 접기 아이콘 pointer cursor 적용 | [상세](devlog/2026-05-29/011-folding-icon-pointer-cursor.md) |
+| 2026-05-29 | 012 | Style 블럭 자동 접힘 및 접기 cursor 보강 | [상세](devlog/2026-05-29/012-style-auto-fold-cursor-fix.md) |

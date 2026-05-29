@@ -1,0 +1,99 @@
+section(class="flex h-full min-h-0 flex-col bg-[#fbfbfa] text-stone-950 dark:bg-zinc-950 dark:text-zinc-50")
+    header(class="app-drag flex h-[64px] shrink-0 items-center justify-between border-b border-stone-200 bg-white/90 pl-[88px] pr-4 backdrop-blur dark:border-zinc-800 dark:bg-zinc-950/90")
+        div(class="flex min-w-0 items-center gap-3")
+            a(routerLink="/notes", title="Back to notes", class="flex size-9 shrink-0 items-center justify-center rounded-md text-stone-500 transition hover:bg-stone-100 hover:text-stone-950 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:text-zinc-50")
+                svg(xmlns="http://www.w3.org/2000/svg", viewBox="0 0 24 24", fill="none", stroke="currentColor", stroke-width="1.8", stroke-linecap="round", stroke-linejoin="round", class="size-4")
+                    path(d="m15 18-6-6 6-6")
+            div(class="min-w-0")
+                h1(class="truncate text-[17px] font-semibold text-stone-900 dark:text-zinc-100") 설정
+                p(class="text-[12px] text-stone-400 dark:text-zinc-500") {{settings.workspaceName}}
+        div(class="flex items-center gap-2")
+            span(class="hidden text-[12px] text-stone-400 sm:inline dark:text-zinc-500") {{savedAt}}
+            button(type="button", title="Reset", class="flex size-9 items-center justify-center rounded-md border border-stone-200 bg-white text-stone-500 shadow-sm transition hover:bg-stone-50 hover:text-stone-950 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:text-zinc-50", (click)="resetSettings()")
+                svg(xmlns="http://www.w3.org/2000/svg", viewBox="0 0 24 24", fill="none", stroke="currentColor", stroke-width="1.8", stroke-linecap="round", stroke-linejoin="round", class="size-4")
+                    path(d="M3 12a9 9 0 1 0 3-6.7")
+                    path(d="M3 3v6h6")
+            button(type="button", title="Save", class="flex size-9 items-center justify-center rounded-md bg-stone-900 text-white shadow-sm transition hover:bg-stone-700 dark:bg-zinc-100 dark:text-zinc-950 dark:hover:bg-zinc-200", (click)="saveSettings()")
+                svg(xmlns="http://www.w3.org/2000/svg", viewBox="0 0 24 24", fill="none", stroke="currentColor", stroke-width="1.8", stroke-linecap="round", stroke-linejoin="round", class="size-4")
+                    path(d="M20 6 9 17l-5-5")
+
+    div(class="grid min-h-0 flex-1 lg:grid-cols-[260px_minmax(0,1fr)]")
+        aside(class="hidden min-h-0 border-r border-stone-200 bg-[#f6f5f1] p-4 lg:flex lg:flex-col dark:border-zinc-800 dark:bg-zinc-900/45")
+            nav(class="space-y-1")
+                button(type="button", *ngFor="let section of sections", [class]="sectionButtonClass(section.id)", (click)="setSection(section.id)") {{section.label}}
+
+        main(class="min-h-0 overflow-y-auto px-5 py-6 sm:px-8 lg:px-10")
+            div(class="mx-auto w-full max-w-[920px]")
+                nav(class="mb-6 flex gap-1 overflow-x-auto rounded-lg bg-stone-100 p-1 lg:hidden dark:bg-zinc-900")
+                    button(type="button", *ngFor="let section of sections", [class]="sectionButtonClass(section.id)", (click)="setSection(section.id)") {{section.label}}
+
+                section(*ngIf="activeSection === 'general'", class="space-y-8")
+                    div(class="border-b border-stone-200 pb-5 dark:border-zinc-800")
+                        h2(class="text-[20px] font-semibold") 일반
+                    div(class="space-y-8")
+                        div(class="space-y-5")
+                            h3(class="text-[15px] font-semibold text-stone-900 dark:text-zinc-100") 작업공간
+                            label(class="grid gap-2")
+                                span(class="text-[13px] font-medium text-stone-700 dark:text-zinc-300") 이름
+                                input(type="text", [(ngModel)]="settings.workspaceName", (ngModelChange)="saveSettings()", class="h-10 rounded-md border border-stone-200 bg-white px-3 text-[14px] outline-none focus:border-stone-300 focus:ring-2 focus:ring-stone-200 dark:border-zinc-800 dark:bg-zinc-900 dark:focus:border-zinc-700 dark:focus:ring-zinc-800")
+                            div(class="flex items-center justify-between gap-4 border-y border-stone-200 py-4 dark:border-zinc-800")
+                                div
+                                    p(class="text-[13px] font-medium text-stone-700 dark:text-zinc-300") 자동 저장
+                                    p(class="mt-1 text-[12px] text-stone-400 dark:text-zinc-500") Markdown + metadata.json
+                                button(type="button", role="switch", [attr.aria-checked]="settings.autoSave", [class]="toggleTrackClass(settings.autoSave)", (click)="toggle('autoSave')")
+                                    span([class]="toggleKnobClass(settings.autoSave)")
+                        div(class="space-y-5 border-t border-stone-200 pt-6 dark:border-zinc-800")
+                            h3(class="text-[15px] font-semibold text-stone-900 dark:text-zinc-100") 편집기
+                            div
+                                p(class="mb-2 text-[13px] font-medium text-stone-700 dark:text-zinc-300") 기본 보기
+                                div(class="inline-flex rounded-lg bg-stone-100 p-1 dark:bg-zinc-800")
+                                    button(type="button", [class]="optionClass(settings.editorMode === 'markdown')", (click)="setEditorMode('markdown')") 작성
+                                    button(type="button", [class]="optionClass(settings.editorMode === 'split')", (click)="setEditorMode('split')") 분할
+                                    button(type="button", [class]="optionClass(settings.editorMode === 'preview')", (click)="setEditorMode('preview')") 미리보기
+                            label(class="grid max-w-xs gap-2")
+                                span(class="text-[13px] font-medium text-stone-700 dark:text-zinc-300") 탭 크기
+                                input(type="number", min="2", max="8", step="1", [ngModel]="settings.tabSize", (ngModelChange)="setTabSize($event)", class="h-10 rounded-md border border-stone-200 bg-white px-3 text-[14px] outline-none focus:border-stone-300 focus:ring-2 focus:ring-stone-200 dark:border-zinc-800 dark:bg-zinc-900 dark:focus:border-zinc-700 dark:focus:ring-zinc-800")
+                        div(class="space-y-5 border-t border-stone-200 pt-6 dark:border-zinc-800")
+                            h3(class="text-[15px] font-semibold text-stone-900 dark:text-zinc-100") 화면
+                            div
+                                p(class="mb-2 text-[13px] font-medium text-stone-700 dark:text-zinc-300") 테마
+                                div(class="inline-flex rounded-lg bg-stone-100 p-1 dark:bg-zinc-800")
+                                    button(type="button", [class]="optionClass(settings.theme === 'light')", (click)="setTheme('light')") Light
+                                    button(type="button", [class]="optionClass(settings.theme === 'dark')", (click)="setTheme('dark')") Dark
+                                    button(type="button", [class]="optionClass(settings.theme === 'system')", (click)="setTheme('system')") System
+
+                section(*ngIf="activeSection === 'storage'", class="space-y-6")
+                    div(class="border-b border-stone-200 pb-5 dark:border-zinc-800")
+                        div(class="flex flex-wrap items-center justify-between gap-3")
+                            div
+                                h2(class="text-[20px] font-semibold") 저장소
+                                p(class="mt-1 text-[13px] text-stone-500 dark:text-zinc-400") Markdown 파일과 metadata.json을 기준으로 로컬에 저장합니다.
+                            span([class]="storageStatusClass()") {{storageInfo.metadataExists ? 'metadata 준비됨' : '초기화 필요'}}
+                    div(class="grid gap-5")
+                        div(class="grid gap-2")
+                            span(class="text-[13px] font-medium text-stone-700 dark:text-zinc-300") 저장소 디렉토리
+                            div(class="flex gap-2")
+                                div(class="flex h-10 min-w-0 flex-1 items-center rounded-md border border-stone-200 bg-white px-3 font-mono text-[13px] text-stone-700 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-200")
+                                    span(class="truncate") {{settings.storagePath || '선택된 디렉토리 없음'}}
+                                button(type="button", class="h-10 shrink-0 rounded-md border border-stone-200 bg-white px-3 text-[13px] font-semibold text-stone-700 shadow-sm transition hover:bg-stone-50 disabled:cursor-not-allowed disabled:opacity-50 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-200 dark:hover:bg-zinc-800", (click)="chooseStoragePath()", [disabled]="storageBusy") 디렉토리 선택
+                        div(class="rounded-lg border border-stone-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-900")
+                            div(class="grid gap-3 sm:grid-cols-4")
+                                div
+                                    p(class="text-[12px] text-stone-400 dark:text-zinc-500") 문서
+                                    p(class="mt-1 text-[22px] font-semibold") {{storageInfo.notes || 0}}
+                                div
+                                    p(class="text-[12px] text-stone-400 dark:text-zinc-500") 작업공간
+                                    p(class="mt-1 text-[22px] font-semibold") {{storageInfo.workspaces || 0}}
+                                div
+                                    p(class="text-[12px] text-stone-400 dark:text-zinc-500") 바로 아래 MD
+                                    p(class="mt-1 text-[22px] font-semibold") {{storageInfo.shallowMarkdownCount || storageInfo.rootMarkdownCount || 0}}
+                                div
+                                    p(class="text-[12px] text-stone-400 dark:text-zinc-500") 깊은 경로 MD
+                                    p(class="mt-1 text-[22px] font-semibold") {{storageInfo.deepMarkdownCount || 0}}
+                            div(class="mt-4 border-t border-stone-200 pt-3 dark:border-zinc-800")
+                                p(class="break-all font-mono text-[12px] text-stone-500 dark:text-zinc-400") {{storageInfo.metadataPath || settings.storagePath + '/metadata.json'}}
+                                p(*ngIf="storageMessage", [class]="storageMessageClass()", aria-live="polite") {{storageMessage}}
+                        div(class="grid gap-3 sm:grid-cols-3")
+                            button(type="button", class="h-10 rounded-md bg-stone-900 px-3 text-[13px] font-semibold text-white shadow-sm transition hover:bg-stone-700 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-zinc-100 dark:text-zinc-950 dark:hover:bg-zinc-200", (click)="initializeStorage()", [disabled]="storageBusy", [attr.aria-busy]="storageAction === 'initialize'") {{storageAction === 'initialize' ? 'metadata 생성 중...' : 'metadata 생성/갱신'}}
+                            button(type="button", class="h-10 rounded-md border border-stone-200 bg-white px-3 text-[13px] font-semibold text-stone-700 shadow-sm transition hover:bg-stone-50 disabled:cursor-not-allowed disabled:opacity-50 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-200 dark:hover:bg-zinc-800", (click)="refreshStorageInfo()", [disabled]="storageBusy", [attr.aria-busy]="storageAction === 'refresh'") {{storageAction === 'refresh' ? '상태 확인 중...' : '상태 새로고침'}}
+                            button(type="button", class="h-10 rounded-md border border-stone-200 bg-white px-3 text-[13px] font-semibold text-stone-700 shadow-sm transition hover:bg-stone-50 disabled:cursor-not-allowed disabled:opacity-50 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-200 dark:hover:bg-zinc-800", (click)="importDeepMarkdown()", [disabled]="storageBusy", [attr.aria-busy]="storageAction === 'import'") {{storageAction === 'import' ? '가져오는 중...' : '깊은 문서 가져오기'}}

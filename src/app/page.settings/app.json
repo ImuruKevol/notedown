@@ -1,0 +1,12 @@
+{
+    "id": "page.settings",
+    "mode": "page",
+    "title": "Settings",
+    "namespace": "settings",
+    "category": "workspace",
+    "viewuri": "/settings",
+    "preview": "",
+    "controller": "base",
+    "layout": "layout.sidebar",
+    "template": "wiz-page-settings()"
+}
