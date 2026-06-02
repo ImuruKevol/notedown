@@ -67,9 +67,7 @@ npm run dist:requested
 
 ### 작성자
 
-- Taewook Kwon
-- Nickname: ImuruKevol
-- Email: kwon3286@season.co.kr
+- [ImuruKevol](https://github.com/ImuruKevol)
 
 ### 라이선스
 
