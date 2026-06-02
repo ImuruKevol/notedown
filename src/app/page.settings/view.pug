@@ -97,3 +97,68 @@ section(class="flex h-full min-h-0 flex-col bg-[#fbfbfa] text-stone-950 dark:bg-
                             button(type="button", class="h-10 rounded-md bg-stone-900 px-3 text-[13px] font-semibold text-white shadow-sm transition hover:bg-stone-700 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-zinc-100 dark:text-zinc-950 dark:hover:bg-zinc-200", (click)="initializeStorage()", [disabled]="storageBusy", [attr.aria-busy]="storageAction === 'initialize'") {{storageAction === 'initialize' ? 'metadata 생성 중...' : 'metadata 생성/갱신'}}
                             button(type="button", class="h-10 rounded-md border border-stone-200 bg-white px-3 text-[13px] font-semibold text-stone-700 shadow-sm transition hover:bg-stone-50 disabled:cursor-not-allowed disabled:opacity-50 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-200 dark:hover:bg-zinc-800", (click)="refreshStorageInfo()", [disabled]="storageBusy", [attr.aria-busy]="storageAction === 'refresh'") {{storageAction === 'refresh' ? '상태 확인 중...' : '상태 새로고침'}}
                             button(type="button", class="h-10 rounded-md border border-stone-200 bg-white px-3 text-[13px] font-semibold text-stone-700 shadow-sm transition hover:bg-stone-50 disabled:cursor-not-allowed disabled:opacity-50 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-200 dark:hover:bg-zinc-800", (click)="importDeepMarkdown()", [disabled]="storageBusy", [attr.aria-busy]="storageAction === 'import'") {{storageAction === 'import' ? '가져오는 중...' : '깊은 문서 가져오기'}}
+
+                section(*ngIf="activeSection === 'sync'", class="space-y-6")
+                    div(class="border-b border-stone-200 pb-5 dark:border-zinc-800")
+                        div(class="flex flex-wrap items-center justify-between gap-3")
+                            div
+                                h2(class="text-[20px] font-semibold") 동기화
+                                p(class="mt-1 text-[13px] text-stone-500 dark:text-zinc-400") 서버 메타데이터를 먼저 비교하고 파일 단위로 맞춥니다.
+                            span([class]="syncStatusClass()") {{syncStatusLabel()}}
+                    div(*ngIf="!hasSyncToken()", class="grid gap-5")
+                        label(class="grid gap-2")
+                            span(class="text-[13px] font-medium text-stone-700 dark:text-zinc-300") 서버 URL
+                            input(type="url", [(ngModel)]="settings.syncServerUrl", (ngModelChange)="saveSettings()", class="h-10 rounded-md border border-stone-200 bg-white px-3 text-[14px] outline-none focus:border-stone-300 focus:ring-2 focus:ring-stone-200 dark:border-zinc-800 dark:bg-zinc-900 dark:focus:border-zinc-700 dark:focus:ring-zinc-800")
+                        div(class="grid gap-4 sm:grid-cols-2")
+                            label(class="grid gap-2")
+                                span(class="text-[13px] font-medium text-stone-700 dark:text-zinc-300") 사용자 이름
+                                input(type="text", [(ngModel)]="settings.syncUsername", (ngModelChange)="saveSettings()", class="h-10 rounded-md border border-stone-200 bg-white px-3 text-[14px] outline-none focus:border-stone-300 focus:ring-2 focus:ring-stone-200 dark:border-zinc-800 dark:bg-zinc-900 dark:focus:border-zinc-700 dark:focus:ring-zinc-800")
+                            label(class="grid gap-2")
+                                span(class="text-[13px] font-medium text-stone-700 dark:text-zinc-300") 비밀번호
+                                input(type="password", [(ngModel)]="syncPassword", class="h-10 rounded-md border border-stone-200 bg-white px-3 text-[14px] outline-none focus:border-stone-300 focus:ring-2 focus:ring-stone-200 dark:border-zinc-800 dark:bg-zinc-900 dark:focus:border-zinc-700 dark:focus:ring-zinc-800")
+                        div(class="grid gap-3 sm:grid-cols-4")
+                            button(type="button", class="h-10 rounded-md border border-stone-200 bg-white px-3 text-[13px] font-semibold text-stone-700 shadow-sm transition hover:bg-stone-50 disabled:cursor-not-allowed disabled:opacity-50 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-200 dark:hover:bg-zinc-800", (click)="testSyncServer()", [disabled]="syncBusy", [attr.aria-busy]="syncAction === 'health'") {{syncAction === 'health' ? '확인 중...' : '연결 확인'}}
+                            button(type="button", class="h-10 rounded-md border border-stone-200 bg-white px-3 text-[13px] font-semibold text-stone-700 shadow-sm transition hover:bg-stone-50 disabled:cursor-not-allowed disabled:opacity-50 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-200 dark:hover:bg-zinc-800", (click)="setupSyncServer()", [disabled]="syncBusy", [attr.aria-busy]="syncAction === 'setup'") {{syncAction === 'setup' ? '설정 중...' : '초기 설정'}}
+                            button(type="button", class="h-10 rounded-md bg-stone-900 px-3 text-[13px] font-semibold text-white shadow-sm transition hover:bg-stone-700 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-zinc-100 dark:text-zinc-950 dark:hover:bg-zinc-200", (click)="loginSyncServer()", [disabled]="syncBusy", [attr.aria-busy]="syncAction === 'login'") {{syncAction === 'login' ? '로그인 중...' : '로그인'}}
+                        p(*ngIf="syncMessage", [class]="syncMessageClass()", aria-live="polite") {{syncMessage}}
+                    div(*ngIf="hasSyncToken()", class="grid gap-5")
+                        div(class="rounded-lg border border-emerald-200 bg-emerald-50/70 p-4 dark:border-emerald-500/25 dark:bg-emerald-500/10")
+                            div(class="grid gap-4 md:grid-cols-[minmax(0,1fr)_auto]")
+                                div(class="min-w-0")
+                                    p(class="text-[12px] font-semibold uppercase tracking-wide text-emerald-700 dark:text-emerald-300") 연결됨
+                                    p(class="mt-1 break-all text-[14px] font-semibold text-stone-900 dark:text-zinc-100") {{settings.syncServerUrl}}
+                                    p(class="mt-1 text-[12px] text-stone-500 dark:text-zinc-400") {{settings.syncUsername || settings.syncClientId}}
+                                div(class="grid gap-2 sm:grid-cols-2 md:grid-cols-1")
+                                    button(type="button", class="h-10 rounded-md border border-emerald-200 bg-white px-3 text-[13px] font-semibold text-emerald-700 shadow-sm transition hover:bg-emerald-50 disabled:cursor-not-allowed disabled:opacity-50 dark:border-emerald-500/30 dark:bg-zinc-900 dark:text-emerald-300 dark:hover:bg-emerald-500/10", (click)="testSyncServer()", [disabled]="syncBusy", [attr.aria-busy]="syncAction === 'health'") {{syncAction === 'health' ? '확인 중...' : '연결 확인'}}
+                                    button(type="button", class="h-10 rounded-md border border-stone-200 bg-white px-3 text-[13px] font-semibold text-stone-700 shadow-sm transition hover:bg-stone-50 disabled:cursor-not-allowed disabled:opacity-50 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-200 dark:hover:bg-zinc-800", (click)="logoutSyncServer()", [disabled]="syncBusy") 로그아웃
+                        div(class="flex items-center justify-between gap-4 border-y border-stone-200 py-4 dark:border-zinc-800")
+                            div
+                                p(class="text-[13px] font-medium text-stone-700 dark:text-zinc-300") 저장 시 업로드
+                                p(class="mt-1 text-[12px] text-stone-400 dark:text-zinc-500") 개별 파일 저장 이벤트를 서버에 반영합니다.
+                            button(type="button", role="switch", [attr.aria-checked]="settings.syncAutoUpload", [class]="toggleTrackClass(settings.syncAutoUpload)", (click)="toggle('syncAutoUpload')")
+                                span([class]="toggleKnobClass(settings.syncAutoUpload)")
+                        div(class="rounded-lg border border-stone-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-900")
+                            div(class="grid gap-3 sm:grid-cols-5")
+                                div
+                                    p(class="text-[12px] text-stone-400 dark:text-zinc-500") 업로드
+                                    p(class="mt-1 text-[22px] font-semibold") {{syncPlanSummary?.uploadFiles || 0}}
+                                div
+                                    p(class="text-[12px] text-stone-400 dark:text-zinc-500") 다운로드
+                                    p(class="mt-1 text-[22px] font-semibold") {{syncPlanSummary?.downloadFiles || 0}}
+                                div
+                                    p(class="text-[12px] text-stone-400 dark:text-zinc-500") 서버 삭제
+                                    p(class="mt-1 text-[22px] font-semibold") {{syncPlanSummary?.deleteServerFiles || 0}}
+                                div
+                                    p(class="text-[12px] text-stone-400 dark:text-zinc-500") 로컬 삭제
+                                    p(class="mt-1 text-[22px] font-semibold") {{syncPlanSummary?.deleteLocalFiles || 0}}
+                                div
+                                    p(class="text-[12px] text-stone-400 dark:text-zinc-500") 충돌
+                                    p(class="mt-1 text-[22px] font-semibold") {{syncPlanSummary?.conflicts || 0}}
+                            p(*ngIf="syncMessage", [class]="syncMessageClass()", aria-live="polite") {{syncMessage}}
+                        div(*ngIf="hasSyncConflicts()", class="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-amber-200 bg-amber-50/80 p-4 dark:border-amber-500/25 dark:bg-amber-500/10")
+                            div
+                                p(class="text-[14px] font-semibold text-amber-900 dark:text-amber-100") 동기화 충돌 {{syncConflicts.length}}건
+                                p(class="mt-1 text-[12px] text-amber-700 dark:text-amber-300") 충돌 비교와 정리는 문서 화면에서 진행합니다.
+                            a(routerLink="/notes", class="inline-flex h-9 items-center rounded-md bg-amber-500 px-3 text-[13px] font-semibold text-white shadow-sm transition hover:bg-amber-600 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-400 dark:bg-amber-400 dark:text-zinc-950 dark:hover:bg-amber-300") 충돌 보기
+                        div(class="grid gap-3")
+                            button(type="button", class="h-10 rounded-md bg-stone-900 px-3 text-[13px] font-semibold text-white shadow-sm transition hover:bg-stone-700 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-zinc-100 dark:text-zinc-950 dark:hover:bg-zinc-200", (click)="runFullSync()", [disabled]="syncBusy", [attr.aria-busy]="syncAction === 'run'") {{syncAction === 'run' ? '동기화 중...' : '전체 동기화'}}

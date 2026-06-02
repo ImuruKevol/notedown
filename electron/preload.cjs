@@ -15,6 +15,17 @@ contextBridge.exposeInMainWorld('notedown', {
         loadNotes: (payload) => ipcRenderer.invoke('notedown:storage:load-notes', payload),
         saveNotes: (payload) => ipcRenderer.invoke('notedown:storage:save-notes', payload)
     },
+    sync: {
+        health: (payload) => ipcRenderer.invoke('notedown:sync:health', payload),
+        setupStatus: (payload) => ipcRenderer.invoke('notedown:sync:setup-status', payload),
+        setup: (payload) => ipcRenderer.invoke('notedown:sync:setup', payload),
+        login: (payload) => ipcRenderer.invoke('notedown:sync:login', payload),
+        plan: (payload) => ipcRenderer.invoke('notedown:sync:plan', payload),
+        runFull: (payload) => ipcRenderer.invoke('notedown:sync:run-full', payload),
+        uploadNote: (payload) => ipcRenderer.invoke('notedown:sync:upload-note', payload),
+        readFile: (payload) => ipcRenderer.invoke('notedown:sync:read-file', payload),
+        resolveConflict: (payload) => ipcRenderer.invoke('notedown:sync:resolve-conflict', payload)
+    },
     pdf: {
         saveNote: (payload) => ipcRenderer.invoke('notedown:pdf:save-note', payload)
     }

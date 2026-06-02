@@ -2,6 +2,7 @@ import { HostListener, OnDestroy, OnInit } from '@angular/core';
 
 type SortField = 'createdAt' | 'updatedAt' | 'title';
 type SortDirection = 'asc' | 'desc';
+type SyncStatusTone = 'idle' | 'running' | 'success' | 'warning' | 'error';
 
 interface NoteItem {
     id: string;
@@ -34,6 +35,7 @@ export class Component implements OnInit, OnDestroy {
     private storageKey = 'notedown.notes.v1';
     private activeNoteKey = 'notedown.activeNoteId.v1';
     private settingsKey = 'notedown.settings.v1';
+    private startupSyncResultKey = 'notedown.sync.startup.result.v1';
 
     public query = '';
     public searchOpen = false;
@@ -53,17 +55,29 @@ export class Component implements OnInit, OnDestroy {
     ];
     public folders: FolderItem[] = [{ id: 'all', label: '모든 노트' }];
     public notes: NoteItem[] = [];
+    public syncStatusLabel = '동기화 대기';
+    public syncStatusDetail = '서버 동기화 상태';
+    public syncStatusTone: SyncStatusTone = 'idle';
 
     private handleNotesChanged = () => { void this.loadNotes(); };
+    private handleStartupSyncStatus = () => { this.loadStartupSyncStatus(); };
+    private handleStorageChanged = (event: StorageEvent) => {
+        if (event.key === this.startupSyncResultKey || event.key === this.settingsKey) this.loadStartupSyncStatus();
+    };
 
     public ngOnInit() {
+        this.loadStartupSyncStatus();
         void this.loadNotes();
         window.addEventListener('notedown:notes-changed', this.handleNotesChanged);
+        window.addEventListener('notedown:startup-sync-status', this.handleStartupSyncStatus);
+        window.addEventListener('storage', this.handleStorageChanged);
     }
 
     public ngOnDestroy() {
         this.emitWorkspaceState(false);
         window.removeEventListener('notedown:notes-changed', this.handleNotesChanged);
+        window.removeEventListener('notedown:startup-sync-status', this.handleStartupSyncStatus);
+        window.removeEventListener('storage', this.handleStorageChanged);
     }
 
     public get activeFolderLabel() {
@@ -133,6 +147,7 @@ export class Component implements OnInit, OnDestroy {
         this.notes = [note, ...this.notes];
         this.syncFolders();
         await this.persistNotes();
+        await this.syncNoteWithServer(note);
         window.dispatchEvent(new CustomEvent('notedown:notes-changed'));
         this.selectNote(note.id);
     }
@@ -153,6 +168,7 @@ export class Component implements OnInit, OnDestroy {
         this.notes = this.notes.filter(item => item.id !== id);
         this.syncFolders();
         await this.persistNotes();
+        await this.syncNoteWithServer(note, true);
 
         if (!wasActive) {
             window.dispatchEvent(new CustomEvent('notedown:notes-changed'));
@@ -267,6 +283,38 @@ export class Component implements OnInit, OnDestroy {
         return `${base} text-stone-600 hover:bg-stone-100 hover:text-stone-950 dark:text-zinc-300 dark:hover:bg-zinc-800 dark:hover:text-zinc-50`;
     }
 
+    public syncStatusClass() {
+        const base = 'group min-w-0 flex flex-1 items-center justify-between gap-2 rounded-md border px-2 py-1 text-left text-[12px] font-semibold transition focus-visible:outline-none focus-visible:ring-2';
+        const toneClass = {
+            idle: 'border-transparent text-stone-500 hover:border-stone-200 hover:bg-white/60 hover:text-stone-700 focus-visible:ring-stone-300 dark:text-zinc-400 dark:hover:border-zinc-800 dark:hover:bg-zinc-800 dark:hover:text-zinc-200',
+            running: 'border-blue-200/70 bg-blue-50 text-blue-700 hover:bg-blue-100 focus-visible:ring-blue-300 dark:border-blue-500/20 dark:bg-blue-500/10 dark:text-blue-300 dark:hover:bg-blue-500/15',
+            success: 'border-transparent text-emerald-700 hover:border-emerald-200 hover:bg-emerald-50 focus-visible:ring-emerald-300 dark:text-emerald-300 dark:hover:border-emerald-500/20 dark:hover:bg-emerald-500/10',
+            warning: 'border-amber-300 bg-amber-100 text-amber-900 shadow-sm ring-1 ring-amber-200 hover:bg-amber-200 hover:underline focus-visible:ring-amber-400 dark:border-amber-400/50 dark:bg-amber-500/15 dark:text-amber-100 dark:ring-amber-400/20 dark:hover:bg-amber-500/25',
+            error: 'border-red-200 bg-red-50 text-red-700 hover:bg-red-100 focus-visible:ring-red-300 dark:border-red-500/20 dark:bg-red-500/10 dark:text-red-300 dark:hover:bg-red-500/15'
+        }[this.syncStatusTone];
+        return `${base} ${toneClass}`;
+    }
+
+    public isSyncConflictStatus() {
+        return this.syncStatusTone === 'warning';
+    }
+
+    public openSyncConflict() {
+        if (!this.isSyncConflictStatus()) return;
+        window.dispatchEvent(new CustomEvent('notedown:open-sync-conflict'));
+    }
+
+    public syncStatusDotClass() {
+        const toneClass = {
+            idle: 'bg-stone-300 dark:bg-zinc-700',
+            running: 'bg-blue-500',
+            success: 'bg-emerald-500',
+            warning: 'bg-amber-500',
+            error: 'bg-red-500'
+        }[this.syncStatusTone];
+        return `inline-block size-2 shrink-0 rounded-full ${toneClass}`;
+    }
+
     @HostListener('document:keydown.escape')
     public closeOnEscape() {
         this.closeWorkspace();
@@ -277,6 +325,73 @@ export class Component implements OnInit, OnDestroy {
     @HostListener('document:click')
     public closeFloatingMenus() {
         this.sortOpen = false;
+    }
+
+    private loadStartupSyncStatus() {
+        const settings = this.readSettings();
+        if (!settings.syncToken || !settings.storagePath) {
+            this.setSyncStatus('동기화 미설정', '설정에서 동기화 서버에 로그인하세요.', 'idle');
+            return;
+        }
+
+        const result = this.readStartupSyncResult();
+        if (!result?.syncedAtMs) {
+            this.setSyncStatus('동기화 대기', '앱 시작 동기화를 기다리는 중입니다.', 'idle');
+            return;
+        }
+
+        const elapsedMs = Date.now() - Number(result.syncedAtMs);
+        if (result.status === 'running' && elapsedMs <= 5 * 60 * 1000) {
+            this.setSyncStatus('동기화 중', '서버 메타데이터와 로컬 파일을 비교하는 중입니다.', 'running');
+            return;
+        }
+
+        if (elapsedMs > 30 * 60 * 1000) {
+            this.setSyncStatus('동기화 대기', '최근 시작 동기화 결과가 없습니다.', 'idle');
+            return;
+        }
+
+        const conflictCount = this.startupConflictCount(result);
+        if (result.status === 'conflict' || conflictCount > 0) {
+            const conflicts = conflictCount || 1;
+            this.setSyncStatus('동기화 충돌', `충돌 ${conflicts}건이 감지되었습니다.`, 'warning');
+            return;
+        }
+
+        if (result.ok && conflictCount === 0) {
+            this.setSyncStatus('동기화 완료', this.syncResultDetail(result), 'success');
+            return;
+        }
+
+        this.setSyncStatus('동기화 실패', result.error || '시작 동기화에 실패했습니다.', 'error');
+    }
+
+    private readStartupSyncResult() {
+        try {
+            return JSON.parse(localStorage.getItem(this.startupSyncResultKey) || '{}') || {};
+        } catch (error) {
+            return {};
+        }
+    }
+
+    private startupConflictCount(result: any) {
+        return Number(result?.summary?.conflicts) || result?.conflicts?.length || 0;
+    }
+
+    private syncResultDetail(result: any) {
+        const summary = result.summary || {};
+        return [
+            `업로드 ${summary.uploadFiles || 0}`,
+            `다운로드 ${summary.downloadFiles || 0}`,
+            `삭제 ${Number(summary.deleteServerFiles || 0) + Number(summary.deleteLocalFiles || 0)}`,
+            `충돌 ${summary.conflicts || 0}`
+        ].join(', ');
+    }
+
+    private setSyncStatus(label: string, detail: string, tone: SyncStatusTone) {
+        this.syncStatusLabel = label;
+        this.syncStatusDetail = detail;
+        this.syncStatusTone = tone;
     }
 
     private async loadNotes() {
@@ -370,6 +485,33 @@ export class Component implements OnInit, OnDestroy {
             return settings.storagePath || '';
         } catch (error) {
             return '';
+        }
+    }
+
+    private async syncNoteWithServer(note: NoteItem, deleted = false) {
+        const api = (window as any).notedown?.sync;
+        const settings = this.readSettings();
+        if (!api?.uploadNote || !settings.syncAutoUpload || !settings.syncToken || !settings.storagePath) return;
+
+        try {
+            await api.uploadNote({
+                serverUrl: settings.syncServerUrl,
+                token: settings.syncToken,
+                clientId: settings.syncClientId,
+                storagePath: settings.storagePath,
+                note,
+                deleted
+            });
+        } catch (error) {
+            // Local save remains authoritative when server sync is unavailable.
+        }
+    }
+
+    private readSettings() {
+        try {
+            return JSON.parse(localStorage.getItem(this.settingsKey) || '{}') || {};
+        } catch (error) {
+            return {};
         }
     }
 

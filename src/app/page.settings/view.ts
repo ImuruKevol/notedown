@@ -3,8 +3,9 @@ import { Service } from '@wiz/libs/portal/season/service';
 
 type ThemeMode = 'light' | 'dark' | 'system';
 type EditorMode = 'markdown' | 'split' | 'preview';
-type ToggleKey = 'autoSave';
+type ToggleKey = 'autoSave' | 'syncAutoUpload';
 type StorageAction = '' | 'choose' | 'refresh' | 'initialize' | 'import';
+type SyncAction = '' | 'health' | 'setup' | 'login' | 'plan' | 'run';
 type StorageMessageTone = 'info' | 'success' | 'warning' | 'error';
 
 interface AppSettings {
@@ -14,6 +15,12 @@ interface AppSettings {
     editorMode: EditorMode;
     autoSave: boolean;
     tabSize: number;
+    syncServerUrl: string;
+    syncUsername: string;
+    syncToken: string;
+    syncTokenType: string;
+    syncClientId: string;
+    syncAutoUpload: boolean;
 }
 
 interface StorageInfo {
@@ -28,9 +35,42 @@ interface StorageInfo {
     copiedDeepCount?: number;
 }
 
+interface SyncPlanSummary {
+    uploadFiles: number;
+    downloadFiles: number;
+    deleteServerFiles: number;
+    deleteLocalFiles: number;
+    conflicts: number;
+}
+
+interface SyncConflict {
+    relativePath: string;
+    reason?: string;
+    type?: string;
+    clientRevision?: number;
+    serverRevision?: number;
+    serverFile?: any;
+    serverNote?: any;
+    clientNote?: any;
+    clientWorkspace?: any;
+    serverWorkspace?: any;
+}
+
+interface SyncConflictDetail {
+    relativePath: string;
+    localExists?: boolean;
+    localContent?: string;
+    localNote?: any;
+    localError?: string;
+    serverContent?: string;
+    serverFile?: any;
+    serverError?: string;
+}
+
 export class Component implements OnInit {
     private storageKey = 'notedown.settings.v1';
     private notesKey = 'notedown.notes.v1';
+    private startupSyncResultKey = 'notedown.sync.startup.result.v1';
 
     public activeSection = 'general';
     public savedAt = '';
@@ -39,9 +79,20 @@ export class Component implements OnInit {
     public storageMessage = '';
     public storageMessageTone: StorageMessageTone = 'info';
     public storageInfo: StorageInfo = {};
+    public syncBusy = false;
+    public syncAction: SyncAction = '';
+    public syncPassword = '';
+    public syncMessage = '';
+    public syncMessageTone: StorageMessageTone = 'info';
+    public syncPlanSummary: SyncPlanSummary | null = null;
+    public syncConflicts: SyncConflict[] = [];
+    public selectedSyncConflictIndex = 0;
+    public syncConflictDetail: SyncConflictDetail | null = null;
+    public syncConflictBusy = false;
     public sections = [
         { id: 'general', label: '일반' },
-        { id: 'storage', label: '저장소' }
+        { id: 'storage', label: '저장소' },
+        { id: 'sync', label: '동기화' }
     ];
     public settings: AppSettings = this.defaultSettings();
 
@@ -49,6 +100,7 @@ export class Component implements OnInit {
 
     public async ngOnInit() {
         this.loadSettings();
+        this.applyStartupSyncResult();
         await this.ensureDefaultStoragePath();
         await this.refreshStorageInfo();
         this.applyTheme();
@@ -88,6 +140,9 @@ export class Component implements OnInit {
     public resetSettings() {
         localStorage.removeItem(this.storageKey);
         this.settings = this.defaultSettings();
+        this.syncPassword = '';
+        this.syncPlanSummary = null;
+        this.clearSyncConflicts();
         this.applyTheme();
         this.saveSettings();
     }
@@ -242,6 +297,207 @@ export class Component implements OnInit {
         return `${base} text-stone-400 dark:text-zinc-500`;
     }
 
+    public syncStatusLabel() {
+        if (this.hasSyncConflicts()) return '충돌';
+        if (this.hasSyncToken()) return '로그인됨';
+        if (this.settings.syncUsername) return '로그인 필요';
+        return '미설정';
+    }
+
+    public syncStatusClass() {
+        const base = 'inline-flex h-7 items-center rounded-full px-2.5 text-[12px] font-semibold';
+        if (this.hasSyncConflicts()) return `${base} bg-amber-100 text-amber-700 dark:bg-amber-500/15 dark:text-amber-300`;
+        if (this.hasSyncToken()) return `${base} bg-emerald-100 text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-300`;
+        if (this.settings.syncUsername) return `${base} bg-amber-100 text-amber-700 dark:bg-amber-500/15 dark:text-amber-300`;
+        return `${base} bg-stone-100 text-stone-600 dark:bg-zinc-800 dark:text-zinc-300`;
+    }
+
+    public syncMessageClass() {
+        const base = 'mt-2 min-h-5 text-[12px]';
+        if (this.syncMessageTone === 'success') return `${base} text-emerald-700 dark:text-emerald-300`;
+        if (this.syncMessageTone === 'warning') return `${base} text-amber-700 dark:text-amber-300`;
+        if (this.syncMessageTone === 'error') return `${base} text-red-600 dark:text-red-300`;
+        return `${base} text-stone-400 dark:text-zinc-500`;
+    }
+
+    public hasSyncConflicts() {
+        return this.syncConflicts.length > 0;
+    }
+
+    public selectedSyncConflict() {
+        return this.syncConflicts[this.selectedSyncConflictIndex] || this.syncConflicts[0] || null;
+    }
+
+    public selectSyncConflict(index: number) {
+        if (index < 0 || index >= this.syncConflicts.length) return;
+        this.selectedSyncConflictIndex = index;
+        this.syncConflictDetail = null;
+        void this.loadSyncConflictDetail();
+    }
+
+    public syncConflictButtonClass(index: number) {
+        const base = 'flex w-full min-w-0 items-center justify-between gap-2 rounded-md px-2.5 py-2 text-left text-[12px] font-medium transition-colors';
+        if (this.selectedSyncConflictIndex === index) return `${base} bg-amber-100 text-amber-900 dark:bg-amber-500/20 dark:text-amber-100`;
+        return `${base} text-stone-600 hover:bg-stone-100 hover:text-stone-950 dark:text-zinc-300 dark:hover:bg-zinc-800 dark:hover:text-zinc-50`;
+    }
+
+    public syncConflictReason(conflict = this.selectedSyncConflict()) {
+        const reason = conflict?.reason || '';
+        if (reason === 'server_metadata_changed_after_local_edit') return '서버 변경과 로컬 편집이 겹쳤습니다.';
+        if (reason === 'server_metadata_changed_without_sync_history') return '동기화 이력이 없어 자동 적용하지 않았습니다.';
+        if (reason === 'server_metadata_removed_after_local_edit') return '서버 삭제와 로컬 편집이 겹쳤습니다.';
+        if (reason === 'server_file_changed') return '서버 파일이 변경되었습니다.';
+        if (reason === 'server_metadata_changed') return '서버 메타데이터가 변경되었습니다.';
+        if (reason === 'conflict') return '서버와 로컬 버전이 충돌했습니다.';
+        return reason || '충돌 상세 정보가 필요합니다.';
+    }
+
+    public syncConflictServerText() {
+        const conflict = this.selectedSyncConflict();
+        if (!conflict) return '';
+        if (this.syncConflictBusy) return '서버 파일을 불러오는 중입니다...';
+        if (this.syncConflictDetail?.serverError) return `서버 파일을 읽지 못했습니다.\n\n${this.syncConflictDetail.serverError}`;
+        if (typeof this.syncConflictDetail?.serverContent === 'string') return this.syncConflictDetail.serverContent;
+        return JSON.stringify(conflict.serverNote || conflict.serverFile || {}, null, 2);
+    }
+
+    public syncConflictLocalText() {
+        const conflict = this.selectedSyncConflict();
+        if (!conflict) return '';
+        if (this.syncConflictBusy) return '로컬 파일을 불러오는 중입니다...';
+        if (this.syncConflictDetail?.localError && !this.syncConflictDetail.localExists) {
+            return `로컬 파일을 읽지 못했습니다.\n\n${this.syncConflictDetail.localError}`;
+        }
+        if (typeof this.syncConflictDetail?.localContent === 'string') return this.syncConflictDetail.localContent;
+        return JSON.stringify(conflict.clientNote || {}, null, 2);
+    }
+
+    public async testSyncServer() {
+        const api = this.syncApi();
+        if (!api?.health) {
+            this.setSyncMessage('동기화는 Electron 앱에서 사용할 수 있습니다.', 'warning');
+            await this.service.render();
+            return;
+        }
+
+        await this.runSyncAction('health', '동기화 서버에 연결하는 중입니다...', async () => {
+            const result = await api.health({ serverUrl: this.settings.syncServerUrl });
+            if (result?.ok) {
+                this.setSyncMessage('동기화 서버에 연결되었습니다.', 'success');
+                return;
+            }
+            this.setSyncMessage(result?.error || '동기화 서버에 연결하지 못했습니다.', 'error');
+        });
+    }
+
+    public async setupSyncServer() {
+        const api = this.syncApi();
+        if (!api?.setup) {
+            this.setSyncMessage('초기 설정은 Electron 앱에서 사용할 수 있습니다.', 'warning');
+            await this.service.render();
+            return;
+        }
+        if (!this.validSyncCredential()) return;
+
+        await this.runSyncAction('setup', '동기화 서버 계정을 생성하는 중입니다...', async () => {
+            const result = await api.setup(this.syncPayload({ password: this.syncPassword }));
+            if (result?.ok && result.accessToken) {
+                this.storeSyncToken(result);
+                this.syncPassword = '';
+                this.setSyncMessage('동기화 서버 초기 설정이 완료되었습니다.', 'success');
+                return;
+            }
+            this.setSyncMessage(result?.error || '동기화 서버 초기 설정에 실패했습니다.', 'error');
+        });
+    }
+
+    public async loginSyncServer() {
+        const api = this.syncApi();
+        if (!api?.login) {
+            this.setSyncMessage('동기화 서버 로그인은 Electron 앱에서 사용할 수 있습니다.', 'warning');
+            await this.service.render();
+            return;
+        }
+        if (!this.validSyncCredential()) return;
+
+        await this.runSyncAction('login', '동기화 서버에 로그인하는 중입니다...', async () => {
+            const result = await api.login(this.syncPayload({ password: this.syncPassword }));
+            if (result?.ok && result.accessToken) {
+                this.storeSyncToken(result);
+                this.syncPassword = '';
+                this.setSyncMessage('동기화 서버에 로그인했습니다.', 'success');
+                return;
+            }
+            this.setSyncMessage(result?.error || '동기화 서버 로그인에 실패했습니다.', 'error');
+        });
+    }
+
+    public logoutSyncServer() {
+        this.settings.syncToken = '';
+        this.settings.syncTokenType = '';
+        this.syncPlanSummary = null;
+        this.clearSyncConflicts();
+        this.saveSettings();
+        this.setSyncMessage('동기화 서버 로그인을 해제했습니다.', 'info');
+    }
+
+    public async planSync() {
+        const api = this.syncApi();
+        if (!api?.plan) {
+            this.setSyncMessage('동기화 계획은 Electron 앱에서 사용할 수 있습니다.', 'warning');
+            await this.service.render();
+            return;
+        }
+        if (!this.ensureSyncReady()) return;
+
+        await this.runSyncAction('plan', '서버 메타데이터와 비교하는 중입니다...', async () => {
+            const result = await api.plan(this.syncPayload());
+            if (result?.ok) {
+                this.syncPlanSummary = result.summary;
+                this.setSyncConflictsFromResult(result);
+                this.setSyncMessage(this.syncSummaryMessage(result.summary), this.syncConflictCount(result) > 0 ? 'warning' : 'success');
+                return;
+            }
+            this.setSyncMessage(result?.error || '동기화 계획을 만들지 못했습니다.', 'error');
+        });
+    }
+
+    public async runFullSync() {
+        const api = this.syncApi();
+        if (!api?.runFull) {
+            this.setSyncMessage('전체 동기화는 Electron 앱에서 사용할 수 있습니다.', 'warning');
+            await this.service.render();
+            return;
+        }
+        if (!this.ensureSyncReady()) return;
+
+        await this.runSyncAction('run', '전체 동기화를 실행하는 중입니다...', async () => {
+            const result = await api.runFull(this.syncPayload());
+            if (result?.summary) this.syncPlanSummary = result.summary;
+            const conflictCount = this.syncConflictCount(result);
+            if (result?.status === 'conflict' || conflictCount > 0) {
+                this.setSyncConflictsFromResult(result);
+                this.setSyncMessage(`충돌 ${conflictCount || 1}건이 있어 자동 적용하지 않았습니다.`, 'warning');
+                return;
+            }
+            if (result?.ok) {
+                this.clearSyncConflicts();
+                const operations = result.operations || {};
+                const message = [
+                    `업로드 ${operations.uploaded?.length || 0}`,
+                    `다운로드 ${operations.downloaded?.length || 0}`,
+                    `서버 삭제 ${operations.deletedServer?.length || 0}`,
+                    `로컬 삭제 ${operations.deletedLocal?.length || 0}`
+                ].join(', ');
+                this.setSyncMessage(`전체 동기화가 완료되었습니다. ${message}`, 'success');
+                window.dispatchEvent(new CustomEvent('notedown:notes-changed'));
+                await this.refreshStorageInfo();
+                return;
+            }
+            this.setSyncMessage(result?.error || '전체 동기화에 실패했습니다.', 'error');
+        });
+    }
+
     private loadSettings() {
         try {
             const stored = localStorage.getItem(this.storageKey);
@@ -260,7 +516,13 @@ export class Component implements OnInit {
             theme: 'light',
             editorMode: 'split',
             autoSave: true,
-            tabSize: 2
+            tabSize: 2,
+            syncServerUrl: 'http://172.16.0.143:5500',
+            syncUsername: '',
+            syncToken: '',
+            syncTokenType: '',
+            syncClientId: this.createClientId(),
+            syncAutoUpload: false
         };
     }
 
@@ -272,7 +534,13 @@ export class Component implements OnInit {
             theme: this.normalizeTheme(stored?.theme),
             editorMode: this.normalizeEditorMode(stored?.editorMode),
             autoSave: typeof stored?.autoSave === 'boolean' ? stored.autoSave : defaults.autoSave,
-            tabSize: this.normalizeTabSize(stored?.tabSize)
+            tabSize: this.normalizeTabSize(stored?.tabSize),
+            syncServerUrl: typeof stored?.syncServerUrl === 'string' ? stored.syncServerUrl : defaults.syncServerUrl,
+            syncUsername: typeof stored?.syncUsername === 'string' ? stored.syncUsername : defaults.syncUsername,
+            syncToken: typeof stored?.syncToken === 'string' ? stored.syncToken : defaults.syncToken,
+            syncTokenType: typeof stored?.syncTokenType === 'string' ? stored.syncTokenType : defaults.syncTokenType,
+            syncClientId: typeof stored?.syncClientId === 'string' && stored.syncClientId ? stored.syncClientId : defaults.syncClientId,
+            syncAutoUpload: typeof stored?.syncAutoUpload === 'boolean' ? stored.syncAutoUpload : defaults.syncAutoUpload
         };
     }
 
@@ -335,6 +603,23 @@ export class Component implements OnInit {
         }
     }
 
+    private async runSyncAction(actionName: SyncAction, progressMessage: string, action: () => Promise<void>) {
+        if (this.syncBusy) return;
+        this.syncBusy = true;
+        this.syncAction = actionName;
+        this.setSyncMessage(progressMessage, 'info');
+        await this.service.render();
+        try {
+            await action();
+        } catch (error) {
+            this.setSyncMessage(this.errorMessage(error, '동기화 작업 중 오류가 발생했습니다.'), 'error');
+        } finally {
+            this.syncAction = '';
+            this.syncBusy = false;
+            await this.service.render();
+        }
+    }
+
     private applyStorageFallback(message: string, tone: StorageMessageTone) {
         const summary = this.localNoteSummary();
         this.storageInfo = {
@@ -363,6 +648,191 @@ export class Component implements OnInit {
     private setStorageMessage(message: string, tone: StorageMessageTone) {
         this.storageMessage = message;
         this.storageMessageTone = tone;
+    }
+
+    private setSyncMessage(message: string, tone: StorageMessageTone) {
+        this.syncMessage = message;
+        this.syncMessageTone = tone;
+    }
+
+    private applyStartupSyncResult() {
+        if (!this.hasSyncToken()) return;
+        try {
+            const result = JSON.parse(localStorage.getItem(this.startupSyncResultKey) || '{}');
+            if (!result?.syncedAtMs || Date.now() - Number(result.syncedAtMs) > 30 * 60 * 1000) return;
+            if (result.summary) this.syncPlanSummary = result.summary;
+            const conflictCount = this.syncConflictCount(result);
+            if (result.status === 'running') {
+                this.setSyncMessage('앱 시작 동기화가 진행 중입니다.', 'info');
+                return;
+            }
+            if (result.status === 'conflict' || conflictCount > 0) {
+                this.activeSection = 'sync';
+                this.setSyncConflictsFromResult(result);
+                this.setSyncMessage(`시작 동기화에서 충돌 ${conflictCount || 1}건이 감지되었습니다.`, 'warning');
+                return;
+            }
+            if (result.ok) {
+                this.clearSyncConflicts();
+                this.setSyncMessage('앱 시작 시 서버 메타데이터 기준 동기화를 완료했습니다.', 'success');
+                return;
+            }
+            if (result.error) this.setSyncMessage(result.error, 'error');
+        } catch (error) {
+            // Ignore malformed startup sync status.
+        }
+    }
+
+    private syncConflictCount(result: any) {
+        return Number(result?.summary?.conflicts)
+            || result?.conflicts?.length
+            || result?.plan?.conflicts?.length
+            || result?.operations?.conflicts?.length
+            || 0;
+    }
+
+    private setSyncConflictsFromResult(result: any) {
+        this.syncConflicts = this.extractSyncConflicts(result);
+        if (this.syncConflicts.length === 0 && this.syncConflictCount(result) > 0) {
+            this.syncConflicts = [{ relativePath: '', reason: 'conflict' }];
+        }
+        this.selectedSyncConflictIndex = 0;
+        this.syncConflictDetail = null;
+    }
+
+    private clearSyncConflicts() {
+        this.syncConflicts = [];
+        this.selectedSyncConflictIndex = 0;
+        this.syncConflictDetail = null;
+        this.syncConflictBusy = false;
+    }
+
+    private extractSyncConflicts(result: any): SyncConflict[] {
+        const items = [
+            ...(Array.isArray(result?.conflicts) ? result.conflicts : []),
+            ...(Array.isArray(result?.plan?.conflicts) ? result.plan.conflicts : []),
+            ...(Array.isArray(result?.operations?.conflicts) ? result.operations.conflicts : [])
+        ];
+        const conflicts = new Map<string, SyncConflict>();
+        for (const rawItem of items) {
+            const item = rawItem?.file || rawItem;
+            const relativePath = item?.relativePath || item?.serverFile?.relativePath || '';
+            if (!relativePath) continue;
+            const conflict: SyncConflict = {
+                relativePath,
+                reason: item.reason || item.status || '',
+                type: item.type || '',
+                clientRevision: item.clientRevision,
+                serverRevision: item.serverRevision,
+                serverFile: item.serverFile || null,
+                serverNote: item.serverNote || null,
+                clientNote: item.clientNote || null,
+                clientWorkspace: item.clientWorkspace || null,
+                serverWorkspace: item.serverWorkspace || null
+            };
+            conflicts.set(`${relativePath}:${conflict.reason || ''}`, conflict);
+        }
+        return Array.from(conflicts.values());
+    }
+
+    private async loadSyncConflictDetail() {
+        const conflict = this.selectedSyncConflict();
+        const api = this.syncApi();
+        if (!conflict?.relativePath) return;
+        if (!api?.readFile) {
+            this.syncConflictDetail = null;
+            await this.service.render();
+            return;
+        }
+
+        this.syncConflictBusy = true;
+        await this.service.render();
+        try {
+            const result = await api.readFile(this.syncPayload({ relativePath: conflict.relativePath }));
+            if (result?.ok) {
+                this.syncConflictDetail = result;
+            } else {
+                this.syncConflictDetail = {
+                    relativePath: conflict.relativePath,
+                    serverError: result?.error || '충돌 파일을 읽지 못했습니다.'
+                };
+            }
+        } catch (error) {
+            this.syncConflictDetail = {
+                relativePath: conflict.relativePath,
+                serverError: this.errorMessage(error, '충돌 파일을 읽지 못했습니다.')
+            };
+        } finally {
+            this.syncConflictBusy = false;
+            await this.service.render();
+        }
+    }
+
+    private syncApi() {
+        return (window as any).notedown?.sync;
+    }
+
+    private syncPayload(extra: Record<string, unknown> = {}) {
+        return {
+            serverUrl: this.settings.syncServerUrl,
+            username: this.settings.syncUsername,
+            token: this.settings.syncToken,
+            clientId: this.settings.syncClientId,
+            storagePath: this.settings.storagePath,
+            ...extra
+        };
+    }
+
+    public hasSyncToken() {
+        return Boolean(this.settings.syncToken);
+    }
+
+    private ensureSyncReady() {
+        if (!this.settings.storagePath) {
+            this.setSyncMessage('저장소 디렉토리를 먼저 선택하세요.', 'warning');
+            return false;
+        }
+        if (!this.hasSyncToken()) {
+            this.setSyncMessage('동기화 서버 로그인이 필요합니다.', 'warning');
+            return false;
+        }
+        return true;
+    }
+
+    private validSyncCredential() {
+        if (!this.settings.syncServerUrl.trim()) {
+            this.setSyncMessage('동기화 서버 URL을 입력하세요.', 'warning');
+            return false;
+        }
+        if (!this.settings.syncUsername.trim()) {
+            this.setSyncMessage('사용자 이름을 입력하세요.', 'warning');
+            return false;
+        }
+        if (this.syncPassword.length < 8) {
+            this.setSyncMessage('비밀번호는 8자 이상이어야 합니다.', 'warning');
+            return false;
+        }
+        return true;
+    }
+
+    private storeSyncToken(result: any) {
+        this.settings.syncToken = result.accessToken || '';
+        this.settings.syncTokenType = result.tokenType || 'Bearer';
+        this.saveSettings();
+    }
+
+    private syncSummaryMessage(summary: SyncPlanSummary) {
+        return [
+            `업로드 ${summary.uploadFiles}`,
+            `다운로드 ${summary.downloadFiles}`,
+            `서버 삭제 ${summary.deleteServerFiles}`,
+            `로컬 삭제 ${summary.deleteLocalFiles}`,
+            `충돌 ${summary.conflicts}`
+        ].join(', ');
+    }
+
+    private createClientId() {
+        return `notedown-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
     }
 
     private errorMessage(error: unknown, fallback: string) {

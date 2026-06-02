@@ -1,16 +1,70 @@
 {
   "name": "notedown",
+  "productName": "Notedown",
   "version": "0.1.0",
+  "description": "Notedown desktop Markdown notes app",
+  "author": "Taewook Kwon (ImuruKevol) <kwon3286@season.co.kr>",
+  "license": "MIT",
   "private": true,
   "main": "electron/main.cjs",
   "scripts": {
     "electron": "electron .",
-    "electron:dev": "NOTEDOWN_DEV_URL=http://localhost:4200 electron ."
-  },
-  "dependencies": {
-    "@angular/cli": "^21.0.0"
+    "electron:dev": "NOTEDOWN_DEV_URL=http://localhost:4200 electron .",
+    "dist": "electron-builder",
+    "dist:mac:arm64": "electron-builder --mac --arm64",
+    "dist:mac:x64": "electron-builder --mac --x64",
+    "dist:win:nsis": "electron-builder --win nsis --x64",
+    "dist:requested": "npm run dist:mac:arm64 && npm run dist:mac:x64 && npm run dist:win:nsis"
   },
   "devDependencies": {
-    "electron": "^42.3.0"
+    "@angular/cli": "^21.0.0",
+    "electron": "^42.3.0",
+    "electron-builder": "^26.8.1"
+  },
+  "build": {
+    "appId": "com.notedown.app",
+    "productName": "Notedown",
+    "artifactName": "${productName}-${version}-${os}-${arch}.${ext}",
+    "asar": true,
+    "directories": {
+      "buildResources": "build-resources",
+      "output": "dist"
+    },
+    "files": [
+      "package.json",
+      "electron/**/*",
+      "bundle/www/**/*",
+      "build-resources/**/*"
+    ],
+    "extraMetadata": {
+      "name": "notedown",
+      "productName": "Notedown",
+      "main": "electron/main.cjs"
+    },
+    "mac": {
+      "category": "public.app-category.productivity",
+      "icon": "build-resources/icon.icns",
+      "identity": "-",
+      "target": [
+        "dmg",
+        "zip"
+      ]
+    },
+    "dmg": {
+      "backgroundColor": "#fbfbfa"
+    },
+    "win": {
+      "icon": "build-resources/icon.ico",
+      "target": [
+        "nsis"
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "shortcutName": "Notedown",
+      "uninstallDisplayName": "Notedown"
+    }
   }
 }

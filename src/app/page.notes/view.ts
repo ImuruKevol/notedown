@@ -4,6 +4,8 @@ import { Converter } from 'showdown';
 import { NuMonacoEditorEvent } from '@ng-util/monaco-editor';
 
 type ViewMode = 'write' | 'split' | 'preview';
+type SyncConflictResolution = 'server' | 'local';
+type SyncConflictResolveTone = 'info' | 'success' | 'warning' | 'error';
 
 interface PreviewBlock {
     type: 'markdown' | 'code' | 'blank';
@@ -36,6 +38,28 @@ interface NoteItem {
     workspaceName?: string;
     fileName?: string;
     relativePath?: string;
+}
+
+interface SyncConflict {
+    relativePath: string;
+    reason?: string;
+    type?: string;
+    clientRevision?: string;
+    serverRevision?: string;
+    serverFile?: any;
+    serverNote?: any;
+    clientNote?: any;
+    clientWorkspace?: any;
+    serverWorkspace?: any;
+}
+
+interface SyncConflictDetail {
+    relativePath?: string;
+    serverContent?: string;
+    localContent?: string;
+    serverError?: string;
+    localError?: string;
+    localExists?: boolean;
 }
 
 interface DocumentSectionStyle {
@@ -72,13 +96,21 @@ interface ParsedStyleBlock {
 export class Component implements OnInit, OnDestroy {
     private storageKey = 'notedown.notes.v1';
     private activeNoteKey = 'notedown.activeNoteId.v1';
+    private startupSyncResultKey = 'notedown.sync.startup.result.v1';
     private converter = new Converter({ tables: true, tasklists: true, strikethrough: true, simpleLineBreaks: true });
     private editor: any;
+    private diffEditor: any;
+    private diffOriginalModel: any;
+    private diffModifiedModel: any;
+    private diffRenderTimeout: number | null = null;
     private completionDisposable: any;
     private foldingDisposable: any;
     private editorMouseMoveDisposable: any;
     private editorMouseLeaveDisposable: any;
     private styleFoldTimeout: number | null = null;
+    private autoSaveTimeout: number | null = null;
+    private syncUploadTimeout: number | null = null;
+    private readonly autoSaveDelayMs = 2500;
     private autoFoldedStyleNoteId = '';
     private hoveredLineDecorationIds: string[] = [];
 
@@ -96,6 +128,17 @@ export class Component implements OnInit, OnDestroy {
     public documentStyleCss = '';
     public editingTitle = false;
     public titleDraft = '';
+    public hasUnsavedChanges = false;
+    public syncConflicts: SyncConflict[] = [];
+    public selectedSyncConflictIndex = 0;
+    public syncConflictDetail: SyncConflictDetail | null = null;
+    public syncConflictBusy = false;
+    public syncConflictDiffReady = false;
+    public syncConflictResolveChoice: SyncConflictResolution = 'server';
+    public syncConflictResolveBusy = false;
+    public syncConflictResolveMessage = '';
+    public syncConflictResolveTone: SyncConflictResolveTone = 'info';
+    public hiddenMonacoOptions = this.createHiddenMonacoOptions();
 
     public get hasSelectedNote() {
         return Boolean(this.activeNote?.id);
@@ -114,6 +157,7 @@ export class Component implements OnInit, OnDestroy {
         const source = (event as CustomEvent<{ source?: string }>).detail?.source;
         if (source === 'page.notes') return;
 
+        if (this.hasUnsavedChanges) this.saveNow(false);
         const activeId = this.activeNote?.id;
         await this.loadNotes(false);
         this.selectNoteById(localStorage.getItem(this.activeNoteKey) || activeId);
@@ -121,7 +165,25 @@ export class Component implements OnInit, OnDestroy {
     private handleSettingsChanged = () => {
         this.viewMode = this.settingsViewMode();
         this.refreshEditorOptions();
+        if (this.showSyncConflictViewer()) {
+            this.renderSyncConflictDiffSoon();
+            return;
+        }
         this.focusEditorSoon();
+    };
+    private handleStartupSyncStatus = (event: Event) => {
+        this.applyStartupSyncConflict((event as CustomEvent<any>).detail);
+    };
+    private handleOpenSyncConflict = () => {
+        this.applyStartupSyncConflict();
+        this.renderSyncConflictDiffSoon();
+    };
+    private handleSaveShortcut = (event: KeyboardEvent) => {
+        const key = String(event.key || '').toLowerCase();
+        if (key !== 's' || (!event.metaKey && !event.ctrlKey) || event.altKey) return;
+        event.preventDefault();
+        if (this.showSyncConflictViewer()) return;
+        this.saveNow(true);
     };
 
     constructor(private sanitizer: DomSanitizer) { }
@@ -129,20 +191,33 @@ export class Component implements OnInit, OnDestroy {
     public async ngOnInit() {
         this.viewMode = this.settingsViewMode();
         this.editorOptions = this.createEditorOptions();
+        await this.runStartupSync();
+        this.applyStartupSyncConflict();
         await this.loadNotes(true);
         window.addEventListener('notedown:select-note', this.handleSelectNote);
         window.addEventListener('notedown:notes-changed', this.handleNotesChanged);
         window.addEventListener('notedown:settings-changed', this.handleSettingsChanged);
+        window.addEventListener('notedown:startup-sync-status', this.handleStartupSyncStatus);
+        window.addEventListener('notedown:open-sync-conflict', this.handleOpenSyncConflict);
+        window.addEventListener('keydown', this.handleSaveShortcut, true);
+        this.renderSyncConflictDiffSoon();
     }
 
     public ngOnDestroy() {
+        if (this.hasUnsavedChanges) this.saveNow(false);
         window.removeEventListener('notedown:select-note', this.handleSelectNote);
         window.removeEventListener('notedown:notes-changed', this.handleNotesChanged);
         window.removeEventListener('notedown:settings-changed', this.handleSettingsChanged);
+        window.removeEventListener('notedown:startup-sync-status', this.handleStartupSyncStatus);
+        window.removeEventListener('notedown:open-sync-conflict', this.handleOpenSyncConflict);
+        window.removeEventListener('keydown', this.handleSaveShortcut, true);
         if (this.completionDisposable) this.completionDisposable.dispose();
         if (this.foldingDisposable) this.foldingDisposable.dispose();
         this.clearScheduledStyleFold();
+        this.clearScheduledAutoSave();
+        this.clearScheduledSyncUpload();
         this.disposeEditorHoverHandlers();
+        this.disposeDiffEditor();
     }
 
     public createNote() {
@@ -164,7 +239,7 @@ export class Component implements OnInit, OnDestroy {
         this.activeNote = note;
         this.persist(true);
         this.refreshPreview();
-        this.focusEditorSoon();
+        if (!this.showSyncConflictViewer()) this.focusEditorSoon();
     }
 
     public handleBodyChange(nextBody: string) {
@@ -177,13 +252,18 @@ export class Component implements OnInit, OnDestroy {
         this.touchNote();
     }
 
-    public touchNote() {
+    public touchNote(saveImmediately = false) {
         if (!this.hasSelectedNote) return;
         const now = Date.now();
         this.activeNote.updatedAt = this.nowLabel(new Date(now));
         this.activeNote.updatedAtMs = now;
-        this.persist(true);
         this.refreshPreview();
+        this.hasUnsavedChanges = true;
+        if (saveImmediately) {
+            this.saveNow(true);
+            return;
+        }
+        this.scheduleAutoSave();
     }
 
     public startTitleEdit() {
@@ -215,8 +295,18 @@ export class Component implements OnInit, OnDestroy {
         this.editingTitle = false;
     }
 
+    public saveNow(emitChange = true) {
+        if (!this.hasSelectedNote) return;
+        this.clearScheduledAutoSave();
+        this.persist(emitChange);
+    }
+
     public setMode(mode: ViewMode) {
         this.viewMode = mode;
+        if (this.showSyncConflictViewer()) {
+            this.renderSyncConflictDiffSoon();
+            return;
+        }
         this.focusEditorSoon();
     }
 
@@ -335,6 +425,141 @@ export class Component implements OnInit, OnDestroy {
         return `${base} text-stone-500 hover:bg-stone-100 hover:text-stone-950 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:text-zinc-50`;
     }
 
+    public showSyncConflictViewer() {
+        return this.syncConflicts.length > 0;
+    }
+
+    public selectedSyncConflict() {
+        return this.syncConflicts[this.selectedSyncConflictIndex] || this.syncConflicts[0] || null;
+    }
+
+    public selectSyncConflict(index: number) {
+        if (index < 0 || index >= this.syncConflicts.length) return;
+        this.selectedSyncConflictIndex = index;
+        this.syncConflictDetail = null;
+        this.syncConflictDiffReady = false;
+        this.syncConflictResolveMessage = '';
+        this.renderSyncConflictDiffSoon();
+        void this.loadSyncConflictDetail();
+    }
+
+    public syncConflictButtonClass(index: number) {
+        const base = 'flex w-full min-w-0 items-center justify-between gap-2 rounded-md px-2.5 py-2 text-left text-[12px] font-medium transition-colors';
+        if (this.selectedSyncConflictIndex === index) return `${base} bg-amber-100 text-amber-950 dark:bg-amber-500/25 dark:text-amber-100`;
+        return `${base} text-stone-600 hover:bg-stone-100 hover:text-stone-950 dark:text-zinc-300 dark:hover:bg-zinc-800 dark:hover:text-zinc-50`;
+    }
+
+    public syncConflictReason(conflict = this.selectedSyncConflict()) {
+        const reason = conflict?.reason || '';
+        if (reason === 'server_metadata_changed_after_local_edit') return '서버 변경과 로컬 편집이 겹쳤습니다.';
+        if (reason === 'server_metadata_changed_without_sync_history') return '동기화 이력이 없어 자동 적용하지 않았습니다.';
+        if (reason === 'server_metadata_removed_after_local_edit') return '서버 삭제와 로컬 편집이 겹쳤습니다.';
+        if (reason === 'server_file_changed') return '서버 파일이 변경되었습니다.';
+        if (reason === 'server_metadata_changed') return '서버 메타데이터가 변경되었습니다.';
+        if (reason === 'conflict') return '서버와 로컬 버전이 충돌했습니다.';
+        return reason || '서버와 로컬 버전을 수동으로 비교해야 합니다.';
+    }
+
+    public syncConflictPathLabel(conflict = this.selectedSyncConflict()) {
+        return conflict?.relativePath || '충돌 상세 정보 없음';
+    }
+
+    public setSyncConflictResolveChoice(choice: SyncConflictResolution) {
+        this.syncConflictResolveChoice = choice;
+        this.syncConflictResolveMessage = '';
+    }
+
+    public syncConflictResolveChoiceButtonClass(choice: SyncConflictResolution) {
+        const base = 'h-8 rounded-md px-3 text-[12px] font-semibold transition-colors';
+        if (this.syncConflictResolveChoice === choice) {
+            return `${base} bg-stone-900 text-white dark:bg-zinc-100 dark:text-zinc-950`;
+        }
+        return `${base} text-stone-600 hover:bg-stone-100 hover:text-stone-950 dark:text-zinc-300 dark:hover:bg-zinc-800 dark:hover:text-zinc-50`;
+    }
+
+    public syncConflictApplyButtonClass() {
+        return 'h-9 rounded-md bg-amber-500 px-3 text-[13px] font-semibold text-white shadow-sm transition hover:bg-amber-600 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-amber-400 dark:text-zinc-950 dark:hover:bg-amber-300';
+    }
+
+    public syncConflictResolveMessageClass() {
+        const base = 'min-h-5 truncate text-[12px]';
+        if (this.syncConflictResolveTone === 'success') return `${base} text-emerald-700 dark:text-emerald-300`;
+        if (this.syncConflictResolveTone === 'warning') return `${base} text-amber-700 dark:text-amber-300`;
+        if (this.syncConflictResolveTone === 'error') return `${base} text-red-600 dark:text-red-300`;
+        return `${base} text-stone-500 dark:text-zinc-400`;
+    }
+
+    public async resolveSelectedSyncConflict() {
+        const conflict = this.selectedSyncConflict();
+        const relativePath = conflict?.relativePath || '';
+        const api = this.syncApi();
+        if (!relativePath || this.syncConflictResolveBusy) return;
+        if (!api?.resolveConflict) {
+            this.setSyncConflictResolveMessage('충돌 적용은 Electron 앱에서 사용할 수 있습니다.', 'warning');
+            return;
+        }
+
+        this.syncConflictResolveBusy = true;
+        this.setSyncConflictResolveMessage(this.syncConflictResolveChoice === 'server'
+            ? '서버 버전을 로컬 문서에 적용하는 중입니다...'
+            : '로컬 버전을 서버에 적용하는 중입니다...', 'info');
+
+        try {
+            const result = await api.resolveConflict(this.syncPayload({
+                relativePath,
+                resolution: this.syncConflictResolveChoice,
+                serverRevision: this.syncConflictServerRevision(conflict),
+                serverFile: conflict.serverFile || this.syncConflictDetail?.serverFile || null,
+                serverNote: conflict.serverNote || null,
+                serverWorkspace: conflict.serverWorkspace || null
+            }));
+
+            if (!result?.didApply && !result?.ok) {
+                this.setSyncConflictResolveMessage(result?.error || '충돌을 적용하지 못했습니다.', 'error');
+                if (result?.status === 'conflict' || result?.conflicts?.length) this.storeStartupSyncResult(result);
+                return;
+            }
+
+            await this.reloadNotesAfterSyncResolution();
+            this.storeStartupSyncResult(result);
+            const remaining = this.startupSyncConflictCount(result);
+            this.setSyncConflictResolveMessage(
+                remaining > 0 ? `선택한 충돌을 적용했습니다. 남은 충돌 ${remaining}건` : '선택한 충돌을 적용하고 동기화했습니다.',
+                remaining > 0 ? 'warning' : 'success'
+            );
+        } catch (error) {
+            this.setSyncConflictResolveMessage(this.errorMessage(error, '충돌을 적용하지 못했습니다.'), 'error');
+        } finally {
+            this.syncConflictResolveBusy = false;
+            this.renderSyncConflictDiffSoon();
+        }
+    }
+
+    public syncConflictServerText() {
+        const conflict = this.selectedSyncConflict();
+        if (!conflict) return '';
+        if (this.syncConflictBusy) return '서버 파일을 불러오는 중입니다...';
+        if (this.syncConflictDetail?.serverError) return `서버 파일을 읽지 못했습니다.\n\n${this.syncConflictDetail.serverError}`;
+        if (typeof this.syncConflictDetail?.serverContent === 'string') return this.syncConflictDetail.serverContent;
+        return JSON.stringify(conflict.serverNote || conflict.serverFile || {}, null, 2);
+    }
+
+    public syncConflictLocalText() {
+        const conflict = this.selectedSyncConflict();
+        if (!conflict) return '';
+        if (this.syncConflictBusy) return '로컬 파일을 불러오는 중입니다...';
+        if (this.syncConflictDetail?.localError && !this.syncConflictDetail.localExists) {
+            return `로컬 파일을 읽지 못했습니다.\n\n${this.syncConflictDetail.localError}`;
+        }
+        if (typeof this.syncConflictDetail?.localContent === 'string') return this.syncConflictDetail.localContent;
+        return JSON.stringify(conflict.clientNote || {}, null, 2);
+    }
+
+    public onHiddenMonacoEvent(event: NuMonacoEditorEvent) {
+        if (event.type !== 'init' && event.type !== 're-init') return;
+        this.renderSyncConflictDiffSoon();
+    }
+
     public codePreviewOptions(block: PreviewBlock) {
         const dark = document.documentElement.classList.contains('dark');
         return {
@@ -413,12 +638,14 @@ export class Component implements OnInit, OnDestroy {
     }
 
     private selectNoteById(id?: string | null) {
+        if (this.hasUnsavedChanges) this.saveNow(true);
         const note = this.notes.find(item => item.id === id) || this.notes[0];
         if (!note) {
             this.activeNote = this.emptyNote();
             this.editingTitle = false;
             this.titleDraft = '';
             this.savedAt = '';
+            this.hasUnsavedChanges = false;
             localStorage.removeItem(this.activeNoteKey);
             this.clearSyncedLineHover();
             this.disposeEditorHoverHandlers();
@@ -433,8 +660,12 @@ export class Component implements OnInit, OnDestroy {
         this.autoFoldedStyleNoteId = '';
         localStorage.setItem(this.activeNoteKey, note.id);
         this.refreshPreview();
-        this.focusEditorSoon();
-        this.scheduleFoldStyleBlocks();
+        if (this.showSyncConflictViewer()) {
+            this.renderSyncConflictDiffSoon();
+        } else {
+            this.focusEditorSoon();
+            this.scheduleFoldStyleBlocks();
+        }
     }
 
     private async loadNotes(selectStored: boolean) {
@@ -461,6 +692,8 @@ export class Component implements OnInit, OnDestroy {
 
     private persist(emitChange: boolean) {
         localStorage.setItem(this.storageKey, JSON.stringify(this.notes));
+        const syncNoteId = this.activeNote?.id || '';
+        this.hasUnsavedChanges = false;
         if (this.hasSelectedNote) {
             localStorage.setItem(this.activeNoteKey, this.activeNote.id);
         } else {
@@ -470,11 +703,30 @@ export class Component implements OnInit, OnDestroy {
         const fileSave = this.persistFileNotes();
         if (emitChange) {
             if (fileSave) {
-                fileSave.finally(() => this.emitNotesChanged());
+                fileSave.finally(() => {
+                    this.scheduleAutoSync(syncNoteId);
+                    this.emitNotesChanged();
+                });
             } else {
+                this.scheduleAutoSync(syncNoteId);
                 this.emitNotesChanged();
             }
         }
+    }
+
+    private scheduleAutoSave() {
+        if (!this.autoSaveEnabled()) return;
+        this.clearScheduledAutoSave();
+        this.autoSaveTimeout = window.setTimeout(() => {
+            this.autoSaveTimeout = null;
+            this.saveNow(true);
+        }, this.autoSaveDelayMs);
+    }
+
+    private clearScheduledAutoSave() {
+        if (this.autoSaveTimeout == null) return;
+        window.clearTimeout(this.autoSaveTimeout);
+        this.autoSaveTimeout = null;
     }
 
     private emitNotesChanged() {
@@ -506,6 +758,378 @@ export class Component implements OnInit, OnDestroy {
         if (!api?.saveNotes || !storagePath) return null;
 
         return api.saveNotes({ storagePath, notes: this.notes }).catch(() => null);
+    }
+
+    private scheduleAutoSync(noteId: string) {
+        if (!noteId || !this.autoSyncEnabled()) return;
+        this.clearScheduledSyncUpload();
+        this.syncUploadTimeout = window.setTimeout(() => {
+            this.syncUploadTimeout = null;
+            void this.uploadNoteToSyncServer(noteId);
+        }, 1200);
+    }
+
+    private clearScheduledSyncUpload() {
+        if (this.syncUploadTimeout == null) return;
+        window.clearTimeout(this.syncUploadTimeout);
+        this.syncUploadTimeout = null;
+    }
+
+    private async uploadNoteToSyncServer(noteId: string) {
+        const api = (window as any).notedown?.sync;
+        const settings = this.readSettings();
+        const note = this.notes.find(item => item.id === noteId);
+        if (!api?.uploadNote || !note || !settings.syncAutoUpload || !settings.syncToken || !settings.storagePath) return;
+
+        try {
+            await api.uploadNote({
+                serverUrl: settings.syncServerUrl,
+                token: settings.syncToken,
+                clientId: settings.syncClientId,
+                storagePath: settings.storagePath,
+                note
+            });
+        } catch (error) {
+            // Local save remains authoritative when server sync is unavailable.
+        }
+    }
+
+    private autoSyncEnabled() {
+        const settings = this.readSettings();
+        return Boolean(settings.syncAutoUpload && settings.syncToken && settings.storagePath);
+    }
+
+    private autoSaveEnabled() {
+        return this.readSettings().autoSave !== false;
+    }
+
+    private async runStartupSync() {
+        const api = (window as any).notedown?.sync;
+        const settings = this.readSettings();
+        if (!api?.runFull || !this.canRunSavedSync(settings)) return;
+
+        const sessionKey = `notedown.sync.startup.${settings.syncServerUrl}.${settings.syncClientId}`;
+        if (sessionStorage.getItem(sessionKey)) return;
+        sessionStorage.setItem(sessionKey, 'running');
+        this.storeStartupSyncResult({ ok: false, status: 'running' });
+
+        try {
+            const result = await api.runFull({
+                serverUrl: settings.syncServerUrl,
+                token: settings.syncToken,
+                clientId: settings.syncClientId,
+                storagePath: settings.storagePath
+            });
+            this.storeStartupSyncResult(result);
+        } catch (error) {
+            this.storeStartupSyncResult({ ok: false, status: 'error', error: this.errorMessage(error, '시작 동기화에 실패했습니다.') });
+        } finally {
+            sessionStorage.setItem(sessionKey, 'done');
+        }
+    }
+
+    private canRunSavedSync(settings: any) {
+        return Boolean(settings?.syncServerUrl && settings.syncToken && settings.storagePath && settings.syncClientId);
+    }
+
+    private storeStartupSyncResult(result: any) {
+        const conflicts = this.extractSyncConflicts(result);
+        const summary = result?.summary || {
+            uploadFiles: 0,
+            downloadFiles: 0,
+            deleteServerFiles: 0,
+            deleteLocalFiles: 0,
+            conflicts: conflicts.length
+        };
+        const conflictCount = Number(summary.conflicts) || conflicts.length;
+        const hasConflicts = result?.status === 'conflict' || conflictCount > 0;
+        const status = result?.status === 'running'
+            ? 'running'
+            : hasConflicts
+                ? 'conflict'
+                : result?.status || (result?.ok ? 'ok' : 'error');
+        const payload = {
+            status,
+            ok: Boolean(result?.ok && !hasConflicts),
+            summary,
+            conflicts,
+            error: result?.error || '',
+            syncedAtMs: Date.now()
+        };
+        localStorage.setItem(this.startupSyncResultKey, JSON.stringify(payload));
+        window.dispatchEvent(new CustomEvent('notedown:startup-sync-status', { detail: payload }));
+        this.applyStartupSyncConflict(payload);
+    }
+
+    private extractSyncConflicts(result: any) {
+        const items = [
+            ...(Array.isArray(result?.conflicts) ? result.conflicts : []),
+            ...(Array.isArray(result?.plan?.conflicts) ? result.plan.conflicts : []),
+            ...(Array.isArray(result?.operations?.conflicts) ? result.operations.conflicts : [])
+        ];
+        const conflicts = new Map<string, any>();
+        for (const rawItem of items) {
+            const item = rawItem?.file || rawItem;
+            const relativePath = item?.relativePath || item?.serverFile?.relativePath || '';
+            if (!relativePath) continue;
+            conflicts.set(`${relativePath}:${item.reason || item.status || ''}`, this.compactSyncConflict(item));
+        }
+        return Array.from(conflicts.values());
+    }
+
+    private compactSyncConflict(conflict: any) {
+        return {
+            relativePath: conflict.relativePath || conflict.serverFile?.relativePath || '',
+            reason: conflict.reason || conflict.status || '',
+            type: conflict.type || '',
+            clientRevision: conflict.clientRevision,
+            serverRevision: conflict.serverRevision,
+            serverFile: this.compactServerFile(conflict.serverFile),
+            serverNote: conflict.serverNote || null,
+            clientNote: conflict.clientNote || null,
+            clientWorkspace: conflict.clientWorkspace || null,
+            serverWorkspace: conflict.serverWorkspace || null
+        };
+    }
+
+    private compactServerFile(file: any) {
+        if (!file) return null;
+        const { content: _content, ...rest } = file;
+        return rest;
+    }
+
+    private applyStartupSyncConflict(result = this.readStartupSyncResult()) {
+        const conflictCount = this.startupSyncConflictCount(result);
+        const isRecent = result?.syncedAtMs && Date.now() - Number(result.syncedAtMs) <= 30 * 60 * 1000;
+        if (!isRecent || (result?.status !== 'conflict' && conflictCount <= 0)) {
+            this.clearSyncConflictViewer();
+            return;
+        }
+
+        const conflicts = this.extractSyncConflicts(result) as SyncConflict[];
+        this.syncConflicts = conflicts.length > 0 ? conflicts : [{ relativePath: '', reason: 'conflict' }];
+        if (this.selectedSyncConflictIndex >= this.syncConflicts.length) this.selectedSyncConflictIndex = 0;
+        this.syncConflictDetail = null;
+        this.syncConflictDiffReady = false;
+        void this.loadSyncConflictDetail();
+        this.renderSyncConflictDiffSoon();
+    }
+
+    private clearSyncConflictViewer() {
+        if (this.syncConflicts.length === 0) return;
+        this.syncConflicts = [];
+        this.selectedSyncConflictIndex = 0;
+        this.syncConflictDetail = null;
+        this.syncConflictBusy = false;
+        this.syncConflictResolveBusy = false;
+        this.syncConflictResolveMessage = '';
+        this.disposeDiffEditor();
+    }
+
+    private readStartupSyncResult() {
+        try {
+            return JSON.parse(localStorage.getItem(this.startupSyncResultKey) || '{}') || {};
+        } catch (error) {
+            return {};
+        }
+    }
+
+    private startupSyncConflictCount(result: any) {
+        return Number(result?.summary?.conflicts)
+            || result?.conflicts?.length
+            || result?.plan?.conflicts?.length
+            || result?.operations?.conflicts?.length
+            || 0;
+    }
+
+    private syncConflictServerRevision(conflict = this.selectedSyncConflict()) {
+        return Number(conflict?.serverRevision)
+            || Number(conflict?.serverFile?.revision)
+            || Number(this.syncConflictDetail?.serverFile?.revision)
+            || 0;
+    }
+
+    private setSyncConflictResolveMessage(message: string, tone: SyncConflictResolveTone) {
+        this.syncConflictResolveMessage = message;
+        this.syncConflictResolveTone = tone;
+    }
+
+    private async reloadNotesAfterSyncResolution() {
+        const activeId = localStorage.getItem(this.activeNoteKey) || this.activeNote?.id || '';
+        await this.loadNotes(false);
+        this.selectNoteById(activeId);
+        this.emitNotesChanged();
+    }
+
+    private async loadSyncConflictDetail() {
+        const conflict = this.selectedSyncConflict();
+        const relativePath = conflict?.relativePath || '';
+        const api = this.syncApi();
+        if (!relativePath || !api?.readFile) {
+            this.syncConflictDetail = null;
+            this.renderSyncConflictDiffSoon();
+            return;
+        }
+
+        this.syncConflictBusy = true;
+        this.syncConflictDiffReady = false;
+        this.renderSyncConflictDiffSoon();
+        try {
+            const result = await api.readFile(this.syncPayload({ relativePath }));
+            if (this.selectedSyncConflict()?.relativePath !== relativePath) return;
+            if (result?.ok) {
+                this.syncConflictDetail = result;
+            } else {
+                this.syncConflictDetail = {
+                    relativePath,
+                    serverError: result?.error || '충돌 파일을 읽지 못했습니다.'
+                };
+            }
+        } catch (error) {
+            if (this.selectedSyncConflict()?.relativePath !== relativePath) return;
+            this.syncConflictDetail = {
+                relativePath,
+                serverError: this.errorMessage(error, '충돌 파일을 읽지 못했습니다.')
+            };
+        } finally {
+            if (this.selectedSyncConflict()?.relativePath === relativePath) {
+                this.syncConflictBusy = false;
+                this.renderSyncConflictDiffSoon();
+            }
+        }
+    }
+
+    private syncApi() {
+        return (window as any).notedown?.sync;
+    }
+
+    private syncPayload(extra: Record<string, unknown> = {}) {
+        const settings = this.readSettings();
+        return {
+            serverUrl: settings.syncServerUrl,
+            username: settings.syncUsername,
+            token: settings.syncToken,
+            clientId: settings.syncClientId,
+            storagePath: settings.storagePath,
+            ...extra
+        };
+    }
+
+    private renderSyncConflictDiffSoon(delay = 0) {
+        if (this.diffRenderTimeout != null) window.clearTimeout(this.diffRenderTimeout);
+        this.diffRenderTimeout = window.setTimeout(() => {
+            this.diffRenderTimeout = null;
+            this.renderSyncConflictDiff();
+        }, delay);
+    }
+
+    private renderSyncConflictDiff() {
+        if (!this.showSyncConflictViewer()) {
+            this.disposeDiffEditor();
+            return;
+        }
+
+        const monaco = (window as any).monaco;
+        const host = document.getElementById('notedown-sync-conflict-diff');
+        if (!monaco?.editor || !host) {
+            this.syncConflictDiffReady = false;
+            return;
+        }
+        if (host.clientWidth <= 0 || host.clientHeight <= 0) {
+            this.syncConflictDiffReady = false;
+            this.renderSyncConflictDiffSoon(50);
+            return;
+        }
+
+        if (!this.diffEditor) {
+            this.diffEditor = monaco.editor.createDiffEditor(host, this.createDiffEditorOptions());
+        } else {
+            this.diffEditor.updateOptions(this.createDiffEditorOptions());
+        }
+
+        this.disposeDiffModels();
+        this.diffOriginalModel = monaco.editor.createModel(this.syncConflictServerText(), 'markdown');
+        this.diffModifiedModel = monaco.editor.createModel(this.syncConflictLocalText(), 'markdown');
+        this.diffEditor.setModel({
+            original: this.diffOriginalModel,
+            modified: this.diffModifiedModel
+        });
+        this.layoutSyncConflictDiff(host);
+        this.syncConflictDiffReady = true;
+        window.setTimeout(() => this.layoutSyncConflictDiff(host), 0);
+    }
+
+    private createDiffEditorOptions() {
+        const dark = document.documentElement.classList.contains('dark');
+        return {
+            theme: dark ? 'vs-dark' : 'vs',
+            readOnly: true,
+            originalEditable: false,
+            renderSideBySide: true,
+            useInlineViewWhenSpaceIsLimited: false,
+            enableSplitViewResizing: true,
+            automaticLayout: true,
+            ignoreTrimWhitespace: false,
+            wordWrap: 'on',
+            diffWordWrap: 'on',
+            fontFamily: 'SFMono-Regular, ui-monospace, Menlo, Monaco, Consolas, monospace',
+            fontSize: 13,
+            lineHeight: 20,
+            minimap: { enabled: false },
+            scrollbar: {
+                vertical: 'auto',
+                horizontal: 'auto',
+                alwaysConsumeMouseWheel: false,
+                verticalScrollbarSize: 10,
+                horizontalScrollbarSize: 10
+            },
+            scrollBeyondLastLine: false,
+            overviewRulerLanes: 0,
+            renderOverviewRuler: false
+        };
+    }
+
+    private layoutSyncConflictDiff(host = document.getElementById('notedown-sync-conflict-diff')) {
+        if (!this.diffEditor || !host) return;
+        const width = Math.max(0, Math.floor(host.clientWidth));
+        const height = Math.max(0, Math.floor(host.clientHeight));
+        if (width > 0 && height > 0) this.diffEditor.layout({ width, height });
+    }
+
+    private createHiddenMonacoOptions() {
+        return {
+            language: 'markdown',
+            theme: 'vs',
+            readOnly: true,
+            minimap: { enabled: false },
+            lineNumbers: 'off',
+            automaticLayout: false
+        };
+    }
+
+    private disposeDiffEditor() {
+        if (this.diffRenderTimeout != null) {
+            window.clearTimeout(this.diffRenderTimeout);
+            this.diffRenderTimeout = null;
+        }
+        if (this.diffEditor) {
+            this.diffEditor.setModel?.(null);
+            this.diffEditor.dispose?.();
+            this.diffEditor = null;
+        }
+        this.disposeDiffModels();
+        this.syncConflictDiffReady = false;
+    }
+
+    private disposeDiffModels() {
+        this.diffOriginalModel?.dispose?.();
+        this.diffModifiedModel?.dispose?.();
+        this.diffOriginalModel = null;
+        this.diffModifiedModel = null;
+    }
+
+    private errorMessage(error: unknown, fallback: string) {
+        return error instanceof Error && error.message ? error.message : fallback;
     }
 
     private storagePath() {
@@ -595,6 +1219,14 @@ export class Component implements OnInit, OnDestroy {
                 const position = editor.getPosition();
                 editor.trigger('keyboard', 'type', { text: '/' });
                 if (position?.column === 1) editor.trigger('keyboard', 'editor.action.triggerSuggest', {});
+            }
+        });
+        this.editor.addAction({
+            id: 'notedown-save-note',
+            label: 'Save note',
+            keybindings: [monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS],
+            run: () => {
+                this.saveNow(true);
             }
         });
 
@@ -1436,6 +2068,7 @@ ${documentCss}
     }
 
     private focusEditorSoon() {
+        if (this.showSyncConflictViewer()) return;
         if (!this.hasSelectedNote) return;
         window.setTimeout(() => {
             if (this.editor && this.viewMode !== 'preview') this.editor.focus();

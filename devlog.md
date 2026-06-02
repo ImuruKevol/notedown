@@ -47,3 +47,14 @@
 | 2026-05-29 | 010 | 실제 본문 편집 시에만 자동 저장되도록 노트 저장 이벤트 개선 | [상세](devlog/2026-05-29/010-autosave-actual-edit-only.md) |
 | 2026-05-29 | 011 | Monaco 접기 아이콘 pointer cursor 적용 | [상세](devlog/2026-05-29/011-folding-icon-pointer-cursor.md) |
 | 2026-05-29 | 012 | Style 블럭 자동 접힘 및 접기 cursor 보강 | [상세](devlog/2026-05-29/012-style-auto-fold-cursor-fix.md) |
+| 2026-05-29 | 013 | 서버 동기화 기능 추가 | [상세](devlog/2026-05-29/013-server-sync.md) |
+| 2026-05-29 | 014 | 노트 자동 저장 debounce 및 저장 단축키 추가 | [상세](devlog/2026-05-29/014-debounced-save-shortcut.md) |
+| 2026-05-29 | 015 | 앱 시작 동기화 및 로그인 상태별 동기화 설정 UX 개선 | [상세](devlog/2026-05-29/015-startup-sync-settings-ux.md) |
+| 2026-06-01 | 001 | 서버 동기화 토큰 유효 시간 제거 | [상세](devlog/2026-06-01/001-remove-sync-token-expiry.md) |
+| 2026-06-01 | 002 | 시작 동기화 상태 표시 및 서버 메타데이터 동기화 보강 | [상세](devlog/2026-06-01/002-startup-sync-status-metadata-reconcile.md) |
+| 2026-06-01 | 003 | 동기화 충돌 상태 판정 및 충돌 뷰어 연결 | [상세](devlog/2026-06-01/003-sync-conflict-viewer.md) |
+| 2026-06-01 | 004 | 동기화 충돌 진입점 개선 및 노트 화면 Monaco diff 뷰어 이동 | [상세](devlog/2026-06-01/004-note-sync-conflict-diff-viewer.md) |
+| 2026-06-01 | 005 | 충돌 diff 레이아웃 수정 및 서버/로컬 버전 적용 UI 추가 | [상세](devlog/2026-06-01/005-sync-conflict-resolve-actions.md) |
+| 2026-06-01 | 006 | 충돌 diff editor 로드 전 textarea fallback 제거 | [상세](devlog/2026-06-01/006-sync-conflict-diff-loading-state.md) |
+| 2026-06-01 | 007 | Electron 앱 이름/로고 빌드 설정 및 macOS/Windows 배포 산출물 생성 | [상세](devlog/2026-06-01/007-electron-build-name-logo-artifacts.md) |
+| 2026-06-01 | 008 | Notedown 한영 README 및 MIT 라이선스 문서 추가 | [상세](devlog/2026-06-01/008-readme-license.md) |

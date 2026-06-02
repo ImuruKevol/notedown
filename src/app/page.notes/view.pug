@@ -1,17 +1,18 @@
 section(class="flex h-full min-h-0 flex-col bg-white text-stone-950 dark:bg-zinc-950 dark:text-zinc-50")
-    ng-container(*ngIf="hasSelectedNote")
+    ng-container(*ngIf="hasSelectedNote || showSyncConflictViewer()")
         header(class="app-drag flex h-14 shrink-0 items-center justify-between border-b border-stone-200 bg-white px-5 dark:border-zinc-800 dark:bg-zinc-950")
             div(class="min-w-0 flex flex-1 items-center")
                 div(*ngIf="!editingTitle", class="min-w-0 flex max-w-full items-center gap-1.5")
-                    span(class="min-w-0 truncate text-[16px] font-semibold text-stone-900 dark:text-zinc-100", [title]="noteTitleLabel()") {{noteTitleLabel()}}
-                    button(type="button", title="Edit title", aria-label="Edit title", class="flex size-8 shrink-0 items-center justify-center rounded-md text-stone-400 transition hover:bg-stone-100 hover:text-stone-950 dark:text-zinc-500 dark:hover:bg-zinc-800 dark:hover:text-zinc-50", (click)="startTitleEdit()")
+                    span(class="min-w-0 truncate text-[16px] font-semibold text-stone-900 dark:text-zinc-100", [title]="showSyncConflictViewer() ? syncConflictPathLabel() : noteTitleLabel()") {{showSyncConflictViewer() ? '동기화 충돌' : noteTitleLabel()}}
+                    button(*ngIf="!showSyncConflictViewer()", type="button", title="Edit title", aria-label="Edit title", class="flex size-8 shrink-0 items-center justify-center rounded-md text-stone-400 transition hover:bg-stone-100 hover:text-stone-950 dark:text-zinc-500 dark:hover:bg-zinc-800 dark:hover:text-zinc-50", (click)="startTitleEdit()")
                         svg(xmlns="http://www.w3.org/2000/svg", viewBox="0 0 24 24", fill="none", stroke="currentColor", stroke-width="1.8", stroke-linecap="round", stroke-linejoin="round", class="size-4")
                             path(d="M12 20h9")
                             path(d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z")
-                input(*ngIf="editingTitle", type="text", [(ngModel)]="titleDraft", (keydown.enter)="commitTitleEdit()", (keydown.escape)="cancelTitleEdit()", (blur)="commitTitleEdit()", data-note-title-input="true", class="app-no-drag min-w-0 w-full border-0 bg-transparent p-0 text-[16px] font-semibold text-stone-900 outline-none placeholder:text-stone-300 focus:ring-0 dark:text-zinc-100 dark:placeholder:text-zinc-700", placeholder="제목 없음")
+                input(*ngIf="editingTitle && !showSyncConflictViewer()", type="text", [(ngModel)]="titleDraft", (keydown.enter)="commitTitleEdit()", (keydown.escape)="cancelTitleEdit()", (blur)="commitTitleEdit()", data-note-title-input="true", class="app-no-drag min-w-0 w-full border-0 bg-transparent p-0 text-[16px] font-semibold text-stone-900 outline-none placeholder:text-stone-300 focus:ring-0 dark:text-zinc-100 dark:placeholder:text-zinc-700", placeholder="제목 없음")
             div(class="flex shrink-0 items-center gap-2 pl-4")
-                span(class="hidden whitespace-nowrap text-[12px] text-stone-400 sm:inline dark:text-zinc-500") 생성: {{createdAtLabel()}} · 저장: {{lastSavedLabel()}}
-                div(class="flex rounded-lg border border-stone-200 bg-white/95 p-1 shadow-sm backdrop-blur dark:border-zinc-800 dark:bg-zinc-900/95")
+                span(*ngIf="showSyncConflictViewer()", class="inline-flex h-7 items-center rounded-full bg-amber-100 px-2.5 text-[12px] font-semibold text-amber-800 dark:bg-amber-500/20 dark:text-amber-100") 충돌 {{syncConflicts.length}}건
+                span(*ngIf="!showSyncConflictViewer()", class="hidden whitespace-nowrap text-[12px] text-stone-400 sm:inline dark:text-zinc-500") 생성: {{createdAtLabel()}} · 저장: {{lastSavedLabel()}}
+                div(*ngIf="!showSyncConflictViewer()", class="flex rounded-lg border border-stone-200 bg-white/95 p-1 shadow-sm backdrop-blur dark:border-zinc-800 dark:bg-zinc-900/95")
                     button(type="button", title="Write", [class]="modeButtonClass('write')", (click)="setMode('write')")
                         svg(xmlns="http://www.w3.org/2000/svg", viewBox="0 0 24 24", fill="none", stroke="currentColor", stroke-width="1.8", stroke-linecap="round", stroke-linejoin="round", class="size-4")
                             path(d="M12 20h9")
@@ -24,7 +25,7 @@ section(class="flex h-full min-h-0 flex-col bg-white text-stone-950 dark:bg-zinc
                         svg(xmlns="http://www.w3.org/2000/svg", viewBox="0 0 24 24", fill="none", stroke="currentColor", stroke-width="1.8", stroke-linecap="round", stroke-linejoin="round", class="size-4")
                             path(d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z")
                             circle(cx="12", cy="12", r="3")
-                button(type="button", title="Toggle line numbers", [class]="lineNumberButtonClass()", (click)="toggleLineNumbers()")
+                button(*ngIf="!showSyncConflictViewer()", type="button", title="Toggle line numbers", [class]="lineNumberButtonClass()", (click)="toggleLineNumbers()")
                     svg(xmlns="http://www.w3.org/2000/svg", viewBox="0 0 24 24", fill="none", stroke="currentColor", stroke-width="1.8", stroke-linecap="round", stroke-linejoin="round", class="size-4")
                         path(d="M8 6h12")
                         path(d="M8 12h12")
@@ -32,7 +33,7 @@ section(class="flex h-full min-h-0 flex-col bg-white text-stone-950 dark:bg-zinc
                         path(d="M3 6h.01")
                         path(d="M3 12h.01")
                         path(d="M3 18h.01")
-                button(type="button", title="Save PDF", class="ml-2 flex size-9 items-center justify-center rounded-md text-stone-500 transition hover:bg-stone-100 hover:text-stone-950 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:text-zinc-50", (click)="exportNotePdf()")
+                button(*ngIf="!showSyncConflictViewer()", type="button", title="Save PDF", class="ml-2 flex size-9 items-center justify-center rounded-md text-stone-500 transition hover:bg-stone-100 hover:text-stone-950 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:text-zinc-50", (click)="exportNotePdf()")
                     svg(xmlns="http://www.w3.org/2000/svg", viewBox="0 0 24 24", fill="none", stroke="currentColor", stroke-width="1.8", stroke-linecap="round", stroke-linejoin="round", class="size-4")
                         path(d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z")
                         path(d="M14 2v6h6")
@@ -40,7 +41,34 @@ section(class="flex h-full min-h-0 flex-col bg-white text-stone-950 dark:bg-zinc
                         path(d="m9 15 3 3 3-3")
 
         div(class="relative min-h-0 flex-1 bg-white dark:bg-zinc-950")
-            div(class="grid h-full min-h-0", [ngClass]="viewMode === 'split' ? 'lg:grid-cols-2' : 'grid-cols-1'")
+            div(*ngIf="showSyncConflictViewer()", class="flex h-full min-h-0 flex-col gap-3 overflow-hidden p-4")
+                nu-monaco-editor(class="pointer-events-none absolute h-px w-px opacity-0", [ngModel]="''", [options]="hiddenMonacoOptions", height="1px", (event)="onHiddenMonacoEvent($event)")
+                div(class="flex shrink-0 flex-wrap items-center justify-between gap-3 border-b border-amber-200 pb-3 dark:border-amber-500/25")
+                    div(class="min-w-0 flex-1")
+                        p(class="text-[13px] font-semibold text-amber-900 dark:text-amber-100") 서버 버전과 로컬 버전 비교
+                        p(class="mt-1 truncate font-mono text-[12px] text-stone-500 dark:text-zinc-400", [title]="syncConflictPathLabel()") {{syncConflictPathLabel()}}
+                        p(*ngIf="syncConflictResolveMessage", [class]="syncConflictResolveMessageClass()", aria-live="polite") {{syncConflictResolveMessage}}
+                    div(class="flex shrink-0 flex-wrap items-center gap-2")
+                        div(class="flex rounded-lg border border-stone-200 bg-white p-1 shadow-sm dark:border-zinc-800 dark:bg-zinc-900")
+                            button(type="button", [class]="syncConflictResolveChoiceButtonClass('server')", (click)="setSyncConflictResolveChoice('server')") 서버 버전 사용
+                            button(type="button", [class]="syncConflictResolveChoiceButtonClass('local')", (click)="setSyncConflictResolveChoice('local')") 로컬 버전 사용
+                        button(type="button", [class]="syncConflictApplyButtonClass()", (click)="resolveSelectedSyncConflict()", [disabled]="syncConflictResolveBusy || syncConflictBusy || !selectedSyncConflict()?.relativePath", [attr.aria-busy]="syncConflictResolveBusy") {{syncConflictResolveBusy ? '적용 중...' : '선택 버전 적용'}}
+                div(class="grid min-h-0 flex-1 overflow-hidden gap-3 lg:grid-cols-[260px_minmax(0,1fr)]")
+                    nav(class="h-full min-h-0 space-y-1 overflow-y-auto rounded-md border border-stone-200 bg-stone-50/80 p-1.5 dark:border-zinc-800 dark:bg-zinc-900/60")
+                        button(type="button", *ngFor="let conflict of syncConflicts; let i = index", [class]="syncConflictButtonClass(i)", (click)="selectSyncConflict(i)")
+                            span(class="min-w-0 truncate") {{syncConflictPathLabel(conflict)}}
+                            span(class="shrink-0 text-[11px] tabular-nums") {{'#' + (i + 1)}}
+                    div(class="flex min-h-0 min-w-0 flex-col overflow-hidden rounded-md border border-stone-200 bg-white dark:border-zinc-800 dark:bg-zinc-950")
+                        div(class="grid shrink-0 border-b border-stone-200 text-[12px] font-semibold text-stone-600 dark:border-zinc-800 dark:text-zinc-300 lg:grid-cols-2")
+                            div(class="border-b border-stone-200 px-3 py-2 dark:border-zinc-800 lg:border-b-0 lg:border-r") 서버 버전
+                            div(class="px-3 py-2") 로컬 버전
+                        div(class="relative min-h-0 flex-1 overflow-hidden")
+                            div(id="notedown-sync-conflict-diff", class="absolute inset-0 h-full w-full overflow-hidden")
+                            div(*ngIf="!syncConflictDiffReady", class="absolute inset-0 flex items-center justify-center bg-white/95 p-4 dark:bg-zinc-950/95")
+                                div(class="flex flex-col items-center gap-3 text-center")
+                                    span(class="size-8 rounded-full border-2 border-stone-200 border-t-amber-500 animate-spin dark:border-zinc-800 dark:border-t-amber-300")
+                                    p(class="text-[13px] font-semibold text-stone-700 dark:text-zinc-200") {{syncConflictBusy ? '충돌 파일을 불러오는 중입니다...' : 'Monaco diff editor를 불러오는 중입니다...'}}
+            div(*ngIf="!showSyncConflictViewer()", class="grid h-full min-h-0", [ngClass]="viewMode === 'split' ? 'lg:grid-cols-2' : 'grid-cols-1'")
                 div(class="min-h-0", *ngIf="viewMode !== 'preview'")
                     nu-monaco-editor(class="block h-full min-h-0", [ngModel]="activeNote.body", (ngModelChange)="handleBodyChange($event)", [options]="editorOptions", height="100%", placeholder="Markdown", (event)="onEditorEvent($event)")
                 div(class="min-h-0 overflow-auto border-stone-200 p-2 dark:border-zinc-800", *ngIf="viewMode !== 'write'", [ngClass]="viewMode === 'split' ? 'border-t lg:border-l lg:border-t-0' : ''")
@@ -62,7 +90,7 @@ section(class="flex h-full min-h-0 flex-col bg-white text-stone-950 dark:bg-zinc
                                 div(class="notedown-preview-content")
                                     nu-monaco-editor(class="block", [ngModel]="block.code", [options]="codePreviewOptions(block)", [height]="codePreviewHeight(block.code)")
 
-    ng-container(*ngIf="!hasSelectedNote")
+    ng-container(*ngIf="!hasSelectedNote && !showSyncConflictViewer()")
         header(class="app-drag flex h-14 shrink-0 items-center justify-between border-b border-stone-200 bg-white px-5 dark:border-zinc-800 dark:bg-zinc-950")
             div(class="min-w-0 flex flex-1 items-center")
                 span(class="truncate text-[16px] font-semibold text-stone-500 dark:text-zinc-400") 노트가 선택되지 않았습니다
