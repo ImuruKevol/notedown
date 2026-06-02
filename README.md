@@ -4,6 +4,8 @@ Notedown is a local-first desktop Markdown notes app built with Electron, WIZ, a
 
 > Develop by [WIZ](https://github.com/season-framework/wiz) with AI.
 
+![Notedown](./screenshots/notedown.png)
+
 ---
 
 ## 한국어
