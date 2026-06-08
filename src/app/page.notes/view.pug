@@ -70,7 +70,13 @@ section(class="flex h-full min-h-0 flex-col bg-white text-stone-950 dark:bg-zinc
                                     p(class="text-[13px] font-semibold text-stone-700 dark:text-zinc-200") {{syncConflictBusy ? '충돌 파일을 불러오는 중입니다...' : 'Monaco diff editor를 불러오는 중입니다...'}}
             div(*ngIf="!showSyncConflictViewer()", class="grid h-full min-h-0", [ngClass]="viewMode === 'split' ? 'lg:grid-cols-2' : 'grid-cols-1'")
                 div(class="min-h-0", *ngIf="viewMode !== 'preview'")
-                    nu-monaco-editor(class="block h-full min-h-0", [ngModel]="activeNote.body", (ngModelChange)="handleBodyChange($event)", [options]="editorOptions", height="100%", placeholder="Markdown", (event)="onEditorEvent($event)")
+                    nu-monaco-editor(*ngIf="monacoEditorsReady", class="block h-full min-h-0", [ngModel]="activeNote.body", (ngModelChange)="handleBodyChange($event)", [options]="editorOptions", height="100%", placeholder="Markdown", (event)="onEditorEvent($event)")
+                    div(*ngIf="!monacoEditorsReady", class="flex h-full min-h-0 flex-col gap-3 bg-white p-4 dark:bg-zinc-950")
+                        div(class="h-5 w-48 rounded bg-stone-100 dark:bg-zinc-900")
+                        div(class="h-4 w-10/12 rounded bg-stone-100 dark:bg-zinc-900")
+                        div(class="h-4 w-8/12 rounded bg-stone-100 dark:bg-zinc-900")
+                        div(class="h-4 w-9/12 rounded bg-stone-100 dark:bg-zinc-900")
+                        div(class="mt-2 h-4 w-7/12 rounded bg-stone-100 dark:bg-zinc-900")
                 div(class="min-h-0 overflow-auto border-stone-200 p-2 dark:border-zinc-800", *ngIf="viewMode !== 'write'", [ngClass]="viewMode === 'split' ? 'border-t lg:border-l lg:border-t-0' : ''")
                     style(*ngIf="documentStyleCss", type="text/css", [textContent]="documentStyleCss")
                     div(class="notedown-preview-flow notedown-preview-document w-full max-w-none", [attr.style]="documentGlobalStyle || null", [class.has-line-numbers]="showLineNumbers", [class.has-text-style]="documentGlobalHasTextStyle", (click)="handlePreviewClick($event)", (mouseover)="handlePreviewMouseOver($event)", (mouseleave)="clearSyncedLineHover()")
@@ -88,7 +94,9 @@ section(class="flex h-full min-h-0 flex-col bg-white text-stone-950 dark:bg-zinc
                                 span(*ngIf="showLineNumbers", [class]="previewLineNumberClass(block)")
                                     span(*ngFor="let lineNumber of previewLineNumbers(block)") {{lineNumber + 1}}
                                 div(class="notedown-preview-content")
-                                    nu-monaco-editor(class="block", [ngModel]="block.code", [options]="codePreviewOptions(block)", [height]="codePreviewHeight(block.code)")
+                                    nu-monaco-editor(*ngIf="monacoEditorsReady", class="block", [ngModel]="block.code", [options]="codePreviewOptions(block)", [height]="codePreviewHeight(block.code)")
+                                    pre(*ngIf="!monacoEditorsReady", class="m-0 overflow-hidden rounded-none bg-stone-100 p-3 font-mono text-[13px] leading-5 text-stone-700 dark:bg-zinc-900 dark:text-zinc-200", [style.height]="codePreviewHeight(block.code)")
+                                        code {{block.code}}
 
     ng-container(*ngIf="!hasSelectedNote && !showSyncConflictViewer()")
         header(class="app-drag flex h-14 shrink-0 items-center justify-between border-b border-stone-200 bg-white px-5 dark:border-zinc-800 dark:bg-zinc-950")

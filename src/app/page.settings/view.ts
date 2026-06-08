@@ -1,9 +1,9 @@
-import { OnInit } from '@angular/core';
+import { OnDestroy, OnInit } from '@angular/core';
 import { Service } from '@wiz/libs/portal/season/service';
 
 type ThemeMode = 'light' | 'dark' | 'system';
 type EditorMode = 'markdown' | 'split' | 'preview';
-type ToggleKey = 'autoSave' | 'syncAutoUpload';
+type ToggleKey = 'autoSave' | 'syncAutoUpload' | 'keepInBackgroundOnClose';
 type StorageAction = '' | 'choose' | 'refresh' | 'initialize' | 'import';
 type SyncAction = '' | 'health' | 'setup' | 'login' | 'plan' | 'run';
 type StorageMessageTone = 'info' | 'success' | 'warning' | 'error';
@@ -14,6 +14,7 @@ interface AppSettings {
     theme: ThemeMode;
     editorMode: EditorMode;
     autoSave: boolean;
+    keepInBackgroundOnClose: boolean;
     tabSize: number;
     syncServerUrl: string;
     syncUsername: string;
@@ -67,10 +68,12 @@ interface SyncConflictDetail {
     serverError?: string;
 }
 
-export class Component implements OnInit {
+export class Component implements OnInit, OnDestroy {
     private storageKey = 'notedown.settings.v1';
     private notesKey = 'notedown.notes.v1';
     private startupSyncResultKey = 'notedown.sync.startup.result.v1';
+    private hadStoredSettings = false;
+    private lastSyncedKeepInBackgroundOnClose: boolean | null = null;
 
     public activeSection = 'general';
     public savedAt = '';
@@ -96,14 +99,29 @@ export class Component implements OnInit {
     ];
     public settings: AppSettings = this.defaultSettings();
 
+    private handleExternalSettingsChanged = (event: Event) => {
+        const settings = (event as CustomEvent<AppSettings>).detail;
+        if (!settings) return;
+        this.settings = this.normalizeSettings(settings);
+        this.savedAt = this.nowLabel();
+        this.applyTheme();
+        void this.service.render();
+    };
+
     constructor(public service: Service) { }
 
     public async ngOnInit() {
         this.loadSettings();
+        await this.hydrateAppPreferences();
         this.applyStartupSyncResult();
         await this.ensureDefaultStoragePath();
         await this.refreshStorageInfo();
         this.applyTheme();
+        window.addEventListener('notedown:settings-changed', this.handleExternalSettingsChanged);
+    }
+
+    public ngOnDestroy() {
+        window.removeEventListener('notedown:settings-changed', this.handleExternalSettingsChanged);
     }
 
     public setSection(id: string) {
@@ -135,6 +153,7 @@ export class Component implements OnInit {
         localStorage.setItem(this.storageKey, JSON.stringify(this.settings));
         this.savedAt = this.nowLabel();
         window.dispatchEvent(new CustomEvent('notedown:settings-changed', { detail: this.settings }));
+        this.syncAppPreferences();
     }
 
     public resetSettings() {
@@ -502,6 +521,7 @@ export class Component implements OnInit {
         try {
             const stored = localStorage.getItem(this.storageKey);
             if (!stored) return;
+            this.hadStoredSettings = true;
             this.settings = this.normalizeSettings(JSON.parse(stored));
             this.savedAt = this.nowLabel();
         } catch (error) {
@@ -516,6 +536,7 @@ export class Component implements OnInit {
             theme: 'light',
             editorMode: 'split',
             autoSave: true,
+            keepInBackgroundOnClose: true,
             tabSize: 2,
             syncServerUrl: 'http://172.16.0.143:5500',
             syncUsername: '',
@@ -534,6 +555,7 @@ export class Component implements OnInit {
             theme: this.normalizeTheme(stored?.theme),
             editorMode: this.normalizeEditorMode(stored?.editorMode),
             autoSave: typeof stored?.autoSave === 'boolean' ? stored.autoSave : defaults.autoSave,
+            keepInBackgroundOnClose: typeof stored?.keepInBackgroundOnClose === 'boolean' ? stored.keepInBackgroundOnClose : defaults.keepInBackgroundOnClose,
             tabSize: this.normalizeTabSize(stored?.tabSize),
             syncServerUrl: typeof stored?.syncServerUrl === 'string' ? stored.syncServerUrl : defaults.syncServerUrl,
             syncUsername: typeof stored?.syncUsername === 'string' ? stored.syncUsername : defaults.syncUsername,
@@ -562,6 +584,37 @@ export class Component implements OnInit {
         const prefersDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
         const dark = this.settings.theme === 'dark' || (this.settings.theme === 'system' && prefersDark);
         document.documentElement.classList.toggle('dark', dark);
+    }
+
+    private async hydrateAppPreferences() {
+        const api = this.appApi();
+        if (!api?.preferences) {
+            this.syncAppPreferences(true);
+            return;
+        }
+
+        try {
+            const result = await api.preferences();
+            if (!this.hadStoredSettings && typeof result?.keepInBackgroundOnClose === 'boolean') {
+                this.settings.keepInBackgroundOnClose = result.keepInBackgroundOnClose;
+            }
+            this.saveSettings();
+        } catch (error) {
+            this.syncAppPreferences(true);
+        }
+    }
+
+    private syncAppPreferences(force = false) {
+        const keepInBackgroundOnClose = this.settings.keepInBackgroundOnClose !== false;
+        if (!force && this.lastSyncedKeepInBackgroundOnClose === keepInBackgroundOnClose) return;
+
+        const api = this.appApi();
+        this.lastSyncedKeepInBackgroundOnClose = keepInBackgroundOnClose;
+        if (!api?.setPreferences) return;
+
+        void api.setPreferences({ keepInBackgroundOnClose }).catch(() => {
+            this.lastSyncedKeepInBackgroundOnClose = null;
+        });
     }
 
     private async ensureDefaultStoragePath() {
@@ -841,6 +894,10 @@ export class Component implements OnInit {
 
     private storageApi() {
         return (window as any).notedown?.storage;
+    }
+
+    private appApi() {
+        return (window as any).notedown?.app;
     }
 
     private nowLabel() {

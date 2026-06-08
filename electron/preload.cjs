@@ -7,6 +7,11 @@ contextBridge.exposeInMainWorld('notedown', {
         chrome: process.versions.chrome,
         node: process.versions.node
     },
+    app: {
+        preferences: () => ipcRenderer.invoke('notedown:app:preferences'),
+        setPreferences: (payload) => ipcRenderer.invoke('notedown:app:set-preferences', payload),
+        showWindow: () => ipcRenderer.invoke('notedown:app:show-window')
+    },
     storage: {
         defaultPath: () => ipcRenderer.invoke('notedown:storage:default-path'),
         chooseDirectory: () => ipcRenderer.invoke('notedown:storage:choose-directory'),

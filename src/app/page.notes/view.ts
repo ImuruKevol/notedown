@@ -1,4 +1,4 @@
-import { OnDestroy, OnInit } from '@angular/core';
+import { ChangeDetectorRef, OnDestroy, OnInit } from '@angular/core';
 import { DomSanitizer, SafeHtml } from '@angular/platform-browser';
 import { Converter } from 'showdown';
 import { NuMonacoEditorEvent } from '@ng-util/monaco-editor';
@@ -139,6 +139,7 @@ export class Component implements OnInit, OnDestroy {
     public syncConflictResolveMessage = '';
     public syncConflictResolveTone: SyncConflictResolveTone = 'info';
     public hiddenMonacoOptions = this.createHiddenMonacoOptions();
+    public monacoEditorsReady = false;
 
     public get hasSelectedNote() {
         return Boolean(this.activeNote?.id);
@@ -150,7 +151,10 @@ export class Component implements OnInit, OnDestroy {
 
     private handleSelectNote = (event: Event) => {
         const id = (event as CustomEvent<string>).detail;
-        if (id) this.selectNoteById(id);
+        if (id) {
+            this.selectNoteById(id);
+            this.requestViewUpdate();
+        }
     };
 
     private handleNotesChanged = async (event: Event) => {
@@ -161,18 +165,23 @@ export class Component implements OnInit, OnDestroy {
         const activeId = this.activeNote?.id;
         await this.loadNotes(false);
         this.selectNoteById(localStorage.getItem(this.activeNoteKey) || activeId);
+        this.requestViewUpdate();
     };
     private handleSettingsChanged = () => {
         this.viewMode = this.settingsViewMode();
         this.refreshEditorOptions();
         if (this.showSyncConflictViewer()) {
             this.renderSyncConflictDiffSoon();
+            this.requestViewUpdate();
             return;
         }
+        this.requestViewUpdate();
         this.focusEditorSoon();
     };
     private handleStartupSyncStatus = (event: Event) => {
-        this.applyStartupSyncConflict((event as CustomEvent<any>).detail);
+        const detail = (event as CustomEvent<any>).detail;
+        if (detail?.source === 'page.notes') return;
+        this.applyStartupSyncConflict(detail);
     };
     private handleOpenSyncConflict = () => {
         this.applyStartupSyncConflict();
@@ -186,21 +195,22 @@ export class Component implements OnInit, OnDestroy {
         this.saveNow(true);
     };
 
-    constructor(private sanitizer: DomSanitizer) { }
+    constructor(
+        private sanitizer: DomSanitizer,
+        private ref: ChangeDetectorRef
+    ) { }
 
-    public async ngOnInit() {
+    public ngOnInit() {
         this.viewMode = this.settingsViewMode();
         this.editorOptions = this.createEditorOptions();
-        await this.runStartupSync();
-        this.applyStartupSyncConflict();
-        await this.loadNotes(true);
+        this.loadCachedNotes(true);
         window.addEventListener('notedown:select-note', this.handleSelectNote);
         window.addEventListener('notedown:notes-changed', this.handleNotesChanged);
         window.addEventListener('notedown:settings-changed', this.handleSettingsChanged);
         window.addEventListener('notedown:startup-sync-status', this.handleStartupSyncStatus);
         window.addEventListener('notedown:open-sync-conflict', this.handleOpenSyncConflict);
         window.addEventListener('keydown', this.handleSaveShortcut, true);
-        this.renderSyncConflictDiffSoon();
+        this.startDeferredStartupWork();
     }
 
     public ngOnDestroy() {
@@ -668,6 +678,63 @@ export class Component implements OnInit, OnDestroy {
         }
     }
 
+    private loadCachedNotes(selectStored: boolean) {
+        try {
+            const stored = localStorage.getItem(this.storageKey);
+            if (stored) {
+                const notes = JSON.parse(stored);
+                if (Array.isArray(notes)) {
+                    this.notes = notes.map((note, index) => this.normalizeNote(note, index));
+                }
+            }
+        } catch (error) {
+            // Keep the already-initialized default notes when the cache is invalid.
+        }
+
+        if (!Array.isArray(this.notes) || this.notes.length === 0) this.notes = this.defaultNotes();
+        if (selectStored) this.selectNoteById(localStorage.getItem(this.activeNoteKey));
+    }
+
+    private startDeferredStartupWork() {
+        this.afterInitialRender(() => {
+            this.monacoEditorsReady = true;
+            this.requestViewUpdate();
+            void this.refreshNotesFromStorage(true)
+                .finally(() => { void this.runStartupSyncOrApplyStoredConflict(); });
+        });
+    }
+
+    private async refreshNotesFromStorage(selectStored: boolean) {
+        await this.loadNotes(selectStored);
+        this.requestViewUpdate();
+    }
+
+    private async runStartupSyncOrApplyStoredConflict() {
+        const didRun = await this.runStartupSync();
+        if (!didRun) this.applyStartupSyncConflict();
+        this.renderSyncConflictDiffSoon();
+        this.requestViewUpdate();
+    }
+
+    private afterInitialRender(callback: () => void) {
+        const run = () => window.setTimeout(callback, 0);
+        if (typeof window.requestAnimationFrame === 'function') {
+            window.requestAnimationFrame(() => run());
+            return;
+        }
+        run();
+    }
+
+    private requestViewUpdate() {
+        window.setTimeout(() => {
+            try {
+                this.ref.detectChanges();
+            } catch (error) {
+                // The view may already be destroyed when a deferred sync callback settles.
+            }
+        }, 0);
+    }
+
     private async loadNotes(selectStored: boolean) {
         const fileNotes = await this.loadFileNotes();
         if (fileNotes) {
@@ -806,10 +873,10 @@ export class Component implements OnInit, OnDestroy {
     private async runStartupSync() {
         const api = (window as any).notedown?.sync;
         const settings = this.readSettings();
-        if (!api?.runFull || !this.canRunSavedSync(settings)) return;
+        if (!api?.runFull || !this.canRunSavedSync(settings)) return false;
 
         const sessionKey = `notedown.sync.startup.${settings.syncServerUrl}.${settings.syncClientId}`;
-        if (sessionStorage.getItem(sessionKey)) return;
+        if (sessionStorage.getItem(sessionKey)) return false;
         sessionStorage.setItem(sessionKey, 'running');
         this.storeStartupSyncResult({ ok: false, status: 'running' });
 
@@ -821,11 +888,16 @@ export class Component implements OnInit, OnDestroy {
                 storagePath: settings.storagePath
             });
             this.storeStartupSyncResult(result);
+            if (result?.ok || result?.status === 'conflict') {
+                await this.reloadNotesAfterStartupSync();
+            }
         } catch (error) {
             this.storeStartupSyncResult({ ok: false, status: 'error', error: this.errorMessage(error, '시작 동기화에 실패했습니다.') });
         } finally {
             sessionStorage.setItem(sessionKey, 'done');
         }
+
+        return true;
     }
 
     private canRunSavedSync(settings: any) {
@@ -857,8 +929,11 @@ export class Component implements OnInit, OnDestroy {
             syncedAtMs: Date.now()
         };
         localStorage.setItem(this.startupSyncResultKey, JSON.stringify(payload));
-        window.dispatchEvent(new CustomEvent('notedown:startup-sync-status', { detail: payload }));
         this.applyStartupSyncConflict(payload);
+        window.dispatchEvent(new CustomEvent('notedown:startup-sync-status', {
+            detail: { ...payload, source: 'page.notes' }
+        }));
+        this.requestViewUpdate();
     }
 
     private extractSyncConflicts(result: any) {
@@ -913,6 +988,7 @@ export class Component implements OnInit, OnDestroy {
         this.syncConflictDiffReady = false;
         void this.loadSyncConflictDetail();
         this.renderSyncConflictDiffSoon();
+        this.requestViewUpdate();
     }
 
     private clearSyncConflictViewer() {
@@ -924,6 +1000,7 @@ export class Component implements OnInit, OnDestroy {
         this.syncConflictResolveBusy = false;
         this.syncConflictResolveMessage = '';
         this.disposeDiffEditor();
+        this.requestViewUpdate();
     }
 
     private readStartupSyncResult() {
@@ -954,6 +1031,14 @@ export class Component implements OnInit, OnDestroy {
         this.syncConflictResolveTone = tone;
     }
 
+    private async reloadNotesAfterStartupSync() {
+        const activeId = localStorage.getItem(this.activeNoteKey) || this.activeNote?.id || '';
+        await this.loadNotes(false);
+        this.selectNoteById(activeId);
+        this.emitNotesChanged();
+        this.requestViewUpdate();
+    }
+
     private async reloadNotesAfterSyncResolution() {
         const activeId = localStorage.getItem(this.activeNoteKey) || this.activeNote?.id || '';
         await this.loadNotes(false);
@@ -968,12 +1053,14 @@ export class Component implements OnInit, OnDestroy {
         if (!relativePath || !api?.readFile) {
             this.syncConflictDetail = null;
             this.renderSyncConflictDiffSoon();
+            this.requestViewUpdate();
             return;
         }
 
         this.syncConflictBusy = true;
         this.syncConflictDiffReady = false;
         this.renderSyncConflictDiffSoon();
+        this.requestViewUpdate();
         try {
             const result = await api.readFile(this.syncPayload({ relativePath }));
             if (this.selectedSyncConflict()?.relativePath !== relativePath) return;
@@ -995,6 +1082,7 @@ export class Component implements OnInit, OnDestroy {
             if (this.selectedSyncConflict()?.relativePath === relativePath) {
                 this.syncConflictBusy = false;
                 this.renderSyncConflictDiffSoon();
+                this.requestViewUpdate();
             }
         }
     }
@@ -1057,6 +1145,7 @@ export class Component implements OnInit, OnDestroy {
         this.layoutSyncConflictDiff(host);
         this.syncConflictDiffReady = true;
         window.setTimeout(() => this.layoutSyncConflictDiff(host), 0);
+        this.requestViewUpdate();
     }
 
     private createDiffEditorOptions() {

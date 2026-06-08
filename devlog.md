@@ -58,3 +58,15 @@
 | 2026-06-01 | 006 | 충돌 diff editor 로드 전 textarea fallback 제거 | [상세](devlog/2026-06-01/006-sync-conflict-diff-loading-state.md) |
 | 2026-06-01 | 007 | Electron 앱 이름/로고 빌드 설정 및 macOS/Windows 배포 산출물 생성 | [상세](devlog/2026-06-01/007-electron-build-name-logo-artifacts.md) |
 | 2026-06-01 | 008 | Notedown 한영 README 및 MIT 라이선스 문서 추가 | [상세](devlog/2026-06-01/008-readme-license.md) |
+| 2026-06-02 | 001 | 상태바/트레이 백그라운드 종료 동작 추가 | [상세](devlog/2026-06-02/001-status-tray-close-behavior.md) |
+| 2026-06-02 | 002 | 상태바 설정 스위치 및 트레이 아이콘 보정 | [상세](devlog/2026-06-02/002-status-tray-switch-icon-polish.md) |
+| 2026-06-02 | 003 | 노트/워크스페이스/설정 커맨드 팔렛트 추가 | [상세](devlog/2026-06-02/003-command-palette.md) |
+| 2026-06-02 | 004 | 앱 시작 렌더링 지연을 줄이도록 시작 동기화 비동기화 | [상세](devlog/2026-06-02/004-startup-render-sync-deferral.md) |
+| 2026-06-02 | 005 | 커맨드 팔렛트 Cmd/Ctrl+P 캡처 단축키 적용 | [상세](devlog/2026-06-02/005-command-palette-shortcut.md) |
+| 2026-06-02 | 006 | 초기 흰 화면 완화를 위한 부트 셸 및 Monaco 지연 마운트 | [상세](devlog/2026-06-02/006-boot-shell-monaco-deferral.md) |
+| 2026-06-02 | 007 | 커맨드 팔렛트 단축키 렌더 갱신 보강 | [상세](devlog/2026-06-02/007-command-palette-render.md) |
+| 2026-06-08 | 001 | 커맨드 팔렛트 Service 재초기화 제거로 런타임 렌더링 복구 | [상세](devlog/2026-06-08/001-command-palette-service-init-fix.md) |
+| 2026-06-08 | 002 | 커맨드 팔렛트 선택 스크롤 및 입력 아이콘 보정 | [상세](devlog/2026-06-08/002-command-palette-scroll-icon.md) |
+| 2026-06-08 | 003 | 커맨드 팔렛트 Enter/클릭 액션 및 목록/설정 동기화 정리 | [상세](devlog/2026-06-08/003-command-palette-action-sync.md) |
+| 2026-06-08 | 004 | 커맨드 팔렛트 hover와 키보드 선택 경합 수정 | [상세](devlog/2026-06-08/004-command-palette-hover-keyboard.md) |
+| 2026-06-08 | 005 | 현재 기능 기준 README 갱신 및 Electron 스크린샷 추가 | [상세](devlog/2026-06-08/005-readme-screenshots-current-features.md) |

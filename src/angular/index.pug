@@ -11,5 +11,198 @@ html(lang="ko")
         meta(name="mobile-web-app-capable" content="yes")
         link(rel="icon" type="image/svg+xml" href="assets/brand/icon.svg")
         link(rel="apple-touch-icon" href="assets/brand/icon.svg")
+        style.
+            html, body, app-root {
+                width: 100%;
+                height: 100%;
+                margin: 0;
+                background: #fbfbfa;
+                overflow: hidden;
+            }
+            .notedown-boot-shell {
+                position: fixed;
+                inset: 0;
+                display: grid;
+                grid-template-columns: 256px minmax(0, 1fr);
+                background: #fbfbfa;
+                color: #1c1917;
+                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            }
+            .notedown-boot-sidebar {
+                display: flex;
+                min-width: 0;
+                flex-direction: column;
+                gap: 8px;
+                border-right: 1px solid #e7e5e4;
+                background: #f6f5f1;
+                padding: 86px 12px 12px;
+            }
+            .notedown-boot-row,
+            .notedown-boot-line,
+            .notedown-boot-title,
+            .notedown-boot-dot {
+                border-radius: 6px;
+                background: #e7e5e4;
+            }
+            .notedown-boot-row {
+                height: 32px;
+            }
+            .notedown-boot-row:nth-child(2),
+            .notedown-boot-line:nth-child(2) {
+                width: 76%;
+            }
+            .notedown-boot-row:nth-child(3),
+            .notedown-boot-line:nth-child(3) {
+                width: 88%;
+            }
+            .notedown-boot-spacer {
+                flex: 1;
+            }
+            .notedown-boot-footer {
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                height: 44px;
+                border-top: 1px solid #e7e5e4;
+            }
+            .notedown-boot-dot {
+                width: 28px;
+                height: 28px;
+            }
+            .notedown-boot-status {
+                height: 28px;
+                flex: 1;
+                border-radius: 6px;
+                background: #e7e5e4;
+            }
+            .notedown-boot-main {
+                display: flex;
+                min-width: 0;
+                min-height: 0;
+                flex-direction: column;
+                background: #ffffff;
+            }
+            .notedown-boot-header {
+                display: flex;
+                height: 56px;
+                flex: 0 0 auto;
+                align-items: center;
+                justify-content: space-between;
+                border-bottom: 1px solid #e7e5e4;
+                padding: 0 20px;
+                background: #ffffff;
+            }
+            .notedown-boot-title {
+                width: 176px;
+                height: 18px;
+            }
+            .notedown-boot-actions {
+                display: flex;
+                gap: 8px;
+            }
+            .notedown-boot-action {
+                width: 34px;
+                height: 34px;
+                border-radius: 8px;
+                background: #f5f5f4;
+            }
+            .notedown-boot-content {
+                display: grid;
+                min-height: 0;
+                flex: 1;
+                grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+            }
+            .notedown-boot-pane {
+                display: flex;
+                min-width: 0;
+                flex-direction: column;
+                gap: 12px;
+                padding: 18px;
+            }
+            .notedown-boot-pane + .notedown-boot-pane {
+                border-left: 1px solid #e7e5e4;
+            }
+            .notedown-boot-line {
+                height: 14px;
+            }
+            .notedown-boot-shell * {
+                animation: notedown-boot-pulse 1.4s ease-in-out infinite;
+            }
+            @keyframes notedown-boot-pulse {
+                0%, 100% { opacity: 0.72; }
+                50% { opacity: 1; }
+            }
+            @media (max-width: 1023px) {
+                .notedown-boot-shell {
+                    grid-template-columns: minmax(0, 1fr);
+                }
+                .notedown-boot-sidebar {
+                    display: none;
+                }
+                .notedown-boot-header {
+                    height: 48px;
+                }
+                .notedown-boot-content {
+                    grid-template-columns: minmax(0, 1fr);
+                }
+                .notedown-boot-pane + .notedown-boot-pane {
+                    display: none;
+                }
+            }
+            @media (prefers-color-scheme: dark) {
+                html, body, app-root,
+                .notedown-boot-shell,
+                .notedown-boot-main,
+                .notedown-boot-header {
+                    background: #09090b;
+                    color: #fafafa;
+                }
+                .notedown-boot-sidebar,
+                .notedown-boot-action,
+                .notedown-boot-row,
+                .notedown-boot-line,
+                .notedown-boot-title,
+                .notedown-boot-dot,
+                .notedown-boot-status {
+                    background: #18181b;
+                }
+                .notedown-boot-sidebar,
+                .notedown-boot-header,
+                .notedown-boot-footer,
+                .notedown-boot-pane + .notedown-boot-pane {
+                    border-color: #27272a;
+                }
+            }
     body
         app-root
+            div(class="notedown-boot-shell" aria-hidden="true")
+                aside(class="notedown-boot-sidebar")
+                    div(class="notedown-boot-row")
+                    div(class="notedown-boot-row")
+                    div(class="notedown-boot-row")
+                    div(class="notedown-boot-row")
+                    div(class="notedown-boot-spacer")
+                    div(class="notedown-boot-footer")
+                        div(class="notedown-boot-dot")
+                        div(class="notedown-boot-status")
+                        div(class="notedown-boot-dot")
+                main(class="notedown-boot-main")
+                    header(class="notedown-boot-header")
+                        div(class="notedown-boot-title")
+                        div(class="notedown-boot-actions")
+                            div(class="notedown-boot-action")
+                            div(class="notedown-boot-action")
+                            div(class="notedown-boot-action")
+                    div(class="notedown-boot-content")
+                        section(class="notedown-boot-pane")
+                            div(class="notedown-boot-line")
+                            div(class="notedown-boot-line")
+                            div(class="notedown-boot-line")
+                            div(class="notedown-boot-line")
+                            div(class="notedown-boot-line")
+                        section(class="notedown-boot-pane")
+                            div(class="notedown-boot-line")
+                            div(class="notedown-boot-line")
+                            div(class="notedown-boot-line")
+                            div(class="notedown-boot-line")
+                            div(class="notedown-boot-line")

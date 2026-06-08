@@ -1,4 +1,4 @@
-import { HostListener, OnDestroy, OnInit } from '@angular/core';
+import { ChangeDetectorRef, HostListener, OnDestroy, OnInit } from '@angular/core';
 
 type SortField = 'createdAt' | 'updatedAt' | 'title';
 type SortDirection = 'asc' | 'desc';
@@ -34,6 +34,7 @@ interface SortOption {
 export class Component implements OnInit, OnDestroy {
     private storageKey = 'notedown.notes.v1';
     private activeNoteKey = 'notedown.activeNoteId.v1';
+    private activeWorkspaceKey = 'notedown.activeWorkspace.v1';
     private settingsKey = 'notedown.settings.v1';
     private startupSyncResultKey = 'notedown.sync.startup.result.v1';
 
@@ -59,24 +60,54 @@ export class Component implements OnInit, OnDestroy {
     public syncStatusDetail = '서버 동기화 상태';
     public syncStatusTone: SyncStatusTone = 'idle';
 
-    private handleNotesChanged = () => { void this.loadNotes(); };
+    private handleNotesChanged = () => { void this.loadNotes().then(() => this.renderSoon()); };
+    private handleSelectNote = (event: Event) => {
+        const noteId = (event as CustomEvent<string>).detail;
+        if (!noteId) return;
+        this.activeNoteId = noteId;
+        localStorage.setItem(this.activeNoteKey, noteId);
+        const note = this.notes.find(item => item.id === noteId);
+        if (note?.folder) {
+            this.activeFolder = note.folder || 'memo';
+            localStorage.setItem(this.activeWorkspaceKey, this.activeFolder);
+        }
+        this.renderSoon();
+    };
     private handleStartupSyncStatus = () => { this.loadStartupSyncStatus(); };
+    private handleWorkspaceChanged = (event: Event) => {
+        const workspaceId = (event as CustomEvent<{ workspaceId?: string }>).detail?.workspaceId;
+        if (!workspaceId) return;
+        this.activeFolder = workspaceId;
+        localStorage.setItem(this.activeWorkspaceKey, workspaceId);
+        this.renderSoon();
+    };
     private handleStorageChanged = (event: StorageEvent) => {
         if (event.key === this.startupSyncResultKey || event.key === this.settingsKey) this.loadStartupSyncStatus();
+        if (event.key === this.activeWorkspaceKey) {
+            this.activeFolder = localStorage.getItem(this.activeWorkspaceKey) || 'all';
+        }
+        this.renderSoon();
     };
 
+    constructor(private ref: ChangeDetectorRef) { }
+
     public ngOnInit() {
+        this.activeFolder = localStorage.getItem(this.activeWorkspaceKey) || this.activeFolder;
         this.loadStartupSyncStatus();
-        void this.loadNotes();
+        void this.loadNotes().then(() => this.renderSoon());
         window.addEventListener('notedown:notes-changed', this.handleNotesChanged);
+        window.addEventListener('notedown:select-note', this.handleSelectNote);
         window.addEventListener('notedown:startup-sync-status', this.handleStartupSyncStatus);
+        window.addEventListener('notedown:workspace-changed', this.handleWorkspaceChanged);
         window.addEventListener('storage', this.handleStorageChanged);
     }
 
     public ngOnDestroy() {
         this.emitWorkspaceState(false);
         window.removeEventListener('notedown:notes-changed', this.handleNotesChanged);
+        window.removeEventListener('notedown:select-note', this.handleSelectNote);
         window.removeEventListener('notedown:startup-sync-status', this.handleStartupSyncStatus);
+        window.removeEventListener('notedown:workspace-changed', this.handleWorkspaceChanged);
         window.removeEventListener('storage', this.handleStorageChanged);
     }
 
@@ -117,6 +148,8 @@ export class Component implements OnInit, OnDestroy {
 
     public selectFolder(folder: string) {
         this.activeFolder = folder;
+        localStorage.setItem(this.activeWorkspaceKey, folder);
+        window.dispatchEvent(new CustomEvent('notedown:workspace-changed', { detail: { workspaceId: folder } }));
         this.closeWorkspace();
         const first = this.visibleNotes[0];
         if (first) this.selectNote(first.id);
@@ -614,5 +647,15 @@ export class Component implements OnInit, OnDestroy {
             minute: '2-digit',
             second: '2-digit'
         }).format(date);
+    }
+
+    private renderSoon() {
+        window.setTimeout(() => {
+            try {
+                this.ref.detectChanges();
+            } catch (error) {
+                // The view may already be destroyed when an async storage callback settles.
+            }
+        }, 0);
     }
 }

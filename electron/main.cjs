@@ -1,4 +1,4 @@
-const { app, BrowserWindow, dialog, ipcMain, net, protocol, shell } = require('electron');
+const { app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, net, protocol, shell, Tray } = require('electron');
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const crypto = require('node:crypto');
@@ -9,7 +9,15 @@ const DIST_DIR = path.resolve(__dirname, '..', 'bundle', 'www');
 const APP_NAME = 'Notedown';
 const APP_ID = 'com.notedown.app';
 const APP_ICON_PATH = path.resolve(__dirname, '..', 'build-resources', 'icon.png');
+const TRAY_ICON_PATH = path.resolve(__dirname, '..', 'build-resources', 'tray-icon.png');
+const APP_PREFERENCES_FILE = 'app-preferences.json';
 let protocolRegistered = false;
+let mainWindow = null;
+let tray = null;
+let isQuitting = false;
+let appPreferences = {
+    keepInBackgroundOnClose: true
+};
 
 const METADATA_FILE = 'metadata.json';
 const SYNC_STATE_FILE = '.notedown-sync.json';
@@ -23,6 +31,34 @@ function expandHome(filePath) {
     if (filePath === '~') return app.getPath('home');
     if (filePath.startsWith('~/')) return path.join(app.getPath('home'), filePath.slice(2));
     return filePath;
+}
+
+function normalizeAppPreferences(preferences = {}) {
+    return {
+        keepInBackgroundOnClose: preferences.keepInBackgroundOnClose !== false
+    };
+}
+
+function appPreferencesPath() {
+    return path.join(app.getPath('userData'), APP_PREFERENCES_FILE);
+}
+
+async function readAppPreferences() {
+    try {
+        const stored = JSON.parse(await fs.readFile(appPreferencesPath(), 'utf8'));
+        appPreferences = normalizeAppPreferences(stored);
+    } catch (error) {
+        appPreferences = normalizeAppPreferences(appPreferences);
+    }
+    return appPreferences;
+}
+
+async function writeAppPreferences(preferences = {}) {
+    appPreferences = normalizeAppPreferences({ ...appPreferences, ...preferences });
+    await fs.mkdir(app.getPath('userData'), { recursive: true });
+    await fs.writeFile(appPreferencesPath(), `${JSON.stringify(appPreferences, null, 2)}\n`, 'utf8');
+    syncTrayState();
+    return appPreferences;
 }
 
 function defaultStoragePath() {
@@ -1308,6 +1344,82 @@ function registerPdfHandlers() {
     ipcMain.handle('notedown:pdf:save-note', async (_event, args = {}) => saveNotePdf(args));
 }
 
+function trayIcon() {
+    const imagePath = process.platform === 'darwin' ? TRAY_ICON_PATH : APP_ICON_PATH;
+    let image = nativeImage.createFromPath(imagePath);
+    if (image.isEmpty()) image = nativeImage.createFromPath(APP_ICON_PATH);
+    const size = process.platform === 'darwin' ? 18 : 16;
+    const icon = image.isEmpty() ? image : image.resize({ width: size, height: size });
+    if (process.platform === 'darwin') icon.setTemplateImage(true);
+    return icon;
+}
+
+function trayMenu() {
+    return Menu.buildFromTemplate([
+        { label: 'Notedown 열기', click: () => { void showMainWindow(); } },
+        { type: 'separator' },
+        { label: '종료', click: quitApplication }
+    ]);
+}
+
+function ensureTray() {
+    if (tray) return tray;
+
+    tray = new Tray(trayIcon());
+    tray.setToolTip(APP_NAME);
+    tray.on('right-click', () => tray?.popUpContextMenu(trayMenu()));
+    if (process.platform === 'darwin') {
+        tray.on('click', () => { void showMainWindow(); });
+    } else {
+        tray.on('double-click', () => { void showMainWindow(); });
+    }
+    return tray;
+}
+
+function syncTrayState() {
+    if (appPreferences.keepInBackgroundOnClose) {
+        ensureTray();
+        return;
+    }
+
+    if (tray) tray.destroy();
+    tray = null;
+}
+
+function quitApplication() {
+    isQuitting = true;
+    app.quit();
+}
+
+function hideMainWindow(win) {
+    win.hide();
+    if (process.platform === 'darwin' && app.dock) app.dock.hide();
+}
+
+async function showMainWindow() {
+    if (process.platform === 'darwin' && app.dock) app.dock.show();
+
+    const win = mainWindow && !mainWindow.isDestroyed()
+        ? mainWindow
+        : await createWindow();
+
+    if (win.isMinimized()) win.restore();
+    if (!win.isVisible()) win.show();
+    win.focus();
+}
+
+function registerAppHandlers() {
+    ipcMain.handle('notedown:app:preferences', async () => ({ ok: true, ...appPreferences }));
+    ipcMain.handle('notedown:app:set-preferences', async (_event, args = {}) => {
+        const nextPreferences = await writeAppPreferences(args);
+        return { ok: true, ...nextPreferences };
+    });
+    ipcMain.handle('notedown:app:show-window', async () => {
+        await showMainWindow();
+        return { ok: true };
+    });
+}
+
 protocol.registerSchemesAsPrivileged([
     {
         scheme: 'notedown',
@@ -1353,6 +1465,7 @@ async function registerLocalProtocol() {
 }
 
 async function createWindow() {
+    if (mainWindow && !mainWindow.isDestroyed()) return mainWindow;
     if (!DEV_URL) await registerLocalProtocol();
 
     const win = new BrowserWindow({
@@ -1371,10 +1484,21 @@ async function createWindow() {
             sandbox: true
         }
     });
+    mainWindow = win;
 
     win.webContents.setWindowOpenHandler(({ url }) => {
         shell.openExternal(url);
         return { action: 'deny' };
+    });
+
+    win.on('close', (event) => {
+        if (isQuitting || !appPreferences.keepInBackgroundOnClose) return;
+        event.preventDefault();
+        hideMainWindow(win);
+    });
+
+    win.on('closed', () => {
+        if (mainWindow === win) mainWindow = null;
     });
 
     if (DEV_URL) {
@@ -1382,22 +1506,31 @@ async function createWindow() {
     } else {
         await win.loadURL('notedown://app/index.html');
     }
+
+    return win;
 }
 
 app.setName(APP_NAME);
 if (process.platform === 'win32') app.setAppUserModelId(APP_ID);
 
 app.whenReady().then(async () => {
+    await readAppPreferences();
+    syncTrayState();
+    registerAppHandlers();
     registerStorageHandlers();
     registerSyncHandlers();
     registerPdfHandlers();
     await createWindow();
 
     app.on('activate', async () => {
-        if (BrowserWindow.getAllWindows().length === 0) await createWindow();
+        await showMainWindow();
     });
 });
 
+app.on('before-quit', () => {
+    isQuitting = true;
+});
+
 app.on('window-all-closed', () => {
-    if (process.platform !== 'darwin') app.quit();
+    if (!appPreferences.keepInBackgroundOnClose) app.quit();
 });
