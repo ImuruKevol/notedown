@@ -19,6 +19,7 @@ interface NoteItem {
     workspaceName?: string;
     fileName?: string;
     relativePath?: string;
+    attachments?: any[];
 }
 
 interface FolderItem {
@@ -35,6 +36,7 @@ export class Component implements OnInit, OnDestroy {
     private storageKey = 'notedown.notes.v1';
     private activeNoteKey = 'notedown.activeNoteId.v1';
     private activeWorkspaceKey = 'notedown.activeWorkspace.v1';
+    private foldersKey = 'notedown.folders.v1';
     private settingsKey = 'notedown.settings.v1';
     private startupSyncResultKey = 'notedown.sync.startup.result.v1';
 
@@ -44,6 +46,8 @@ export class Component implements OnInit, OnDestroy {
     public activeFolder = 'all';
     public activeNoteId = '';
     public workspaceOpen = false;
+    public editingFolderId = '';
+    public folderNameDraft = '';
     public sortField: SortField = 'updatedAt';
     public sortDirection: SortDirection = 'desc';
     public sortOptions: SortOption[] = [
@@ -67,8 +71,9 @@ export class Component implements OnInit, OnDestroy {
         this.activeNoteId = noteId;
         localStorage.setItem(this.activeNoteKey, noteId);
         const note = this.notes.find(item => item.id === noteId);
-        if (note?.folder) {
-            this.activeFolder = note.folder || 'memo';
+        const noteFolder = note ? note.folder || 'memo' : '';
+        if (noteFolder && this.activeFolder !== 'all' && this.activeFolder !== noteFolder) {
+            this.activeFolder = noteFolder;
             localStorage.setItem(this.activeWorkspaceKey, this.activeFolder);
         }
         this.renderSoon();
@@ -150,15 +155,92 @@ export class Component implements OnInit, OnDestroy {
         this.activeFolder = folder;
         localStorage.setItem(this.activeWorkspaceKey, folder);
         window.dispatchEvent(new CustomEvent('notedown:workspace-changed', { detail: { workspaceId: folder } }));
-        this.closeWorkspace();
         const first = this.visibleNotes[0];
-        if (first) this.selectNote(first.id);
+        if (first) {
+            this.selectNote(first.id);
+            return;
+        }
+
+        this.activeNoteId = '';
+        localStorage.removeItem(this.activeNoteKey);
+        window.dispatchEvent(new CustomEvent('notedown:select-note', { detail: '' }));
+        this.renderSoon();
     }
 
     public selectNote(id: string) {
         this.activeNoteId = id;
         localStorage.setItem(this.activeNoteKey, id);
         window.dispatchEvent(new CustomEvent('notedown:select-note', { detail: id }));
+    }
+
+    public createFolder(event?: Event) {
+        if (event) {
+            event.preventDefault();
+            event.stopPropagation();
+        }
+
+        const label = this.nextFolderLabel();
+        const folder: FolderItem = {
+            id: this.uniqueFolderId(this.folderIdFromLabel(label)),
+            label
+        };
+        this.saveStoredFolders([...this.readStoredFolders(), folder]);
+        this.syncFolders();
+        this.selectFolder(folder.id);
+        window.dispatchEvent(new CustomEvent('notedown:notes-changed', { detail: { source: 'component.nav.sidebar', foldersChanged: true } }));
+        this.renderSoon();
+    }
+
+    public startFolderRename(folderId: string, event?: Event) {
+        if (event) {
+            event.preventDefault();
+            event.stopPropagation();
+        }
+        if (!folderId || folderId === 'all') return;
+
+        const folder = this.folders.find(item => item.id === folderId);
+        if (!folder) return;
+
+        this.editingFolderId = folderId;
+        this.folderNameDraft = folder.label;
+        this.renderSoon(() => {
+            const input = document.querySelector<HTMLInputElement>('[data-folder-name-input="true"]');
+            input?.focus();
+            input?.select();
+        });
+    }
+
+    public cancelFolderRename() {
+        this.editingFolderId = '';
+        this.folderNameDraft = '';
+        this.renderSoon();
+    }
+
+    public async commitFolderRename(folderId: string) {
+        if (this.editingFolderId !== folderId || folderId === 'all') return;
+
+        const current = this.folders.find(folder => folder.id === folderId);
+        const nextLabel = this.uniqueFolderLabel(this.normalizeFolderLabel(this.folderNameDraft), folderId);
+        const wasActive = this.activeFolder === folderId;
+        this.editingFolderId = '';
+        this.folderNameDraft = '';
+
+        if (!current || !nextLabel || current.label === nextLabel) {
+            this.renderSoon();
+            return;
+        }
+
+        const storedFolders = this.readStoredFolders();
+        const nextStoredFolders = storedFolders.some(folder => folder.id === folderId)
+            ? storedFolders.map(folder => folder.id === folderId ? { ...folder, label: nextLabel } : folder)
+            : [...storedFolders, { id: folderId, label: nextLabel }];
+        this.saveStoredFolders(nextStoredFolders);
+        this.notes = this.notes.map(note => (note.folder || 'memo') === folderId ? { ...note, workspaceName: nextLabel } : note);
+        this.syncFolders();
+        await this.persistNotes();
+        window.dispatchEvent(new CustomEvent('notedown:notes-changed', { detail: { source: 'component.nav.sidebar', foldersChanged: true } }));
+        if (wasActive) window.dispatchEvent(new CustomEvent('notedown:workspace-changed', { detail: { workspaceId: folderId } }));
+        this.renderSoon();
     }
 
     public async createNote() {
@@ -175,7 +257,8 @@ export class Component implements OnInit, OnDestroy {
             createdAt: this.nowLabel(new Date(now)),
             createdAtMs: now,
             updatedAt: this.nowLabel(new Date(now)),
-            updatedAtMs: now
+            updatedAtMs: now,
+            attachments: []
         };
         this.notes = [note, ...this.notes];
         this.syncFolders();
@@ -276,10 +359,24 @@ export class Component implements OnInit, OnDestroy {
         return 'flex h-full w-[236px] shrink-0 flex-col border-r border-stone-300/70 bg-[#e8e6e1] px-3 pb-3 pt-14 transition-[width,opacity] duration-200 dark:border-zinc-800 dark:bg-zinc-900';
     }
 
-    public folderButtonClass(folder: string) {
-        const base = 'flex h-9 w-full items-center gap-2 rounded-md px-3 text-left text-[13px] font-medium transition-colors';
+    public folderRowClass(folder: string) {
+        const base = 'group flex h-9 w-full min-w-0 items-center rounded-md transition-colors';
         if (this.activeFolder === folder) return `${base} bg-white/80 text-stone-950 shadow-sm dark:bg-zinc-800 dark:text-zinc-50`;
         return `${base} text-stone-600 hover:bg-white/55 hover:text-stone-950 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:text-zinc-50`;
+    }
+
+    public folderSelectButtonClass(folder: string) {
+        return 'flex h-full min-w-0 flex-1 items-center gap-2 rounded-md px-3 text-left text-[13px] font-medium';
+    }
+
+    public folderEditButtonClass(folder: string) {
+        const base = 'app-no-drag flex size-7 shrink-0 items-center justify-center rounded-md opacity-0 transition group-hover:opacity-100 focus:opacity-100 focus-visible:opacity-100';
+        if (this.activeFolder === folder) return `${base} text-stone-500 hover:bg-stone-100 hover:text-stone-950 dark:text-zinc-300 dark:hover:bg-zinc-700 dark:hover:text-zinc-50`;
+        return `${base} text-stone-400 hover:bg-white/60 hover:text-stone-950 dark:text-zinc-500 dark:hover:bg-zinc-800 dark:hover:text-zinc-50`;
+    }
+
+    public folderCountClass(folder: string) {
+        return 'shrink-0 pr-3 text-[12px] text-stone-400 dark:text-zinc-500';
     }
 
     public noteRowClass(id: string) {
@@ -289,7 +386,7 @@ export class Component implements OnInit, OnDestroy {
     }
 
     public noteTitleButtonClass(id: string) {
-        return 'min-w-0 flex-1 truncate px-2.5 text-left text-[13px] font-medium leading-8';
+        return 'flex h-full min-w-0 flex-1 items-center truncate px-2.5 text-left text-[13px] font-medium leading-5';
     }
 
     public deleteButtonClass(id: string) {
@@ -299,13 +396,13 @@ export class Component implements OnInit, OnDestroy {
     }
 
     public searchButtonClass() {
-        const base = 'flex size-9 shrink-0 items-center justify-center rounded-md transition';
+        const base = 'flex size-7 shrink-0 items-center justify-center rounded-md transition';
         if (this.searchOpen) return `${base} bg-stone-900 text-white dark:bg-zinc-100 dark:text-zinc-950`;
         return `${base} text-stone-500 hover:bg-stone-200/70 hover:text-stone-950 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:text-zinc-50`;
     }
 
     public sortButtonClass() {
-        const base = 'flex size-9 shrink-0 items-center justify-center rounded-md transition';
+        const base = 'flex size-7 shrink-0 items-center justify-center rounded-md transition';
         if (this.sortOpen) return `${base} bg-stone-900 text-white dark:bg-zinc-100 dark:text-zinc-950`;
         return `${base} text-stone-500 hover:bg-stone-200/70 hover:text-stone-950 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:text-zinc-50`;
     }
@@ -464,13 +561,92 @@ export class Component implements OnInit, OnDestroy {
         const folders = new Map<string, string>();
         folders.set('all', '모든 노트');
 
+        for (const folder of this.readStoredFolders()) {
+            if (folder.id !== 'all') folders.set(folder.id, folder.label);
+        }
+
         for (const note of this.notes) {
             const folder = note.folder || 'memo';
-            folders.set(folder, note.workspaceName || this.defaultFolderLabel(folder));
+            if (!folders.has(folder)) folders.set(folder, note.workspaceName || this.defaultFolderLabel(folder));
         }
 
         this.folders = Array.from(folders.entries()).map(([id, label]) => ({ id, label }));
         if (!this.folders.some(folder => folder.id === this.activeFolder)) this.activeFolder = 'all';
+    }
+
+    private readStoredFolders(): FolderItem[] {
+        try {
+            const stored = JSON.parse(localStorage.getItem(this.foldersKey) || '[]');
+            if (!Array.isArray(stored)) return [];
+            const folders = stored
+                .map(folder => ({
+                    id: String(folder?.id || '').trim(),
+                    label: this.normalizeFolderLabel(folder?.label)
+                }))
+                .filter(folder => folder.id && folder.id !== 'all' && folder.label);
+            return this.dedupeFolders(folders);
+        } catch (error) {
+            return [];
+        }
+    }
+
+    private saveStoredFolders(folders: FolderItem[]) {
+        localStorage.setItem(this.foldersKey, JSON.stringify(this.dedupeFolders(folders)));
+    }
+
+    private dedupeFolders(folders: FolderItem[]) {
+        const map = new Map<string, FolderItem>();
+        for (const folder of folders) {
+            if (!folder.id || folder.id === 'all' || !folder.label) continue;
+            map.set(folder.id, folder);
+        }
+        return Array.from(map.values());
+    }
+
+    private normalizeFolderLabel(value: unknown) {
+        return String(value || '').replace(/\s+/g, ' ').trim();
+    }
+
+    private nextFolderLabel() {
+        const base = '새 폴더';
+        const used = new Set(this.folders.concat(this.readStoredFolders()).map(folder => this.normalizeFolderLabel(folder.label)));
+        if (!used.has(base)) return base;
+
+        let suffix = 2;
+        while (used.has(`${base} ${suffix}`)) suffix++;
+        return `${base} ${suffix}`;
+    }
+
+    private uniqueFolderLabel(label: string, currentFolderId: string) {
+        if (!label) return '';
+        const used = new Set(this.folders
+            .concat(this.readStoredFolders())
+            .filter(folder => folder.id !== currentFolderId)
+            .map(folder => this.normalizeFolderLabel(folder.label)));
+        if (!used.has(label)) return label;
+
+        let suffix = 2;
+        while (used.has(`${label} ${suffix}`)) suffix++;
+        return `${label} ${suffix}`;
+    }
+
+    private folderIdFromLabel(label: string) {
+        const id = label
+            .normalize('NFKC')
+            .replace(/[/:\\?%*"<>|]+/g, ' ')
+            .replace(/[^\p{L}\p{N}_-]+/gu, '-')
+            .replace(/^-+|-+$/g, '')
+            .slice(0, 80);
+        return id && id !== 'all' ? id : `folder-${Date.now()}`;
+    }
+
+    private uniqueFolderId(baseId: string) {
+        const used = new Set(this.folders.concat(this.readStoredFolders()).map(folder => folder.id));
+        if (!used.has(baseId)) return baseId;
+
+        let suffix = 2;
+        while (used.has(`${baseId}-${suffix}`)) suffix++;
+        return `${baseId}-${suffix}`;
     }
 
     private defaultFolderLabel(folder: string) {
@@ -562,6 +738,7 @@ export class Component implements OnInit, OnDestroy {
                 createdAtMs: now - 600000,
                 updatedAt: this.nowLabel(new Date(now - 120000)),
                 updatedAtMs: now - 120000,
+                attachments: [],
                 body: '# 오늘의 노트\n\n- [ ] Electron 앱 셸 정리\n- [ ] 로컬 저장소 구조 설계\n- [ ] Markdown 편집 경험 다듬기\n\n## 메모\n\nNotion처럼 가볍게 열고, Markdown으로 빠르게 남기는 흐름을 기준으로 잡는다.'
             },
             {
@@ -575,6 +752,7 @@ export class Component implements OnInit, OnDestroy {
                 createdAtMs: now - 360000,
                 updatedAt: this.nowLabel(new Date(now - 180000)),
                 updatedAtMs: now - 180000,
+                attachments: [],
                 body: '# 제품 범위\n\n## 화면\n\n- 노트\n- 설정\n\n## 저장\n\n로컬 우선 저장을 기본값으로 둔다.'
             }
         ];
@@ -596,6 +774,7 @@ export class Component implements OnInit, OnDestroy {
             workspaceName: note?.workspaceName,
             fileName: note?.fileName,
             relativePath: note?.relativePath,
+            attachments: Array.isArray(note?.attachments) ? note.attachments : [],
             createdAt: note?.createdAt || this.nowLabel(new Date(createdAtMs)),
             createdAtMs,
             updatedAt: note?.updatedAt || this.nowLabel(new Date(updatedAtMs)),
@@ -649,10 +828,11 @@ export class Component implements OnInit, OnDestroy {
         }).format(date);
     }
 
-    private renderSoon() {
+    private renderSoon(callback?: () => void) {
         window.setTimeout(() => {
             try {
                 this.ref.detectChanges();
+                if (callback) callback();
             } catch (error) {
                 // The view may already be destroyed when an async storage callback settles.
             }

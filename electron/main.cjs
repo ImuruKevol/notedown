@@ -1,4 +1,4 @@
-const { app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, net, protocol, shell, Tray } = require('electron');
+const { app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, net, protocol, screen, shell, Tray } = require('electron');
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const crypto = require('node:crypto');
@@ -12,9 +12,12 @@ const APP_ICON_PATH = path.resolve(__dirname, '..', 'build-resources', 'icon.png
 const TRAY_ICON_PATH = path.resolve(__dirname, '..', 'build-resources', 'tray-icon.png');
 const APP_PREFERENCES_FILE = 'app-preferences.json';
 let protocolRegistered = false;
+let attachmentProtocolRegistered = false;
 let mainWindow = null;
 let tray = null;
 let isQuitting = false;
+let currentWorkspaceRevealTimer = null;
+const activeStorageRoots = new Set();
 let appPreferences = {
     keepInBackgroundOnClose: true
 };
@@ -78,6 +81,12 @@ function normalizeStoragePath(filePath) {
     return samePath(expanded, legacyDefaultStoragePath()) ? defaultStoragePath() : expanded;
 }
 
+function rememberStoragePath(filePath) {
+    const storagePath = normalizeStoragePath(filePath);
+    activeStorageRoots.add(path.resolve(storagePath));
+    return storagePath;
+}
+
 function safeWorkspaceId(name) {
     const normalized = String(name || '')
         .trim()
@@ -106,6 +115,28 @@ function safeExportFileName(name, extension) {
     return `${base}.${extension}`;
 }
 
+function safeAttachmentFileName(name, fallback = 'attachment') {
+    const parsed = path.parse(String(name || fallback));
+    const stem = String(parsed.name || fallback)
+        .replace(/[/:\\?%*"<>|]+/g, '_')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .slice(0, 120) || fallback;
+    const ext = String(parsed.ext || '')
+        .replace(/[/:\\?%*"<>|\s]+/g, '')
+        .slice(0, 24);
+    return `${stem}${ext || ''}`;
+}
+
+function safePathSegment(name, fallback = 'item') {
+    return String(name || fallback)
+        .replace(/\.[a-z0-9]{1,12}$/i, '')
+        .replace(/[/:\\?%*"<>|.]+/g, '-')
+        .replace(/\s+/g, '-')
+        .replace(/^-+|-+$/g, '')
+        .slice(0, 80) || fallback;
+}
+
 function toPosixPath(filePath) {
     return String(filePath || '').replace(/\\/g, '/');
 }
@@ -117,6 +148,34 @@ function normalizeRelativePath(relativePath) {
     if (parts.some(part => part === '.' || part === '..')) throw new Error('허용되지 않는 파일 경로입니다.');
     if (parts[0] === METADATA_FILE || parts[0] === SYNC_STATE_FILE) throw new Error('동기화할 수 없는 시스템 파일입니다.');
     return parts.join('/');
+}
+
+function isAttachmentRelativePath(relativePath) {
+    return normalizeRelativePath(relativePath).split('/').includes('.attachments');
+}
+
+function contentTypeForFileName(fileName) {
+    return mimeTypeForFileName(fileName);
+}
+
+function mimeTypeForFileName(fileName) {
+    const lower = String(fileName || '').toLowerCase();
+    if (lower.endsWith('.png')) return 'image/png';
+    if (lower.endsWith('.jpg') || lower.endsWith('.jpeg')) return 'image/jpeg';
+    if (lower.endsWith('.gif')) return 'image/gif';
+    if (lower.endsWith('.webp')) return 'image/webp';
+    if (lower.endsWith('.svg')) return 'image/svg+xml; charset=utf-8';
+    if (lower.endsWith('.avif')) return 'image/avif';
+    if (lower.endsWith('.bmp')) return 'image/bmp';
+    if (lower.endsWith('.pdf')) return 'application/pdf';
+    if (lower.endsWith('.txt') || lower.endsWith('.md')) return 'text/plain; charset=utf-8';
+    if (lower.endsWith('.json')) return 'application/json; charset=utf-8';
+    if (lower.endsWith('.csv')) return 'text/csv; charset=utf-8';
+    return 'application/octet-stream';
+}
+
+function isImageFileName(fileName) {
+    return mimeTypeForFileName(fileName).startsWith('image/');
 }
 
 function resolveStorageFile(storagePath, relativePath) {
@@ -243,7 +302,8 @@ async function readSyncState(storagePath) {
             serverRevision: 0,
             metadataRevision: 0,
             metadataHash: null,
-            files: {}
+            files: {},
+            attachments: {}
         };
     }
 }
@@ -268,12 +328,25 @@ async function writeSyncStateFromManifest(storagePath, manifest, previousState =
         };
     }
 
+    const attachments = {};
+    for (const file of manifest.attachments || []) {
+        if (!file?.relativePath) continue;
+        const relativePath = normalizeRelativePath(file.relativePath);
+        attachments[relativePath] = {
+            lastKnownRevision: Number(file.revision) || 0,
+            contentHash: file.contentHash || null,
+            updatedAtMs: Number(file.clientUpdatedAtMs) || null,
+            deleted: Boolean(file.deleted)
+        };
+    }
+
     const nextState = {
         ...previousState,
         serverRevision: Number(manifest.serverRevision) || 0,
         metadataRevision: Number(manifest.metadata?.revision) || 0,
         metadataHash: manifest.metadata?.contentHash || null,
         files,
+        attachments,
         updatedAt: new Date().toISOString()
     };
     await writeSyncState(storagePath, nextState);
@@ -299,7 +372,7 @@ async function removeEmptyParents(dirPath, stopPath) {
     }
 }
 
-async function removeMetadataOrphans(storagePath, previousMetadata, writtenRelativePaths) {
+async function removeMetadataOrphans(storagePath, previousMetadata, writtenRelativePaths, writtenAttachmentPaths = new Set()) {
     const root = path.resolve(storagePath);
     const previousNotes = Array.isArray(previousMetadata?.notes) ? previousMetadata.notes : [];
 
@@ -309,6 +382,18 @@ async function removeMetadataOrphans(storagePath, previousMetadata, writtenRelat
         if (!isInsidePath(root, absolutePath) || path.basename(absolutePath) === METADATA_FILE) continue;
         await fs.rm(absolutePath, { force: true });
         await removeEmptyParents(path.dirname(absolutePath), root);
+    }
+
+    for (const note of previousNotes) {
+        for (const attachment of note.attachments || []) {
+            if (!attachment?.relativePath) continue;
+            const relativePath = normalizeRelativePath(attachment.relativePath);
+            if (writtenAttachmentPaths.has(relativePath)) continue;
+            const absolutePath = path.resolve(storagePath, relativePath);
+            if (!isInsidePath(root, absolutePath)) continue;
+            await fs.rm(absolutePath, { force: true });
+            await removeEmptyParents(path.dirname(absolutePath), root);
+        }
     }
 }
 
@@ -332,6 +417,88 @@ function makeMetadataNote(storagePath, relativePath, workspaceId, workspaceName,
         updatedAt: labelForDate(updatedAtMs),
         updatedAtMs
     };
+}
+
+function normalizeAttachmentMetadata(attachment = {}, noteRelativePath = '') {
+    const relativePath = normalizeRelativePath(attachment.relativePath);
+    const fileName = safeAttachmentFileName(attachment.fileName || path.posix.basename(relativePath));
+    return {
+        id: attachment.id || attachment.attachmentId || `att-${crypto.createHash('sha1').update(relativePath).digest('hex').slice(0, 16)}`,
+        fileName,
+        relativePath,
+        noteRelativePath: attachment.noteRelativePath ? normalizeRelativePath(attachment.noteRelativePath) : noteRelativePath,
+        mimeType: attachment.mimeType || null,
+        size: Number.isFinite(attachment.size) ? Number(attachment.size) : null,
+        contentHash: attachment.contentHash || null,
+        updatedAtMs: Number.isFinite(attachment.updatedAtMs) ? Number(attachment.updatedAtMs) : null,
+        deleted: Boolean(attachment.deleted)
+    };
+}
+
+function noteAttachmentDirectory(noteRelativePath, note = {}) {
+    const safeNoteRelativePath = normalizeRelativePath(noteRelativePath);
+    const noteDir = path.posix.dirname(safeNoteRelativePath);
+    const noteName = path.posix.basename(safeNoteRelativePath, path.posix.extname(safeNoteRelativePath));
+    const noteSegment = safePathSegment(note.id || noteName || 'note', 'note');
+    return normalizeRelativePath(path.posix.join(noteDir === '.' ? '' : noteDir, '.attachments', noteSegment));
+}
+
+async function uniqueAttachmentRelativePath(storagePath, baseRelativePath) {
+    const safeRelativePath = normalizeRelativePath(baseRelativePath);
+    const ext = path.posix.extname(safeRelativePath);
+    const dir = path.posix.dirname(safeRelativePath);
+    const stem = path.posix.basename(safeRelativePath, ext);
+    let candidate = safeRelativePath;
+    let suffix = 2;
+    while (await exists(resolveStorageFile(storagePath, candidate).absolutePath)) {
+        candidate = normalizeRelativePath(path.posix.join(dir === '.' ? '' : dir, `${stem}-${suffix}${ext}`));
+        suffix++;
+    }
+    return candidate;
+}
+
+function upsertMetadataAttachment(metadata, noteRelativePath, attachment) {
+    const safeNoteRelativePath = normalizeRelativePath(noteRelativePath);
+    const note = (metadata.notes || []).find(item => item?.relativePath && normalizeRelativePath(item.relativePath) === safeNoteRelativePath);
+    if (!note) return;
+    const nextAttachment = normalizeAttachmentMetadata(attachment, safeNoteRelativePath);
+    if (!Array.isArray(note.attachments)) note.attachments = [];
+    const index = note.attachments.findIndex(item => {
+        if (!item?.relativePath) return false;
+        return normalizeRelativePath(item.relativePath) === nextAttachment.relativePath || (nextAttachment.id && item.id === nextAttachment.id);
+    });
+    if (index >= 0) {
+        note.attachments[index] = { ...note.attachments[index], ...nextAttachment };
+    } else {
+        note.attachments.push(nextAttachment);
+    }
+}
+
+function removeMetadataAttachment(metadata, relativePath) {
+    const safeRelativePath = normalizeRelativePath(relativePath);
+    for (const note of metadata.notes || []) {
+        if (!Array.isArray(note.attachments)) continue;
+        note.attachments = note.attachments.filter(attachment => {
+            if (!attachment?.relativePath) return false;
+            return normalizeRelativePath(attachment.relativePath) !== safeRelativePath;
+        });
+    }
+}
+
+function removeMetadataNoteAttachments(metadata, noteRelativePath) {
+    const safeNoteRelativePath = normalizeRelativePath(noteRelativePath);
+    const note = (metadata.notes || []).find(item => item?.relativePath && normalizeRelativePath(item.relativePath) === safeNoteRelativePath);
+    const attachments = Array.isArray(note?.attachments) ? note.attachments : [];
+    if (note) note.attachments = [];
+    return attachments;
+}
+
+function noteAttachmentsForMetadata(note = {}, noteRelativePath) {
+    if (!Array.isArray(note.attachments)) return [];
+    return note.attachments
+        .filter(attachment => attachment?.relativePath)
+        .map(attachment => normalizeAttachmentMetadata(attachment, noteRelativePath))
+        .filter(attachment => !attachment.deleted);
 }
 
 function labelForDate(ms) {
@@ -445,6 +612,7 @@ async function saveNotesToStorage(storagePath, notes) {
     workspaces.set(UNFILED_WORKSPACE_ID, { id: UNFILED_WORKSPACE_ID, name: '미지정 워크스페이스' });
     const metadataNotes = [];
     const writtenRelativePaths = new Set();
+    const writtenAttachmentPaths = new Set();
 
     for (const note of notes || []) {
         const workspaceId = noteWorkspaceId(note);
@@ -457,6 +625,8 @@ async function saveNotesToStorage(storagePath, notes) {
         await fs.mkdir(path.dirname(absolutePath), { recursive: true });
         await fs.writeFile(absolutePath, note.body || '', 'utf8');
         writtenRelativePaths.add(relativePath);
+        const attachments = noteAttachmentsForMetadata(note, relativePath);
+        for (const attachment of attachments) writtenAttachmentPaths.add(attachment.relativePath);
 
         metadataNotes.push({
             id: note.id,
@@ -469,6 +639,7 @@ async function saveNotesToStorage(storagePath, notes) {
             folder: workspaceId,
             fileName,
             relativePath,
+            attachments,
             createdAt: note.createdAt || labelForDate(note.createdAtMs || Date.now()),
             createdAtMs: note.createdAtMs || Date.now(),
             updatedAt: note.updatedAt || labelForDate(Date.now()),
@@ -482,9 +653,122 @@ async function saveNotesToStorage(storagePath, notes) {
         workspaces: Array.from(workspaces.values()),
         notes: metadataNotes
     });
-    await removeMetadataOrphans(storagePath, previousMetadata, writtenRelativePaths);
+    await removeMetadataOrphans(storagePath, previousMetadata, writtenRelativePaths, writtenAttachmentPaths);
 
     return { ok: true, notes: metadataNotes.length, workspaces: workspaces.size };
+}
+
+async function saveAttachmentToStorage(args = {}) {
+    const storagePath = rememberStoragePath(args.storagePath);
+    const metadata = await ensureMetadata(storagePath);
+    const payloadNote = args.note || null;
+    const noteRelativePath = normalizeRelativePath(args.noteRelativePath || payloadNote?.relativePath || relativePathForNote(payloadNote));
+    const note = findMetadataNote(metadata, noteRelativePath, payloadNote);
+    if (!note) throw new Error('첨부할 노트를 찾지 못했습니다.');
+
+    upsertMetadataWorkspace(metadata, workspacePayload(metadata, note));
+    upsertMetadataNote(metadata, notePayload(note, noteRelativePath));
+
+    const fileName = safeAttachmentFileName(args.fileName || 'attachment');
+    const attachmentDir = noteAttachmentDirectory(noteRelativePath, note);
+    const baseRelativePath = normalizeRelativePath(args.relativePath || path.posix.join(attachmentDir, fileName));
+    const relativePath = args.relativePath ? baseRelativePath : await uniqueAttachmentRelativePath(storagePath, baseRelativePath);
+    const { absolutePath } = resolveStorageFile(storagePath, relativePath);
+    const contentEncoding = args.contentEncoding || 'base64';
+    const content = contentEncoding === 'base64'
+        ? Buffer.from(String(args.content || ''), 'base64')
+        : Buffer.from(String(args.content || ''), 'utf8');
+    const updatedAtMs = Date.now();
+
+    await fs.mkdir(path.dirname(absolutePath), { recursive: true });
+    await fs.writeFile(absolutePath, content);
+
+    const attachment = normalizeAttachmentMetadata({
+        id: args.id,
+        fileName,
+        relativePath,
+        noteRelativePath,
+        mimeType: args.mimeType || null,
+        size: content.length,
+        contentHash: sha256(content),
+        updatedAtMs
+    }, noteRelativePath);
+
+    upsertMetadataAttachment(metadata, noteRelativePath, attachment);
+    metadata.generatedAt = new Date().toISOString();
+    await writeMetadata(storagePath, metadata);
+
+    return {
+        ok: true,
+        storagePath,
+        noteRelativePath,
+        attachment
+    };
+}
+
+async function chooseAttachmentsForStorage(event, args = {}) {
+    const storagePath = rememberStoragePath(args.storagePath);
+    const mode = args.mode === 'image' ? 'image' : 'file';
+    const parent = BrowserWindow.fromWebContents(event.sender) || BrowserWindow.getFocusedWindow() || undefined;
+    const filters = mode === 'image'
+        ? [{ name: 'Images', extensions: ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg', 'avif'] }]
+        : [{ name: 'All Files', extensions: ['*'] }];
+    const result = await dialog.showOpenDialog(parent, {
+        title: mode === 'image' ? '이미지 첨부' : '파일 첨부',
+        properties: ['openFile', 'multiSelections'],
+        filters
+    });
+
+    if (result.canceled || result.filePaths.length === 0) {
+        return { ok: false, canceled: true, attachments: [] };
+    }
+
+    const attachments = [];
+    let skipped = 0;
+    for (const filePath of result.filePaths) {
+        if (mode === 'image' && !isImageFileName(filePath)) {
+            skipped++;
+            continue;
+        }
+
+        const content = await fs.readFile(filePath);
+        const saved = await saveAttachmentToStorage({
+            ...args,
+            storagePath,
+            fileName: path.basename(filePath),
+            mimeType: mimeTypeForFileName(filePath),
+            content: content.toString('base64'),
+            contentEncoding: 'base64'
+        });
+        if (saved?.attachment) attachments.push(saved.attachment);
+    }
+
+    if (attachments.length === 0) {
+        return {
+            ok: false,
+            canceled: false,
+            skipped,
+            attachments: [],
+            error: mode === 'image' ? '선택한 이미지가 없습니다.' : '저장한 첨부 파일이 없습니다.'
+        };
+    }
+
+    return {
+        ok: true,
+        storagePath,
+        attachments,
+        attachment: attachments[0],
+        skipped
+    };
+}
+
+async function openAttachmentFromStorage(args = {}) {
+    const storagePath = rememberStoragePath(args.storagePath);
+    const { relativePath, absolutePath } = resolveStorageFile(storagePath, args.relativePath);
+    if (!await exists(absolutePath)) throw new Error('첨부 파일을 찾지 못했습니다.');
+    const error = await shell.openPath(absolutePath);
+    if (error) throw new Error(error);
+    return { ok: true, relativePath };
 }
 
 function normalizeServerUrl(serverUrl) {
@@ -495,7 +779,7 @@ function normalizeServerUrl(serverUrl) {
 }
 
 function syncConfig(args = {}, requireToken = true) {
-    const storagePath = normalizeStoragePath(args.storagePath);
+    const storagePath = rememberStoragePath(args.storagePath);
     const serverUrl = normalizeServerUrl(args.serverUrl);
     const token = String(args.token || '').trim();
     const clientId = String(args.clientId || 'notedown-electron').trim() || 'notedown-electron';
@@ -566,6 +850,10 @@ function summarizePlan(plan = {}) {
         downloadFiles: plan.downloadFiles?.length || 0,
         deleteServerFiles: plan.deleteServerFiles?.length || 0,
         deleteLocalFiles: plan.deleteLocalFiles?.length || 0,
+        uploadAttachments: plan.uploadAttachments?.length || 0,
+        downloadAttachments: plan.downloadAttachments?.length || 0,
+        deleteServerAttachments: plan.deleteServerAttachments?.length || 0,
+        deleteLocalAttachments: plan.deleteLocalAttachments?.length || 0,
         conflicts: plan.conflicts?.length || 0
     };
 }
@@ -576,6 +864,10 @@ function clonePlan(plan = {}) {
         downloadFiles: [...(plan.downloadFiles || [])],
         deleteServerFiles: [...(plan.deleteServerFiles || [])],
         deleteLocalFiles: [...(plan.deleteLocalFiles || [])],
+        uploadAttachments: [...(plan.uploadAttachments || [])],
+        downloadAttachments: [...(plan.downloadAttachments || [])],
+        deleteServerAttachments: [...(plan.deleteServerAttachments || [])],
+        deleteLocalAttachments: [...(plan.deleteLocalAttachments || [])],
         conflicts: [...(plan.conflicts || [])]
     };
 }
@@ -853,11 +1145,37 @@ async function buildKnownFiles(storagePath, metadata, syncState) {
     return files;
 }
 
+async function buildKnownAttachments(storagePath, metadata, syncState) {
+    const attachments = [];
+    for (const note of metadata.notes || []) {
+        for (const attachment of note.attachments || []) {
+            if (!attachment?.relativePath || attachment.deleted) continue;
+            const relativePath = normalizeRelativePath(attachment.relativePath);
+            try {
+                const { absolutePath } = resolveStorageFile(storagePath, relativePath);
+                const content = await fs.readFile(absolutePath);
+                const stat = await fs.stat(absolutePath);
+                const state = syncState.attachments?.[relativePath] || {};
+                attachments.push({
+                    relativePath,
+                    contentHash: sha256(content),
+                    lastKnownRevision: Number(state.lastKnownRevision) || 0,
+                    updatedAtMs: Number(attachment.updatedAtMs) || Math.round(stat.mtimeMs)
+                });
+            } catch (error) {
+                // Missing local attachment bytes are handled through metadata differences and conflicts.
+            }
+        }
+    }
+    return attachments;
+}
+
 async function createSyncPlan(args = {}) {
     const { storagePath, serverUrl, token, clientId } = syncConfig(args);
     const metadata = await ensureMetadata(storagePath);
     const syncState = await readSyncState(storagePath);
     const knownFiles = await buildKnownFiles(storagePath, metadata, syncState);
+    const knownAttachments = await buildKnownAttachments(storagePath, metadata, syncState);
 
     const response = await syncRequest(serverUrl, '/api/sync/plan', {
         token,
@@ -865,6 +1183,7 @@ async function createSyncPlan(args = {}) {
             clientId,
             baseRevision: Number(syncState.serverRevision) || 0,
             knownFiles,
+            knownAttachments,
             metadata: {
                 body: metadata,
                 lastKnownRevision: Number(syncState.metadataRevision) || 0
@@ -923,6 +1242,150 @@ async function uploadLocalFile(args = {}, relativePathOverride = '') {
     };
 }
 
+function findMetadataAttachment(metadata, relativePath, fallback = null) {
+    const safeRelativePath = relativePath ? normalizeRelativePath(relativePath) : '';
+    for (const note of metadata.notes || []) {
+        for (const attachment of note.attachments || []) {
+            if (!attachment?.relativePath) continue;
+            if (normalizeRelativePath(attachment.relativePath) === safeRelativePath) {
+                return normalizeAttachmentMetadata(attachment, note.relativePath ? normalizeRelativePath(note.relativePath) : '');
+            }
+        }
+    }
+    if (fallback?.relativePath) return normalizeAttachmentMetadata(fallback, fallback.noteRelativePath || '');
+    return null;
+}
+
+function findMetadataNoteByAttachment(metadata, attachment = {}) {
+    const noteRelativePath = attachment.noteRelativePath || '';
+    if (noteRelativePath) {
+        const safeNoteRelativePath = normalizeRelativePath(noteRelativePath);
+        return (metadata.notes || []).find(note => note?.relativePath && normalizeRelativePath(note.relativePath) === safeNoteRelativePath) || null;
+    }
+    const attachmentRelativePath = attachment.relativePath ? normalizeRelativePath(attachment.relativePath) : '';
+    if (!attachmentRelativePath) return null;
+    return (metadata.notes || []).find(note => (note.attachments || []).some(item => {
+        if (!item?.relativePath) return false;
+        return normalizeRelativePath(item.relativePath) === attachmentRelativePath;
+    })) || null;
+}
+
+async function uploadLocalAttachment(args = {}, item = {}) {
+    const { storagePath, serverUrl, token, clientId } = syncConfig(args);
+    const metadata = await ensureMetadata(storagePath);
+    const syncState = await readSyncState(storagePath);
+    const relativePath = normalizeRelativePath(item.relativePath || args.relativePath);
+    const attachment = findMetadataAttachment(metadata, relativePath, item.attachment || args.attachment);
+    const note = findMetadataNoteByAttachment(metadata, attachment || item) || findMetadataNote(metadata, item.noteRelativePath || attachment?.noteRelativePath || args.noteRelativePath, item.note || args.note);
+    const noteRelativePath = normalizeRelativePath(item.noteRelativePath || attachment?.noteRelativePath || note?.relativePath || args.noteRelativePath);
+    const state = syncState.attachments?.[relativePath] || {};
+    const deleted = Boolean(args.deleted || item.deleted);
+    const body = {
+        clientId,
+        baseRevision: Number(syncState.serverRevision) || 0,
+        relativePath,
+        noteRelativePath,
+        deleted,
+        lastKnownRevision: Number(args.lastKnownRevision) || Number(item.lastKnownRevision) || Number(state.lastKnownRevision) || 0
+    };
+
+    if (attachment) {
+        body.attachment = normalizeAttachmentMetadata({ ...attachment, noteRelativePath }, noteRelativePath);
+        body.fileName = attachment.fileName;
+        body.mimeType = attachment.mimeType || undefined;
+    }
+    if (note) {
+        body.note = notePayload(note, normalizeRelativePath(note.relativePath || noteRelativePath));
+        body.workspace = workspacePayload(metadata, note);
+    }
+
+    if (!deleted) {
+        const { absolutePath } = resolveStorageFile(storagePath, relativePath);
+        const content = await fs.readFile(absolutePath);
+        const stat = await fs.stat(absolutePath);
+        body.contentHash = sha256(content);
+        body.updatedAtMs = Number(attachment?.updatedAtMs) || Math.round(stat.mtimeMs);
+        if (item.contentRequired !== false) {
+            body.content = content.toString('base64');
+            body.contentEncoding = 'base64';
+        }
+        if (!body.attachment) {
+            body.attachment = normalizeAttachmentMetadata({
+                fileName: path.posix.basename(relativePath),
+                relativePath,
+                noteRelativePath,
+                size: content.length,
+                contentHash: body.contentHash,
+                updatedAtMs: body.updatedAtMs
+            }, noteRelativePath);
+        } else {
+            body.attachment = {
+                ...body.attachment,
+                contentHash: body.contentHash,
+                size: Number(body.attachment.size) || content.length,
+                updatedAtMs: body.updatedAtMs
+            };
+        }
+    }
+
+    const response = await syncRequest(serverUrl, '/api/sync/attachment', { token, body });
+    if (response.manifest) {
+        await writeSyncStateFromManifest(storagePath, response.manifest, syncState);
+    }
+
+    return {
+        ok: response.status === 'ok',
+        ...response
+    };
+}
+
+async function uploadLocalNoteWithAttachments(args = {}) {
+    const noteResult = await uploadLocalFile(args);
+    const note = args.note || null;
+    const attachments = Array.isArray(note?.attachments) ? note.attachments : [];
+    const uploadedAttachments = [];
+    const attachmentConflicts = [];
+
+    if (!args.deleted && noteResult.status !== 'conflict') {
+        for (const attachment of attachments) {
+            if (!attachment?.relativePath || attachment.deleted) continue;
+            const result = await uploadLocalAttachment(args, {
+                ...attachment,
+                attachment,
+                noteRelativePath: attachment.noteRelativePath || note.relativePath || relativePathForNote(note)
+            });
+            if (result.status === 'conflict') {
+                attachmentConflicts.push(result.attachment || result.file);
+            } else {
+                uploadedAttachments.push(result.attachment);
+            }
+        }
+    }
+
+    if (args.deleted) {
+        for (const attachment of attachments) {
+            if (!attachment?.relativePath) continue;
+            const result = await uploadLocalAttachment({ ...args, deleted: true }, {
+                ...attachment,
+                attachment,
+                noteRelativePath: attachment.noteRelativePath || note.relativePath || relativePathForNote(note)
+            });
+            if (result.status === 'conflict') {
+                attachmentConflicts.push(result.attachment || result.file);
+            } else {
+                uploadedAttachments.push(result.attachment);
+            }
+        }
+    }
+
+    return {
+        ...noteResult,
+        ok: Boolean(noteResult.ok && attachmentConflicts.length === 0),
+        uploadedAttachments,
+        attachmentConflicts
+    };
+}
+
 function encodeRelativePathForUrl(relativePath) {
     return normalizeRelativePath(relativePath).split('/').map(encodeURIComponent).join('/');
 }
@@ -931,6 +1394,55 @@ function decodeFilePayloadContent(payload = {}) {
     if (payload.deleted) return '';
     if (payload.contentEncoding === 'base64') return Buffer.from(payload.content || '', 'base64').toString('utf8');
     return String(payload.content || '');
+}
+
+function decodeBinaryPayloadContent(payload = {}) {
+    if (payload.deleted) return Buffer.alloc(0);
+    if (payload.contentEncoding === 'base64') return Buffer.from(payload.content || '', 'base64');
+    return Buffer.from(String(payload.content || ''), 'utf8');
+}
+
+async function downloadServerAttachment(args = {}, item, metadata) {
+    const { storagePath, serverUrl, token } = syncConfig(args);
+    const relativePath = normalizeRelativePath(item.relativePath);
+    const payload = await syncRequest(serverUrl, `/api/attachments/${encodeRelativePathForUrl(relativePath)}`, { token });
+    const { absolutePath } = resolveStorageFile(storagePath, relativePath);
+
+    if (payload.deleted) {
+        await fs.rm(absolutePath, { force: true });
+        await removeEmptyParents(path.dirname(absolutePath), path.resolve(storagePath));
+        removeMetadataAttachment(metadata, relativePath);
+        return { relativePath, deleted: true };
+    }
+
+    const content = decodeBinaryPayloadContent(payload);
+    await fs.mkdir(path.dirname(absolutePath), { recursive: true });
+    await fs.writeFile(absolutePath, content);
+
+    const noteRelativePath = normalizeRelativePath(
+        item.noteRelativePath
+        || item.attachment?.noteRelativePath
+        || payload.noteRelativePath
+        || payload.attachment?.noteRelativePath
+    );
+    if (item.note) {
+        upsertMetadataWorkspace(metadata, item.workspace || workspacePayload(metadata, item.note));
+        upsertMetadataNote(metadata, notePayload(item.note, noteRelativePath));
+    }
+
+    const attachment = normalizeAttachmentMetadata({
+        ...(item.attachment || {}),
+        id: item.attachment?.id || payload.attachmentId,
+        fileName: item.attachment?.fileName || payload.fileName || path.posix.basename(relativePath),
+        relativePath,
+        noteRelativePath,
+        mimeType: item.attachment?.mimeType || payload.mimeType || null,
+        size: Number(payload.size) || content.length,
+        contentHash: payload.contentHash || sha256(content),
+        updatedAtMs: item.attachment?.updatedAtMs || payload.clientUpdatedAtMs || Date.now()
+    }, noteRelativePath);
+    upsertMetadataAttachment(metadata, noteRelativePath, attachment);
+    return { relativePath, deleted: false, attachment };
 }
 
 async function downloadServerFile(args = {}, item, metadata) {
@@ -972,15 +1484,32 @@ async function downloadServerFile(args = {}, item, metadata) {
 async function deleteLocalFile(storagePath, item, metadata) {
     const relativePath = normalizeRelativePath(item.relativePath);
     const { absolutePath } = resolveStorageFile(storagePath, relativePath);
+    const attachments = removeMetadataNoteAttachments(metadata, relativePath);
+    for (const attachment of attachments) {
+        if (!attachment?.relativePath) continue;
+        const attachmentPath = resolveStorageFile(storagePath, attachment.relativePath).absolutePath;
+        await fs.rm(attachmentPath, { force: true });
+        await removeEmptyParents(path.dirname(attachmentPath), path.resolve(storagePath));
+    }
     await fs.rm(absolutePath, { force: true });
     await removeEmptyParents(path.dirname(absolutePath), path.resolve(storagePath));
     removeMetadataNote(metadata, relativePath);
     return { relativePath };
 }
 
+async function deleteLocalAttachment(storagePath, item, metadata) {
+    const relativePath = normalizeRelativePath(item.relativePath);
+    const { absolutePath } = resolveStorageFile(storagePath, relativePath);
+    await fs.rm(absolutePath, { force: true });
+    await removeEmptyParents(path.dirname(absolutePath), path.resolve(storagePath));
+    removeMetadataAttachment(metadata, relativePath);
+    return { relativePath };
+}
+
 async function readSyncConflictFile(args = {}) {
     const { storagePath, serverUrl, token } = syncConfig(args);
     const relativePath = normalizeRelativePath(args.relativePath);
+    const isAttachment = args.type === 'attachment' || relativePath.includes('/.attachments/');
     const metadata = await ensureMetadata(storagePath);
     const localNote = findMetadataNote(metadata, relativePath, null);
     const { absolutePath } = resolveStorageFile(storagePath, relativePath);
@@ -997,16 +1526,25 @@ async function readSyncConflictFile(args = {}) {
     };
 
     try {
-        result.localContent = await fs.readFile(absolutePath, 'utf8');
+        if (isAttachment) {
+            const content = await fs.readFile(absolutePath);
+            const stat = await fs.stat(absolutePath);
+            result.localContent = `첨부 파일\n\n경로: ${relativePath}\n크기: ${content.length} bytes\nSHA-256: ${sha256(content)}\n수정: ${stat.mtime.toISOString()}`;
+        } else {
+            result.localContent = await fs.readFile(absolutePath, 'utf8');
+        }
         result.localExists = true;
     } catch (error) {
         result.localError = error instanceof Error ? error.message : '로컬 파일을 읽지 못했습니다.';
     }
 
     try {
-        const serverFile = await syncRequest(serverUrl, `/api/files/${encodeRelativePathForUrl(relativePath)}`, { token });
+        const endpoint = isAttachment ? `/api/attachments/${encodeRelativePathForUrl(relativePath)}` : `/api/files/${encodeRelativePathForUrl(relativePath)}`;
+        const serverFile = await syncRequest(serverUrl, endpoint, { token });
         result.serverFile = serverFile;
-        result.serverContent = decodeFilePayloadContent(serverFile);
+        result.serverContent = isAttachment
+            ? `첨부 파일\n\n경로: ${relativePath}\n크기: ${serverFile.size || 0} bytes\nSHA-256: ${serverFile.contentHash || ''}\n수정: ${serverFile.serverUpdatedAt || ''}`
+            : decodeFilePayloadContent(serverFile);
     } catch (error) {
         result.serverError = error instanceof Error ? error.message : '서버 파일을 읽지 못했습니다.';
     }
@@ -1018,6 +1556,7 @@ async function resolveSyncConflict(args = {}) {
     const { storagePath, serverUrl, token } = syncConfig(args);
     const relativePath = normalizeRelativePath(args.relativePath);
     const resolution = String(args.resolution || '').trim();
+    const isAttachment = args.type === 'attachment' || relativePath.includes('/.attachments/');
     if (!['server', 'local'].includes(resolution)) {
         throw new Error('적용할 충돌 버전을 선택하세요.');
     }
@@ -1025,12 +1564,21 @@ async function resolveSyncConflict(args = {}) {
     if (resolution === 'server') {
         const metadata = await ensureMetadata(storagePath);
         const previousState = await readSyncState(storagePath);
-        const file = await downloadServerFile(args, {
-            relativePath,
-            serverFile: args.serverFile || null,
-            note: args.serverNote || null,
-            workspace: args.serverWorkspace || null
-        }, metadata);
+        const file = isAttachment
+            ? await downloadServerAttachment(args, {
+                relativePath,
+                serverAttachment: args.serverAttachment || args.serverFile || null,
+                attachment: args.serverAttachmentMetadata || args.serverAttachment || null,
+                noteRelativePath: args.noteRelativePath || args.serverAttachmentMetadata?.noteRelativePath || null,
+                note: args.serverNote || null,
+                workspace: args.serverWorkspace || null
+            }, metadata)
+            : await downloadServerFile(args, {
+                relativePath,
+                serverFile: args.serverFile || null,
+                note: args.serverNote || null,
+                workspace: args.serverWorkspace || null
+            }, metadata);
         metadata.generatedAt = new Date().toISOString();
         await writeMetadata(storagePath, metadata);
 
@@ -1048,13 +1596,20 @@ async function resolveSyncConflict(args = {}) {
         };
     }
 
-    let lastKnownRevision = Number(args.serverRevision) || Number(args.serverFile?.revision) || 0;
+    let lastKnownRevision = Number(args.serverRevision) || Number(args.serverFile?.revision) || Number(args.serverAttachment?.revision) || 0;
     if (!lastKnownRevision) {
-        const serverFile = await syncRequest(serverUrl, `/api/files/${encodeRelativePathForUrl(relativePath)}`, { token });
+        const endpoint = isAttachment ? `/api/attachments/${encodeRelativePathForUrl(relativePath)}` : `/api/files/${encodeRelativePathForUrl(relativePath)}`;
+        const serverFile = await syncRequest(serverUrl, endpoint, { token });
         lastKnownRevision = Number(serverFile.revision) || 0;
     }
 
-    const uploadResult = await uploadLocalFile({ ...args, lastKnownRevision }, relativePath);
+    const uploadResult = isAttachment
+        ? await uploadLocalAttachment({ ...args, lastKnownRevision }, {
+            relativePath,
+            attachment: args.clientAttachment || args.attachment || null,
+            noteRelativePath: args.noteRelativePath || args.clientAttachment?.noteRelativePath || null
+        })
+        : await uploadLocalFile({ ...args, lastKnownRevision }, relativePath);
     if (uploadResult.status === 'conflict') {
         return {
             ok: false,
@@ -1062,7 +1617,7 @@ async function resolveSyncConflict(args = {}) {
             didApply: false,
             resolution,
             resolvedPath: relativePath,
-            conflicts: [uploadResult.file].filter(Boolean),
+            conflicts: [uploadResult.file || uploadResult.attachment].filter(Boolean),
             summary: { uploadFiles: 0, downloadFiles: 0, deleteServerFiles: 0, deleteLocalFiles: 0, conflicts: 1 },
             ...uploadResult
         };
@@ -1074,7 +1629,7 @@ async function resolveSyncConflict(args = {}) {
         didApply: true,
         resolution,
         resolvedPath: relativePath,
-        file: uploadResult.file,
+        file: uploadResult.file || uploadResult.attachment,
         upload: uploadResult,
         ...planResponse,
         summary: summarizePlan(planResponse.plan || {})
@@ -1100,6 +1655,10 @@ async function runFullSync(args = {}) {
         downloaded: [],
         deletedServer: [],
         deletedLocal: [],
+        uploadedAttachments: [],
+        downloadedAttachments: [],
+        deletedServerAttachments: [],
+        deletedLocalAttachments: [],
         conflicts: []
     };
     const metadata = await ensureMetadata(storagePath);
@@ -1111,8 +1670,18 @@ async function runFullSync(args = {}) {
         metadataChanged = true;
     }
 
+    for (const item of plan.downloadAttachments || []) {
+        operations.downloadedAttachments.push(await downloadServerAttachment(args, item, metadata));
+        metadataChanged = true;
+    }
+
     for (const item of plan.deleteLocalFiles || []) {
         operations.deletedLocal.push(await deleteLocalFile(storagePath, item, metadata));
+        metadataChanged = true;
+    }
+
+    for (const item of plan.deleteLocalAttachments || []) {
+        operations.deletedLocalAttachments.push(await deleteLocalAttachment(storagePath, item, metadata));
         metadataChanged = true;
     }
 
@@ -1131,6 +1700,16 @@ async function runFullSync(args = {}) {
         }
     }
 
+    for (const item of plan.uploadAttachments || []) {
+        const result = await uploadLocalAttachment(args, item);
+        latestManifest = result.manifest || latestManifest;
+        if (result.status === 'conflict') {
+            operations.conflicts.push(result.attachment || result.file);
+        } else {
+            operations.uploadedAttachments.push(result.attachment);
+        }
+    }
+
     for (const item of plan.deleteServerFiles || []) {
         const result = await uploadLocalFile({ ...args, deleted: true }, item.relativePath);
         latestManifest = result.manifest || latestManifest;
@@ -1138,6 +1717,16 @@ async function runFullSync(args = {}) {
             operations.conflicts.push(result.file);
         } else {
             operations.deletedServer.push(result.file);
+        }
+    }
+
+    for (const item of plan.deleteServerAttachments || []) {
+        const result = await uploadLocalAttachment({ ...args, deleted: true }, item);
+        latestManifest = result.manifest || latestManifest;
+        if (result.status === 'conflict') {
+            operations.conflicts.push(result.attachment || result.file);
+        } else {
+            operations.deletedServerAttachments.push(result.attachment);
         }
     }
 
@@ -1169,7 +1758,7 @@ function registerStorageHandlers() {
     });
 
     ipcMain.handle('notedown:storage:info', async (_event, args = {}) => {
-        const storagePath = normalizeStoragePath(args.storagePath);
+        const storagePath = rememberStoragePath(args.storagePath);
         await fs.mkdir(storagePath, { recursive: true });
         const metadata = await readMetadata(storagePath);
         const shallowMarkdownFiles = await listMarkdownFiles(storagePath, 1, storagePath);
@@ -1189,12 +1778,12 @@ function registerStorageHandlers() {
     });
 
     ipcMain.handle('notedown:storage:initialize', async (_event, args = {}) => {
-        const storagePath = normalizeStoragePath(args.storagePath);
+        const storagePath = rememberStoragePath(args.storagePath);
         return generateMetadata(storagePath, { importDeepMarkdown: Boolean(args.importDeepMarkdown) });
     });
 
     ipcMain.handle('notedown:storage:load-notes', async (_event, args = {}) => {
-        const storagePath = normalizeStoragePath(args.storagePath);
+        const storagePath = rememberStoragePath(args.storagePath);
         let metadata = await readMetadata(storagePath);
         if (!metadata) {
             const generated = await generateMetadata(storagePath, { importDeepMarkdown: false });
@@ -1205,8 +1794,41 @@ function registerStorageHandlers() {
     });
 
     ipcMain.handle('notedown:storage:save-notes', async (_event, args = {}) => {
-        const storagePath = normalizeStoragePath(args.storagePath);
+        const storagePath = rememberStoragePath(args.storagePath);
         return saveNotesToStorage(storagePath, args.notes || []);
+    });
+
+    ipcMain.handle('notedown:storage:save-attachment', async (_event, args = {}) => {
+        try {
+            return await saveAttachmentToStorage(args);
+        } catch (error) {
+            return {
+                ok: false,
+                error: error instanceof Error ? error.message : '첨부 파일을 저장하지 못했습니다.'
+            };
+        }
+    });
+
+    ipcMain.handle('notedown:storage:choose-attachments', async (event, args = {}) => {
+        try {
+            return await chooseAttachmentsForStorage(event, args);
+        } catch (error) {
+            return {
+                ok: false,
+                error: error instanceof Error ? error.message : '첨부 파일을 선택하지 못했습니다.'
+            };
+        }
+    });
+
+    ipcMain.handle('notedown:storage:open-attachment', async (_event, args = {}) => {
+        try {
+            return await openAttachmentFromStorage(args);
+        } catch (error) {
+            return {
+                ok: false,
+                error: error instanceof Error ? error.message : '첨부 파일을 열지 못했습니다.'
+            };
+        }
     });
 }
 
@@ -1273,7 +1895,7 @@ function registerSyncHandlers() {
 
     ipcMain.handle('notedown:sync:upload-note', async (_event, args = {}) => {
         try {
-            return await uploadLocalFile(args);
+            return await uploadLocalNoteWithAttachments(args);
         } catch (error) {
             return syncError(error, '문서 동기화에 실패했습니다.');
         }
@@ -1356,10 +1978,60 @@ function trayIcon() {
 
 function trayMenu() {
     return Menu.buildFromTemplate([
-        { label: 'Notedown 열기', click: () => { void showMainWindow(); } },
+        { label: 'Notedown 열기', click: () => { void showMainWindow({ anchorPoint: screen.getCursorScreenPoint() }); } },
         { type: 'separator' },
         { label: '종료', click: quitApplication }
     ]);
+}
+
+function isScreenPoint(point) {
+    return Boolean(point) && Number.isFinite(point.x) && Number.isFinite(point.y);
+}
+
+function trayClickPoint(bounds, position) {
+    if (isScreenPoint(position)) return position;
+    if (bounds && Number.isFinite(bounds.x) && Number.isFinite(bounds.y)) {
+        return {
+            x: Math.round(bounds.x + (bounds.width || 0) / 2),
+            y: Math.round(bounds.y + (bounds.height || 0) / 2)
+        };
+    }
+    return screen.getCursorScreenPoint();
+}
+
+function targetDisplayForPoint(point) {
+    return screen.getDisplayNearestPoint(isScreenPoint(point) ? point : screen.getCursorScreenPoint());
+}
+
+function centeredBoundsForDisplay(win, display) {
+    const bounds = win.getBounds();
+    const [minWidth, minHeight] = win.getMinimumSize();
+    const workArea = display.workArea;
+    const width = Math.min(Math.max(bounds.width || 1400, minWidth || 0), workArea.width);
+    const height = Math.min(Math.max(bounds.height || 920, minHeight || 0), workArea.height);
+
+    return {
+        x: Math.round(workArea.x + (workArea.width - width) / 2),
+        y: Math.round(workArea.y + (workArea.height - height) / 2),
+        width,
+        height
+    };
+}
+
+function moveWindowToTargetDisplay(win, anchorPoint) {
+    const display = targetDisplayForPoint(anchorPoint);
+    win.setBounds(centeredBoundsForDisplay(win, display), false);
+}
+
+function revealWindowOnCurrentMacWorkspace(win) {
+    if (process.platform !== 'darwin') return;
+
+    win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+    if (currentWorkspaceRevealTimer) clearTimeout(currentWorkspaceRevealTimer);
+    currentWorkspaceRevealTimer = setTimeout(() => {
+        currentWorkspaceRevealTimer = null;
+        if (!win.isDestroyed()) win.setVisibleOnAllWorkspaces(false);
+    }, 250);
 }
 
 function ensureTray() {
@@ -1369,9 +2041,13 @@ function ensureTray() {
     tray.setToolTip(APP_NAME);
     tray.on('right-click', () => tray?.popUpContextMenu(trayMenu()));
     if (process.platform === 'darwin') {
-        tray.on('click', () => { void showMainWindow(); });
+        tray.on('click', (_event, bounds, position) => {
+            void showMainWindow({ anchorPoint: trayClickPoint(bounds, position) });
+        });
     } else {
-        tray.on('double-click', () => { void showMainWindow(); });
+        tray.on('double-click', (_event, bounds, position) => {
+            void showMainWindow({ anchorPoint: trayClickPoint(bounds, position) });
+        });
     }
     return tray;
 }
@@ -1396,16 +2072,22 @@ function hideMainWindow(win) {
     if (process.platform === 'darwin' && app.dock) app.dock.hide();
 }
 
-async function showMainWindow() {
-    if (process.platform === 'darwin' && app.dock) app.dock.show();
+async function showMainWindow(options = {}) {
+    if (process.platform === 'darwin' && app.dock) await app.dock.show();
 
-    const win = mainWindow && !mainWindow.isDestroyed()
+    const hadWindow = mainWindow && !mainWindow.isDestroyed();
+    const win = hadWindow
         ? mainWindow
         : await createWindow();
 
+    if (!hadWindow || !win.isVisible() || win.isMinimized()) {
+        moveWindowToTargetDisplay(win, options.anchorPoint);
+    }
+    revealWindowOnCurrentMacWorkspace(win);
     if (win.isMinimized()) win.restore();
     if (!win.isVisible()) win.show();
     win.focus();
+    if (typeof win.moveTop === 'function') win.moveTop();
 }
 
 function registerAppHandlers() {
@@ -1423,6 +2105,15 @@ function registerAppHandlers() {
 protocol.registerSchemesAsPrivileged([
     {
         scheme: 'notedown',
+        privileges: {
+            standard: true,
+            secure: true,
+            supportFetchAPI: true,
+            corsEnabled: true
+        }
+    },
+    {
+        scheme: 'notedown-attachment',
         privileges: {
             standard: true,
             secure: true,
@@ -1464,9 +2155,54 @@ async function registerLocalProtocol() {
     protocolRegistered = true;
 }
 
+async function registerAttachmentProtocol() {
+    if (attachmentProtocolRegistered) return;
+
+    protocol.handle('notedown-attachment', async (request) => {
+        try {
+            const requestUrl = new URL(request.url);
+            const rawStoragePath = requestUrl.searchParams.get('storagePath') || '';
+            const rawRelativePath = requestUrl.searchParams.get('relativePath') || '';
+            if (!rawStoragePath || !rawRelativePath) {
+                return new Response('첨부 파일 경로가 비어 있습니다.', { status: 400 });
+            }
+
+            const storagePath = normalizeStoragePath(rawStoragePath);
+            const root = path.resolve(storagePath);
+            if (!activeStorageRoots.has(root)) {
+                return new Response('등록되지 않은 저장소입니다.', { status: 403 });
+            }
+
+            const relativePath = normalizeRelativePath(rawRelativePath);
+            if (!isAttachmentRelativePath(relativePath)) {
+                return new Response('첨부 파일 경로만 열 수 있습니다.', { status: 403 });
+            }
+
+            const { absolutePath } = resolveStorageFile(storagePath, relativePath);
+            const stat = await fs.stat(absolutePath);
+            if (!stat.isFile()) {
+                return new Response('첨부 파일을 찾지 못했습니다.', { status: 404 });
+            }
+
+            const content = await fs.readFile(absolutePath);
+            return new Response(content, {
+                headers: {
+                    'Content-Type': contentTypeForFileName(relativePath),
+                    'Cache-Control': 'no-store'
+                }
+            });
+        } catch (error) {
+            return new Response(error instanceof Error ? error.message : '첨부 파일을 열지 못했습니다.', { status: 404 });
+        }
+    });
+
+    attachmentProtocolRegistered = true;
+}
+
 async function createWindow() {
     if (mainWindow && !mainWindow.isDestroyed()) return mainWindow;
     if (!DEV_URL) await registerLocalProtocol();
+    await registerAttachmentProtocol();
 
     const win = new BrowserWindow({
         width: 1400,
@@ -1476,7 +2212,7 @@ async function createWindow() {
         backgroundColor: '#fbfbfa',
         title: APP_NAME,
         icon: APP_ICON_PATH,
-        titleBarStyle: 'hiddenInset',
+        frame: true,
         webPreferences: {
             preload: path.join(__dirname, 'preload.cjs'),
             contextIsolation: true,

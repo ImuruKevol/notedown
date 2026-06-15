@@ -4,59 +4,61 @@ div(class="flex h-full min-h-0 overflow-hidden bg-[#f6f5f1] text-stone-950 dark:
             img(src="assets/brand/logo-black.svg", alt="Notedown", class="h-6 w-auto dark:hidden")
             img(src="assets/brand/logo-white.svg", alt="Notedown", class="hidden h-6 w-auto dark:block")
 
-        div(class="mb-2 px-3 text-[12px] font-semibold text-stone-400 dark:text-zinc-500") 로컬
+        div(class="mb-2 flex items-center justify-between px-3")
+            span(class="text-[12px] font-semibold text-stone-400 dark:text-zinc-500") 로컬
+            button(type="button", title="새 폴더", aria-label="새 폴더", class="app-no-drag flex size-6 shrink-0 items-center justify-center rounded-md text-stone-500 transition hover:bg-white/55 hover:text-stone-950 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:text-zinc-50", (click)="createFolder($event)")
+                svg(xmlns="http://www.w3.org/2000/svg", viewBox="0 0 24 24", fill="none", stroke="currentColor", stroke-width="1.9", stroke-linecap="round", stroke-linejoin="round", class="size-3.5")
+                    path(d="M12 5v14")
+                    path(d="M5 12h14")
         nav(class="min-h-0 flex-1 space-y-1 overflow-y-auto")
-            button(type="button", *ngFor="let folder of folders", [class]="folderButtonClass(folder.id)", (click)="selectFolder(folder.id)")
-                svg(xmlns="http://www.w3.org/2000/svg", viewBox="0 0 24 24", fill="none", stroke="currentColor", stroke-width="1.7", stroke-linecap="round", stroke-linejoin="round", class="size-4 shrink-0 text-amber-600")
-                    path(d="M3 7.5A2.5 2.5 0 0 1 5.5 5H10l2 2h6.5A2.5 2.5 0 0 1 21 9.5v7A2.5 2.5 0 0 1 18.5 19h-13A2.5 2.5 0 0 1 3 16.5z")
-                span(class="min-w-0 flex-1 truncate") {{folder.label}}
-                span(class="text-[12px] text-stone-400 dark:text-zinc-500") {{folderCount(folder.id)}}
-
-        div(class="mt-3 space-y-1 border-t border-stone-300/70 pt-3 dark:border-zinc-800")
-            button(type="button", class="flex h-9 w-full items-center gap-2 rounded-md px-3 text-left text-[13px] font-medium text-stone-600 hover:bg-white/55 hover:text-stone-950 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:text-zinc-50")
-                svg(xmlns="http://www.w3.org/2000/svg", viewBox="0 0 24 24", fill="none", stroke="currentColor", stroke-width="1.8", stroke-linecap="round", stroke-linejoin="round", class="size-4")
-                    circle(cx="12", cy="12", r="9")
-                    path(d="M12 8v8")
-                    path(d="M8 12h8")
-                span 새 폴더
-            a(routerLink="/settings", class="flex h-9 w-full items-center gap-2 rounded-md px-3 text-left text-[13px] font-medium text-stone-600 hover:bg-white/55 hover:text-stone-950 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:text-zinc-50", (click)="closeWorkspace()")
-                svg(xmlns="http://www.w3.org/2000/svg", viewBox="0 0 24 24", fill="none", stroke="currentColor", stroke-width="1.8", stroke-linecap="round", stroke-linejoin="round", class="size-4")
-                    path(d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.52a2 2 0 0 1-1 1.72l-.15.1a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.38a2 2 0 0 0-.73-2.73l-.15-.1a2 2 0 0 1-1-1.72v-.52a2 2 0 0 1 1-1.72l.15-.1a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z")
-                    circle(cx="12", cy="12", r="3")
-                span 설정
+            div(*ngFor="let folder of folders", [class]="folderRowClass(folder.id)")
+                div(*ngIf="editingFolderId === folder.id && folder.id !== 'all'", class="flex min-w-0 flex-1 items-center gap-2 px-3")
+                    svg(xmlns="http://www.w3.org/2000/svg", viewBox="0 0 24 24", fill="none", stroke="currentColor", stroke-width="1.7", stroke-linecap="round", stroke-linejoin="round", class="size-4 shrink-0 text-amber-600")
+                        path(d="M3 7.5A2.5 2.5 0 0 1 5.5 5H10l2 2h6.5A2.5 2.5 0 0 1 21 9.5v7A2.5 2.5 0 0 1 18.5 19h-13A2.5 2.5 0 0 1 3 16.5z")
+                    input(type="text", data-folder-name-input="true", [(ngModel)]="folderNameDraft", (keydown.enter)="commitFolderRename(folder.id)", (keydown.escape)="cancelFolderRename()", (blur)="commitFolderRename(folder.id)", class="min-w-0 flex-1 border-0 bg-transparent p-0 text-[13px] font-medium outline-none focus:ring-0")
+                button(*ngIf="editingFolderId !== folder.id || folder.id === 'all'", type="button", [class]="folderSelectButtonClass(folder.id)", (click)="selectFolder(folder.id)")
+                    svg(xmlns="http://www.w3.org/2000/svg", viewBox="0 0 24 24", fill="none", stroke="currentColor", stroke-width="1.7", stroke-linecap="round", stroke-linejoin="round", class="size-4 shrink-0 text-amber-600")
+                        path(d="M3 7.5A2.5 2.5 0 0 1 5.5 5H10l2 2h6.5A2.5 2.5 0 0 1 21 9.5v7A2.5 2.5 0 0 1 18.5 19h-13A2.5 2.5 0 0 1 3 16.5z")
+                    span(class="min-w-0 flex-1 truncate") {{folder.label}}
+                button(*ngIf="folder.id !== 'all' && editingFolderId !== folder.id", type="button", title="폴더 이름 수정", aria-label="폴더 이름 수정", [class]="folderEditButtonClass(folder.id)", (click)="startFolderRename(folder.id, $event)")
+                    svg(xmlns="http://www.w3.org/2000/svg", viewBox="0 0 24 24", fill="none", stroke="currentColor", stroke-width="1.8", stroke-linecap="round", stroke-linejoin="round", class="size-3.5")
+                        path(d="M12 20h9")
+                        path(d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z")
+                span(*ngIf="editingFolderId !== folder.id || folder.id === 'all'", [class]="folderCountClass(folder.id)") {{folderCount(folder.id)}}
 
     section(class="flex h-full min-w-0 flex-1 flex-col bg-[#f7f6f2] dark:bg-zinc-950")
-        header(class="app-drag flex h-14 shrink-0 items-center justify-between border-b border-stone-200/80 bg-[#fbfaf7]/90 px-3 backdrop-blur lg:h-[86px] lg:items-end lg:pb-3 dark:border-zinc-800 dark:bg-zinc-950/90")
-            div(class="flex min-w-0 items-center gap-2")
-                button(type="button", title="Workspace", class="flex size-9 shrink-0 items-center justify-center rounded-md text-stone-500 transition hover:bg-stone-200/70 hover:text-stone-950 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:text-zinc-50", (click)="toggleWorkspace($event)")
+        header(class="flex h-16 shrink-0 items-center border-b border-stone-200/80 bg-[#fbfaf7]/90 px-3 backdrop-blur dark:border-zinc-800 dark:bg-zinc-950/90")
+            div(class="flex w-full min-w-0 items-center gap-2")
+                button(type="button", title="Workspace", class="flex size-8 shrink-0 items-center justify-center rounded-md text-stone-500 transition hover:bg-stone-200/70 hover:text-stone-950 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:text-zinc-50", (click)="toggleWorkspace($event)")
                     svg(xmlns="http://www.w3.org/2000/svg", viewBox="0 0 24 24", fill="none", stroke="currentColor", stroke-width="1.8", stroke-linecap="round", stroke-linejoin="round", class="size-4")
                         rect(x="3", y="4", width="18", height="16", rx="2")
                         path(d="M9 4v16")
-                div(class="min-w-0")
-                    h2(class="truncate text-[15px] font-semibold text-stone-900 dark:text-zinc-100") {{activeFolderLabel}}
-                    p(class="text-[12px] text-stone-400 dark:text-zinc-500") {{visibleNotes.length}}개
-            div(class="app-no-drag relative flex shrink-0 items-center gap-1")
-                button(type="button", title="Sort notes", [class]="sortButtonClass()", (click)="toggleSort($event)")
-                    svg(xmlns="http://www.w3.org/2000/svg", viewBox="0 0 24 24", fill="none", stroke="currentColor", stroke-width="1.8", stroke-linecap="round", stroke-linejoin="round", class="size-4")
-                        path(d="M11 5h9")
-                        path(d="M11 12h7")
-                        path(d="M11 19h5")
-                        path(d="M4 5v12")
-                        path(d="m7 14-3 3-3-3")
-                div(*ngIf="sortOpen", class="absolute right-0 top-10 z-30 w-48 rounded-lg border border-stone-200 bg-white p-1.5 shadow-xl shadow-stone-900/10 dark:border-zinc-800 dark:bg-zinc-900 dark:shadow-black/30")
-                    div(class="px-2 pb-1 pt-0.5 text-[11px] font-semibold text-stone-400 dark:text-zinc-500") {{currentSortLabel}}
-                    button(type="button", *ngFor="let option of sortOptions", [class]="sortOptionClass(option.value)", (click)="selectSort(option.value)")
-                        span {{option.label}}
-                        svg(*ngIf="sortValue === option.value", xmlns="http://www.w3.org/2000/svg", viewBox="0 0 24 24", fill="none", stroke="currentColor", stroke-width="2", stroke-linecap="round", stroke-linejoin="round", class="size-3.5")
-                            path(d="m20 6-11 11-5-5")
-                button(type="button", title="Search notes", [class]="searchButtonClass()", (click)="toggleSearch()")
-                    svg(xmlns="http://www.w3.org/2000/svg", viewBox="0 0 24 24", fill="none", stroke="currentColor", stroke-width="1.8", stroke-linecap="round", stroke-linejoin="round", class="size-4")
-                        circle(cx="11", cy="11", r="8")
-                        path(d="m21 21-4.3-4.3")
-                button(type="button", title="New note", class="flex size-9 shrink-0 items-center justify-center rounded-md text-stone-500 transition hover:bg-stone-200/70 hover:text-stone-950 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:text-zinc-50", (click)="createNote()")
-                    svg(xmlns="http://www.w3.org/2000/svg", viewBox="0 0 24 24", fill="none", stroke="currentColor", stroke-width="1.8", stroke-linecap="round", stroke-linejoin="round", class="size-5")
-                        path(d="M12 5v14")
-                        path(d="M5 12h14")
+                div(class="flex min-w-0 flex-1 flex-col justify-center")
+                    h2(class="w-full truncate text-left text-[15px] font-semibold leading-5 text-stone-900 dark:text-zinc-100") {{activeFolderLabel}}
+                    div(class="mt-1 flex h-7 min-w-0 items-center justify-between gap-2")
+                        p(class="shrink-0 text-[12px] leading-7 text-stone-400 dark:text-zinc-500") {{visibleNotes.length}}개
+                        div(class="app-no-drag relative flex shrink-0 items-center gap-0.5")
+                            button(type="button", title="Sort notes", [class]="sortButtonClass()", (click)="toggleSort($event)")
+                                svg(xmlns="http://www.w3.org/2000/svg", viewBox="0 0 24 24", fill="none", stroke="currentColor", stroke-width="1.8", stroke-linecap="round", stroke-linejoin="round", class="size-3.5")
+                                    path(d="M11 5h9")
+                                    path(d="M11 12h7")
+                                    path(d="M11 19h5")
+                                    path(d="M4 5v12")
+                                    path(d="m7 14-3 3-3-3")
+                            div(*ngIf="sortOpen", class="absolute right-0 top-8 z-30 w-48 rounded-lg border border-stone-200 bg-white p-1.5 shadow-xl shadow-stone-900/10 dark:border-zinc-800 dark:bg-zinc-900 dark:shadow-black/30")
+                                div(class="px-2 pb-1 pt-0.5 text-[11px] font-semibold text-stone-400 dark:text-zinc-500") {{currentSortLabel}}
+                                button(type="button", *ngFor="let option of sortOptions", [class]="sortOptionClass(option.value)", (click)="selectSort(option.value)")
+                                    span {{option.label}}
+                                    svg(*ngIf="sortValue === option.value", xmlns="http://www.w3.org/2000/svg", viewBox="0 0 24 24", fill="none", stroke="currentColor", stroke-width="2", stroke-linecap="round", stroke-linejoin="round", class="size-3.5")
+                                        path(d="m20 6-11 11-5-5")
+                            button(type="button", title="Search notes", [class]="searchButtonClass()", (click)="toggleSearch()")
+                                svg(xmlns="http://www.w3.org/2000/svg", viewBox="0 0 24 24", fill="none", stroke="currentColor", stroke-width="1.8", stroke-linecap="round", stroke-linejoin="round", class="size-3.5")
+                                    circle(cx="11", cy="11", r="8")
+                                    path(d="m21 21-4.3-4.3")
+                            button(type="button", title="New note", class="flex size-7 shrink-0 items-center justify-center rounded-md text-stone-500 transition hover:bg-stone-200/70 hover:text-stone-950 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:text-zinc-50", (click)="createNote()")
+                                svg(xmlns="http://www.w3.org/2000/svg", viewBox="0 0 24 24", fill="none", stroke="currentColor", stroke-width="1.8", stroke-linecap="round", stroke-linejoin="round", class="size-4")
+                                    path(d="M12 5v14")
+                                    path(d="M5 12h14")
 
         div(class="border-b border-stone-200/80 bg-[#fbfaf7]/75 px-3 py-2 dark:border-zinc-800 dark:bg-zinc-950/75", *ngIf="searchOpen && notes.length > 0")
             div(class="relative")

@@ -263,6 +263,17 @@ html.dark .notedown-preview-code:hover {
     line-height: 1.5rem;
 }
 
+.notedown-preview-markdown :where(ul, ol) {
+    margin-top: 0.2rem;
+    margin-bottom: 0.2rem;
+    padding-left: 1.45rem;
+}
+
+.notedown-preview-markdown :where(li > ul, li > ol) {
+    margin-top: 0.15rem;
+    margin-bottom: 0;
+}
+
 .notedown-preview-markdown :where(h1, h2, h3, h4, h5, h6) {
     line-height: 1.28;
 }
@@ -289,6 +300,20 @@ html.dark .notedown-preview-code:hover {
 
 .notedown-preview-markdown p:has(.notedown-task) {
     margin: 0;
+}
+
+.notedown-preview-markdown li.task-list-item {
+    list-style: none;
+    cursor: pointer;
+}
+
+.notedown-preview-markdown li.task-list-item > input[type="checkbox"] {
+    width: 1rem;
+    height: 1rem;
+    margin: 0 0.55rem 0 -1.35rem !important;
+    vertical-align: middle;
+    accent-color: #2563eb;
+    cursor: pointer;
 }
 
 .notedown-preview-markdown blockquote {

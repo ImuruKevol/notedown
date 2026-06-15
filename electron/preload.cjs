@@ -18,7 +18,10 @@ contextBridge.exposeInMainWorld('notedown', {
         info: (payload) => ipcRenderer.invoke('notedown:storage:info', payload),
         initialize: (payload) => ipcRenderer.invoke('notedown:storage:initialize', payload),
         loadNotes: (payload) => ipcRenderer.invoke('notedown:storage:load-notes', payload),
-        saveNotes: (payload) => ipcRenderer.invoke('notedown:storage:save-notes', payload)
+        saveNotes: (payload) => ipcRenderer.invoke('notedown:storage:save-notes', payload),
+        saveAttachment: (payload) => ipcRenderer.invoke('notedown:storage:save-attachment', payload),
+        chooseAttachments: (payload) => ipcRenderer.invoke('notedown:storage:choose-attachments', payload),
+        openAttachment: (payload) => ipcRenderer.invoke('notedown:storage:open-attachment', payload)
     },
     sync: {
         health: (payload) => ipcRenderer.invoke('notedown:sync:health', payload),

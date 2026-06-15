@@ -70,3 +70,22 @@
 | 2026-06-08 | 003 | 커맨드 팔렛트 Enter/클릭 액션 및 목록/설정 동기화 정리 | [상세](devlog/2026-06-08/003-command-palette-action-sync.md) |
 | 2026-06-08 | 004 | 커맨드 팔렛트 hover와 키보드 선택 경합 수정 | [상세](devlog/2026-06-08/004-command-palette-hover-keyboard.md) |
 | 2026-06-08 | 005 | 현재 기능 기준 README 갱신 및 Electron 스크린샷 추가 | [상세](devlog/2026-06-08/005-readme-screenshots-current-features.md) |
+| 2026-06-12 | 001 | Preview 리스트 depth 렌더링 복구 | [상세](devlog/2026-06-12/001-preview-list-depth-fix.md) |
+| 2026-06-12 | 002 | 탭 크기 설정 기반 Preview 리스트 depth 정규화 | [상세](devlog/2026-06-12/002-tab-size-list-depth-normalization.md) |
+| 2026-06-12 | 003 | 폴더 패널 하단 설정 버튼 제거 및 새 폴더 버튼 위치 이동 | [상세](devlog/2026-06-12/003-sidebar-folder-panel-actions.md) |
+| 2026-06-12 | 004 | 폴더 선택 시 폴더 패널 유지 | [상세](devlog/2026-06-12/004-keep-folder-panel-open-on-select.md) |
+| 2026-06-12 | 005 | 모든 노트 선택 상태 유지 보정 | [상세](devlog/2026-06-12/005-keep-all-notes-selection.md) |
+| 2026-06-12 | 006 | Electron 앱 배포 산출물 재빌드 | [상세](devlog/2026-06-12/006-electron-release-rebuild.md) |
+| 2026-06-12 | 007 | Electron 상태바 재열기 위치를 현재 화면/데스크탑 기준으로 보정 | [상세](devlog/2026-06-12/007-electron-current-desktop-reopen.md) |
+| 2026-06-12 | 008 | Electron 앱 배포 산출물 재빌드 | [상세](devlog/2026-06-12/008-electron-release-rebuild.md) |
+| 2026-06-15 | 001 | 폴더 패널 새 폴더 버튼 동작 복구 | [상세](devlog/2026-06-15/001-folder-create-button.md) |
+| 2026-06-15 | 002 | 새 폴더 버튼 즉시 생성 방식으로 보강 | [상세](devlog/2026-06-15/002-folder-button-immediate-create.md) |
+| 2026-06-15 | 003 | 폴더 이름 인라인 수정 기능 추가 | [상세](devlog/2026-06-15/003-inline-folder-rename.md) |
+| 2026-06-15 | 004 | 폴더 행 편집 버튼 및 노트 목록 헤더 레이아웃 정리 | [상세](devlog/2026-06-15/004-folder-row-header-layout.md) |
+| 2026-06-15 | 005 | macOS 창 버튼과 겹치지 않도록 폴더 헤더 정렬 조정 | [상세](devlog/2026-06-15/005-macos-folder-header-align.md) |
+| 2026-06-15 | 006 | Electron 기본 창 프레임 복구 및 좌상단 헤더 여백 정리 | [상세](devlog/2026-06-15/006-electron-native-frame-header.md) |
+| 2026-06-15 | 007 | 노트 목록 제목 헤더와 노트 행 수직 여백 보정 | [상세](devlog/2026-06-15/007-note-list-title-spacing.md) |
+| 2026-06-15 | 008 | 노트 첨부 파일/이미지 UI 및 동기화 처리 추가 | [상세](devlog/2026-06-15/008-note-attachments-sync.md) |
+| 2026-06-15 | 009 | Electron 첨부 이미지 미리보기 로딩 복구 및 실제 앱 검증 | [상세](devlog/2026-06-15/009-attachment-image-preview-protocol.md) |
+| 2026-06-15 | 010 | Electron 파일 선택 첨부 흐름을 main process dialog 저장으로 전환 | [상세](devlog/2026-06-15/010-electron-attachment-dialog-save.md) |
+| 2026-06-15 | 011 | Slash 첨부 팝오버 위치를 입력 줄 기준으로 보정 | [상세](devlog/2026-06-15/011-slash-attachment-popover-position.md) |

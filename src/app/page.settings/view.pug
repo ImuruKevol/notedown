@@ -1,5 +1,5 @@
 section(class="flex h-full min-h-0 flex-col bg-[#fbfbfa] text-stone-950 dark:bg-zinc-950 dark:text-zinc-50")
-    header(class="app-drag flex h-[64px] shrink-0 items-center border-b border-stone-200 bg-white/90 pl-[88px] pr-4 backdrop-blur dark:border-zinc-800 dark:bg-zinc-950/90")
+    header(class="flex h-14 shrink-0 items-center border-b border-stone-200 bg-white/90 px-5 backdrop-blur dark:border-zinc-800 dark:bg-zinc-950/90")
         div(class="flex min-w-0 items-center gap-3")
             a(routerLink="/notes", title="Back to notes", class="flex size-9 shrink-0 items-center justify-center rounded-md text-stone-500 transition hover:bg-stone-100 hover:text-stone-950 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:text-zinc-50")
                 svg(xmlns="http://www.w3.org/2000/svg", viewBox="0 0 24 24", fill="none", stroke="currentColor", stroke-width="1.8", stroke-linecap="round", stroke-linejoin="round", class="size-4")
@@ -134,16 +134,16 @@ section(class="flex h-full min-h-0 flex-col bg-[#fbfbfa] text-stone-950 dark:bg-
                             div(class="grid gap-3 sm:grid-cols-5")
                                 div
                                     p(class="text-[12px] text-stone-400 dark:text-zinc-500") 업로드
-                                    p(class="mt-1 text-[22px] font-semibold") {{syncPlanSummary?.uploadFiles || 0}}
+                                    p(class="mt-1 text-[22px] font-semibold") {{(syncPlanSummary?.uploadFiles || 0) + (syncPlanSummary?.uploadAttachments || 0)}}
                                 div
                                     p(class="text-[12px] text-stone-400 dark:text-zinc-500") 다운로드
-                                    p(class="mt-1 text-[22px] font-semibold") {{syncPlanSummary?.downloadFiles || 0}}
+                                    p(class="mt-1 text-[22px] font-semibold") {{(syncPlanSummary?.downloadFiles || 0) + (syncPlanSummary?.downloadAttachments || 0)}}
                                 div
                                     p(class="text-[12px] text-stone-400 dark:text-zinc-500") 서버 삭제
-                                    p(class="mt-1 text-[22px] font-semibold") {{syncPlanSummary?.deleteServerFiles || 0}}
+                                    p(class="mt-1 text-[22px] font-semibold") {{(syncPlanSummary?.deleteServerFiles || 0) + (syncPlanSummary?.deleteServerAttachments || 0)}}
                                 div
                                     p(class="text-[12px] text-stone-400 dark:text-zinc-500") 로컬 삭제
-                                    p(class="mt-1 text-[22px] font-semibold") {{syncPlanSummary?.deleteLocalFiles || 0}}
+                                    p(class="mt-1 text-[22px] font-semibold") {{(syncPlanSummary?.deleteLocalFiles || 0) + (syncPlanSummary?.deleteLocalAttachments || 0)}}
                                 div
                                     p(class="text-[12px] text-stone-400 dark:text-zinc-500") 충돌
                                     p(class="mt-1 text-[22px] font-semibold") {{syncPlanSummary?.conflicts || 0}}

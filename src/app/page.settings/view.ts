@@ -41,6 +41,10 @@ interface SyncPlanSummary {
     downloadFiles: number;
     deleteServerFiles: number;
     deleteLocalFiles: number;
+    uploadAttachments?: number;
+    downloadAttachments?: number;
+    deleteServerAttachments?: number;
+    deleteLocalAttachments?: number;
     conflicts: number;
 }
 
@@ -503,10 +507,10 @@ export class Component implements OnInit, OnDestroy {
                 this.clearSyncConflicts();
                 const operations = result.operations || {};
                 const message = [
-                    `업로드 ${operations.uploaded?.length || 0}`,
-                    `다운로드 ${operations.downloaded?.length || 0}`,
-                    `서버 삭제 ${operations.deletedServer?.length || 0}`,
-                    `로컬 삭제 ${operations.deletedLocal?.length || 0}`
+                    `업로드 ${(operations.uploaded?.length || 0) + (operations.uploadedAttachments?.length || 0)}`,
+                    `다운로드 ${(operations.downloaded?.length || 0) + (operations.downloadedAttachments?.length || 0)}`,
+                    `서버 삭제 ${(operations.deletedServer?.length || 0) + (operations.deletedServerAttachments?.length || 0)}`,
+                    `로컬 삭제 ${(operations.deletedLocal?.length || 0) + (operations.deletedLocalAttachments?.length || 0)}`
                 ].join(', ');
                 this.setSyncMessage(`전체 동기화가 완료되었습니다. ${message}`, 'success');
                 window.dispatchEvent(new CustomEvent('notedown:notes-changed'));
@@ -876,10 +880,10 @@ export class Component implements OnInit, OnDestroy {
 
     private syncSummaryMessage(summary: SyncPlanSummary) {
         return [
-            `업로드 ${summary.uploadFiles}`,
-            `다운로드 ${summary.downloadFiles}`,
-            `서버 삭제 ${summary.deleteServerFiles}`,
-            `로컬 삭제 ${summary.deleteLocalFiles}`,
+            `업로드 ${summary.uploadFiles + (summary.uploadAttachments || 0)}`,
+            `다운로드 ${summary.downloadFiles + (summary.downloadAttachments || 0)}`,
+            `서버 삭제 ${summary.deleteServerFiles + (summary.deleteServerAttachments || 0)}`,
+            `로컬 삭제 ${summary.deleteLocalFiles + (summary.deleteLocalAttachments || 0)}`,
             `충돌 ${summary.conflicts}`
         ].join(', ');
     }

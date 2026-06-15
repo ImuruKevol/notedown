@@ -17,6 +17,7 @@ interface NoteItem {
     workspaceName?: string;
     updatedAt?: string;
     updatedAtMs?: number;
+    attachments?: any[];
 }
 
 interface WorkspaceItem {
@@ -63,6 +64,7 @@ export class Component implements OnInit, OnDestroy {
     private notesKey = 'notedown.notes.v1';
     private activeNoteKey = 'notedown.activeNoteId.v1';
     private activeWorkspaceKey = 'notedown.activeWorkspace.v1';
+    private foldersKey = 'notedown.folders.v1';
     private settingsKey = 'notedown.settings.v1';
     private routeSubscription?: Subscription;
     private handleWorkspacePanel = (event: Event) => {
@@ -74,13 +76,14 @@ export class Component implements OnInit, OnDestroy {
     private handleWorkspaceChanged = (event: Event) => {
         const workspaceId = (event as CustomEvent<{ workspaceId?: string }>).detail?.workspaceId;
         if (workspaceId) {
+            this.refreshPaletteData();
             this.activeWorkspaceId = workspaceId;
             localStorage.setItem(this.activeWorkspaceKey, workspaceId);
             this.renderSoon();
         }
     };
     private handleStorageChanged = (event: StorageEvent) => {
-        if (event.key === this.notesKey || event.key === this.settingsKey || event.key === this.activeWorkspaceKey) {
+        if (event.key === this.notesKey || event.key === this.settingsKey || event.key === this.activeWorkspaceKey || event.key === this.foldersKey) {
             this.refreshPaletteData();
             this.renderSoon();
         }
@@ -350,13 +353,18 @@ export class Component implements OnInit, OnDestroy {
             folder: note?.folder || 'memo',
             workspaceName: typeof note?.workspaceName === 'string' ? note.workspaceName : undefined,
             updatedAt: typeof note?.updatedAt === 'string' ? note.updatedAt : '',
-            updatedAtMs: Number.isFinite(note?.updatedAtMs) ? Number(note.updatedAtMs) : fallbackTime
+            updatedAtMs: Number.isFinite(note?.updatedAtMs) ? Number(note.updatedAtMs) : fallbackTime,
+            attachments: Array.isArray(note?.attachments) ? note.attachments : []
         };
     }
 
     private buildWorkspaces(notes: NoteItem[]): WorkspaceItem[] {
         const folders = new Map<string, WorkspaceItem>();
         folders.set('all', { id: 'all', label: '모든 노트', count: notes.length });
+
+        for (const folder of this.readStoredFolders()) {
+            folders.set(folder.id, { id: folder.id, label: folder.label, count: 0 });
+        }
 
         for (const note of notes) {
             const id = note.folder || 'memo';
@@ -370,6 +378,32 @@ export class Component implements OnInit, OnDestroy {
         }
 
         return Array.from(folders.values());
+    }
+
+    private readStoredFolders(): WorkspaceItem[] {
+        try {
+            const stored = JSON.parse(localStorage.getItem(this.foldersKey) || '[]');
+            if (!Array.isArray(stored)) return [];
+            const folders = stored
+                .map(folder => ({
+                    id: String(folder?.id || '').trim(),
+                    label: String(folder?.label || '').replace(/\s+/g, ' ').trim(),
+                    count: 0
+                }))
+                .filter(folder => folder.id && folder.id !== 'all' && folder.label);
+            return this.dedupeWorkspaces(folders);
+        } catch (error) {
+            return [];
+        }
+    }
+
+    private dedupeWorkspaces(workspaces: WorkspaceItem[]) {
+        const map = new Map<string, WorkspaceItem>();
+        for (const workspace of workspaces) {
+            if (!workspace.id || workspace.id === 'all' || !workspace.label) continue;
+            map.set(workspace.id, workspace);
+        }
+        return Array.from(map.values());
     }
 
     private workspaceIdForActiveNote() {

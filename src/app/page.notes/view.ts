@@ -6,6 +6,8 @@ import { NuMonacoEditorEvent } from '@ng-util/monaco-editor';
 type ViewMode = 'write' | 'split' | 'preview';
 type SyncConflictResolution = 'server' | 'local';
 type SyncConflictResolveTone = 'info' | 'success' | 'warning' | 'error';
+type AttachmentPickerMode = 'file' | 'image';
+type AttachmentMessageTone = 'info' | 'success' | 'warning' | 'error';
 
 interface PreviewBlock {
     type: 'markdown' | 'code' | 'blank';
@@ -38,6 +40,34 @@ interface NoteItem {
     workspaceName?: string;
     fileName?: string;
     relativePath?: string;
+    attachments?: NoteAttachment[];
+}
+
+interface NoteAttachment {
+    id?: string;
+    fileName: string;
+    relativePath: string;
+    noteRelativePath?: string;
+    mimeType?: string;
+    size?: number;
+    contentHash?: string | null;
+    updatedAtMs?: number | null;
+    deleted?: boolean;
+}
+
+interface AttachmentPickerItem {
+    type: 'attachment' | 'upload';
+    label: string;
+    detail: string;
+    attachment?: NoteAttachment;
+}
+
+interface EditorCursorPosition {
+    lineNumber: number;
+    column: number;
+    visualLeft?: number;
+    visualTop?: number;
+    visualHeight?: number;
 }
 
 interface SyncConflict {
@@ -51,12 +81,16 @@ interface SyncConflict {
     clientNote?: any;
     clientWorkspace?: any;
     serverWorkspace?: any;
+    clientAttachment?: any;
+    serverAttachment?: any;
+    serverAttachmentMetadata?: any;
 }
 
 interface SyncConflictDetail {
     relativePath?: string;
     serverContent?: string;
     localContent?: string;
+    serverFile?: any;
     serverError?: string;
     localError?: string;
     localExists?: boolean;
@@ -96,8 +130,16 @@ interface ParsedStyleBlock {
 export class Component implements OnInit, OnDestroy {
     private storageKey = 'notedown.notes.v1';
     private activeNoteKey = 'notedown.activeNoteId.v1';
+    private activeWorkspaceKey = 'notedown.activeWorkspace.v1';
+    private foldersKey = 'notedown.folders.v1';
     private startupSyncResultKey = 'notedown.sync.startup.result.v1';
-    private converter = new Converter({ tables: true, tasklists: true, strikethrough: true, simpleLineBreaks: true });
+    private converter = new Converter({
+        tables: true,
+        tasklists: true,
+        strikethrough: true,
+        simpleLineBreaks: true,
+        disableForced4SpacesIndentedSublists: true
+    });
     private editor: any;
     private diffEditor: any;
     private diffOriginalModel: any;
@@ -107,6 +149,10 @@ export class Component implements OnInit, OnDestroy {
     private foldingDisposable: any;
     private editorMouseMoveDisposable: any;
     private editorMouseLeaveDisposable: any;
+    private attachmentCommandId = '';
+    private attachmentInputMode: AttachmentPickerMode = 'file';
+    private attachmentUploadFromPicker = false;
+    private attachmentPickerAnchor: EditorCursorPosition | null = null;
     private styleFoldTimeout: number | null = null;
     private autoSaveTimeout: number | null = null;
     private syncUploadTimeout: number | null = null;
@@ -140,6 +186,19 @@ export class Component implements OnInit, OnDestroy {
     public syncConflictResolveTone: SyncConflictResolveTone = 'info';
     public hiddenMonacoOptions = this.createHiddenMonacoOptions();
     public monacoEditorsReady = false;
+    public attachmentPanelOpen = false;
+    public attachmentPickerOpen = false;
+    public attachmentPickerMode: AttachmentPickerMode = 'file';
+    public attachmentPickerItems: AttachmentPickerItem[] = [];
+    public attachmentPickerIndex = 0;
+    public attachmentPickerStyle: Record<string, string> = {
+        left: '16px',
+        top: '16px'
+    };
+    public attachmentInputAccept = '';
+    public attachmentUploadBusy = false;
+    public attachmentMessage = '';
+    public attachmentMessageTone: AttachmentMessageTone = 'info';
 
     public get hasSelectedNote() {
         return Boolean(this.activeNote?.id);
@@ -151,7 +210,7 @@ export class Component implements OnInit, OnDestroy {
 
     private handleSelectNote = (event: Event) => {
         const id = (event as CustomEvent<string>).detail;
-        if (id) {
+        if (typeof id === 'string') {
             this.selectNoteById(id);
             this.requestViewUpdate();
         }
@@ -175,6 +234,7 @@ export class Component implements OnInit, OnDestroy {
             this.requestViewUpdate();
             return;
         }
+        this.refreshPreview();
         this.requestViewUpdate();
         this.focusEditorSoon();
     };
@@ -194,6 +254,34 @@ export class Component implements OnInit, OnDestroy {
         if (this.showSyncConflictViewer()) return;
         this.saveNow(true);
     };
+    private handleAttachmentPickerKeydown = (event: KeyboardEvent) => {
+        if (!this.attachmentPickerOpen) return;
+        const key = event.key;
+        if (key === 'ArrowDown') {
+            event.preventDefault();
+            this.moveAttachmentPickerSelection(1);
+            return;
+        }
+        if (key === 'ArrowUp') {
+            event.preventDefault();
+            this.moveAttachmentPickerSelection(-1);
+            return;
+        }
+        if (key === 'Enter') {
+            event.preventDefault();
+            this.chooseAttachmentPickerItem();
+            return;
+        }
+        if (key === 'Escape') {
+            event.preventDefault();
+            this.closeAttachmentPicker();
+        }
+    };
+    private handleAttachmentPickerReposition = () => {
+        if (!this.attachmentPickerOpen) return;
+        this.updateAttachmentPickerPosition();
+        this.requestViewUpdate();
+    };
 
     constructor(
         private sanitizer: DomSanitizer,
@@ -210,6 +298,8 @@ export class Component implements OnInit, OnDestroy {
         window.addEventListener('notedown:startup-sync-status', this.handleStartupSyncStatus);
         window.addEventListener('notedown:open-sync-conflict', this.handleOpenSyncConflict);
         window.addEventListener('keydown', this.handleSaveShortcut, true);
+        window.addEventListener('keydown', this.handleAttachmentPickerKeydown, true);
+        window.addEventListener('resize', this.handleAttachmentPickerReposition);
         this.startDeferredStartupWork();
     }
 
@@ -221,6 +311,8 @@ export class Component implements OnInit, OnDestroy {
         window.removeEventListener('notedown:startup-sync-status', this.handleStartupSyncStatus);
         window.removeEventListener('notedown:open-sync-conflict', this.handleOpenSyncConflict);
         window.removeEventListener('keydown', this.handleSaveShortcut, true);
+        window.removeEventListener('keydown', this.handleAttachmentPickerKeydown, true);
+        window.removeEventListener('resize', this.handleAttachmentPickerReposition);
         if (this.completionDisposable) this.completionDisposable.dispose();
         if (this.foldingDisposable) this.foldingDisposable.dispose();
         this.clearScheduledStyleFold();
@@ -232,17 +324,20 @@ export class Component implements OnInit, OnDestroy {
 
     public createNote() {
         const now = Date.now();
+        const folder = this.newNoteFolder();
         const note: NoteItem = {
             id: `note-${Date.now()}`,
             icon: 'N',
             title: '새 노트',
             tags: ['draft'],
             status: 'draft',
-            folder: 'memo',
+            folder,
+            workspaceName: this.workspaceLabel(folder),
             createdAt: this.nowLabel(new Date(now)),
             createdAtMs: now,
             updatedAt: this.nowLabel(new Date(now)),
             updatedAtMs: now,
+            attachments: [],
             body: '# 새 노트\n\n'
         };
         this.notes = [note, ...this.notes];
@@ -395,6 +490,12 @@ export class Component implements OnInit, OnDestroy {
 
         const link = target.closest('a[href]') as HTMLAnchorElement | null;
         if (link) {
+            const attachment = this.attachmentForMarkdownPath(link.getAttribute('href') || '');
+            if (attachment) {
+                event.preventDefault();
+                void this.openAttachment(attachment);
+                return;
+            }
             event.preventDefault();
             window.open(link.href, '_blank', 'noopener,noreferrer');
         }
@@ -433,6 +534,479 @@ export class Component implements OnInit, OnDestroy {
         const base = 'flex size-9 items-center justify-center rounded-md transition-colors';
         if (this.showLineNumbers) return `${base} bg-stone-100 text-stone-950 dark:bg-zinc-800 dark:text-zinc-50`;
         return `${base} text-stone-500 hover:bg-stone-100 hover:text-stone-950 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:text-zinc-50`;
+    }
+
+    public attachmentButtonClass() {
+        const base = 'ml-2 inline-flex h-9 shrink-0 items-center gap-1.5 rounded-md px-2.5 text-[12px] font-semibold transition-colors';
+        if (this.attachmentPanelOpen) return `${base} bg-stone-900 text-white dark:bg-zinc-100 dark:text-zinc-950`;
+        return `${base} text-stone-500 hover:bg-stone-100 hover:text-stone-950 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:text-zinc-50`;
+    }
+
+    public attachmentCount(note = this.activeNote) {
+        return this.noteAttachments(note).length;
+    }
+
+    public visibleAttachments(mode?: AttachmentPickerMode) {
+        const attachments = this.noteAttachments();
+        if (mode === 'image') return attachments.filter(attachment => this.isImageAttachment(attachment));
+        return attachments;
+    }
+
+    public isImageAttachment(attachment?: NoteAttachment | null) {
+        const mimeType = String(attachment?.mimeType || '').toLowerCase();
+        if (mimeType.startsWith('image/')) return true;
+        return /\.(png|jpe?g|gif|webp|bmp|svg|avif)$/i.test(attachment?.fileName || attachment?.relativePath || '');
+    }
+
+    public attachmentKindLabel(attachment?: NoteAttachment | null) {
+        return this.isImageAttachment(attachment) ? '이미지' : '파일';
+    }
+
+    public attachmentSizeLabel(size?: number | null) {
+        const value = Number(size) || 0;
+        if (value <= 0) return '';
+        if (value < 1024) return `${value} B`;
+        if (value < 1024 * 1024) return `${Math.round(value / 1024)} KB`;
+        return `${(value / 1024 / 1024).toFixed(value < 10 * 1024 * 1024 ? 1 : 0)} MB`;
+    }
+
+    public attachmentMessageClass() {
+        const base = 'min-h-5 text-[12px]';
+        if (this.attachmentMessageTone === 'success') return `${base} text-emerald-700 dark:text-emerald-300`;
+        if (this.attachmentMessageTone === 'warning') return `${base} text-amber-700 dark:text-amber-300`;
+        if (this.attachmentMessageTone === 'error') return `${base} text-red-600 dark:text-red-300`;
+        return `${base} text-stone-500 dark:text-zinc-400`;
+    }
+
+    public attachmentPickerItemClass(index: number) {
+        const base = 'flex w-full min-w-0 items-center gap-3 rounded-md px-2.5 py-2 text-left transition-colors';
+        if (this.attachmentPickerIndex === index) return `${base} bg-stone-900 text-white dark:bg-zinc-100 dark:text-zinc-950`;
+        return `${base} text-stone-700 hover:bg-stone-100 dark:text-zinc-200 dark:hover:bg-zinc-800`;
+    }
+
+    public toggleAttachmentPanel() {
+        if (!this.hasSelectedNote) return;
+        this.attachmentPanelOpen = !this.attachmentPanelOpen;
+        if (this.attachmentPanelOpen) this.closeAttachmentPicker();
+    }
+
+    public closeAttachmentPanel() {
+        this.attachmentPanelOpen = false;
+    }
+
+    public openAttachmentPicker(mode: AttachmentPickerMode = 'file', anchor?: EditorCursorPosition) {
+        if (!this.hasSelectedNote) return;
+        this.attachmentPickerMode = mode;
+        this.attachmentPanelOpen = false;
+        this.attachmentPickerAnchor = this.normalizeEditorCursorPosition(anchor) || this.normalizeEditorCursorPosition(this.editor?.getPosition?.()) || null;
+        this.updateAttachmentPickerPosition();
+        this.rebuildAttachmentPickerItems();
+        this.attachmentPickerOpen = true;
+        this.attachmentPickerIndex = 0;
+        this.requestViewUpdate();
+        this.afterInitialRender(() => {
+            this.updateAttachmentPickerPosition();
+            this.requestViewUpdate();
+        });
+        this.scrollAttachmentPickerSelectionIntoView();
+    }
+
+    public closeAttachmentPicker() {
+        this.attachmentPickerOpen = false;
+        this.attachmentPickerItems = [];
+        this.attachmentPickerIndex = 0;
+        this.attachmentPickerAnchor = null;
+    }
+
+    private normalizeEditorCursorPosition(position: any): EditorCursorPosition | null {
+        const lineNumber = Number(position?.lineNumber);
+        const column = Number(position?.column);
+        if (!Number.isFinite(lineNumber) || !Number.isFinite(column)) return null;
+        const model = this.editor?.getModel?.();
+        const lineCount = Number(model?.getLineCount?.());
+        let safeLineNumber = Math.max(1, Math.round(lineNumber));
+        if (Number.isFinite(lineCount) && lineCount > 0) {
+            safeLineNumber = Math.min(safeLineNumber, lineCount);
+        }
+        const maxColumn = Number(model?.getLineMaxColumn?.(safeLineNumber));
+        let safeColumn = Math.max(1, Math.round(column));
+        if (Number.isFinite(maxColumn) && maxColumn > 0) {
+            safeColumn = Math.min(safeColumn, maxColumn);
+        }
+        return {
+            lineNumber: safeLineNumber,
+            column: safeColumn,
+            visualLeft: Number.isFinite(Number(position?.visualLeft)) ? Number(position.visualLeft) : undefined,
+            visualTop: Number.isFinite(Number(position?.visualTop)) ? Number(position.visualTop) : undefined,
+            visualHeight: Number.isFinite(Number(position?.visualHeight)) ? Number(position.visualHeight) : undefined
+        };
+    }
+
+    private updateAttachmentPickerPosition() {
+        const shell = document.querySelector<HTMLElement>('[data-note-editor-shell="true"]');
+        const editorDom = this.editor?.getDomNode?.() as HTMLElement | null;
+        const anchor = this.attachmentPickerAnchor || this.normalizeEditorCursorPosition(this.editor?.getPosition?.());
+        const cursor = anchor ? this.attachmentPickerAnchorPixels(anchor) : null;
+        const shellRect = shell?.getBoundingClientRect();
+        const editorRect = editorDom?.getBoundingClientRect();
+
+        if (!shellRect || !editorRect || !cursor) {
+            this.attachmentPickerStyle = { left: '16px', top: '16px' };
+            return;
+        }
+
+        const picker = document.querySelector<HTMLElement>('[data-attachment-picker="true"]');
+        const pickerWidth = Math.min(picker?.offsetWidth || 380, Math.max(240, shellRect.width - 16));
+        const pickerHeight = Math.min(picker?.offsetHeight || 320, Math.max(160, shellRect.height - 16));
+        const gap = 8;
+        const cursorLeft = editorRect.left + Math.max(0, Number(cursor.left) || 0);
+        const cursorTop = editorRect.top + Math.max(0, Number(cursor.top) || 0);
+        const cursorHeight = Math.max(18, Number(cursor.height) || 24);
+
+        let left = cursorLeft - shellRect.left;
+        let top = cursorTop + cursorHeight + gap - shellRect.top;
+
+        if (top + pickerHeight > shellRect.height - gap) {
+            top = cursorTop - shellRect.top - pickerHeight - gap;
+        }
+
+        left = this.clamp(left, gap, Math.max(gap, shellRect.width - pickerWidth - gap));
+        top = this.clamp(top, gap, Math.max(gap, shellRect.height - pickerHeight - gap));
+
+        this.attachmentPickerStyle = {
+            left: `${Math.round(left)}px`,
+            top: `${Math.round(top)}px`
+        };
+    }
+
+    private clamp(value: number, min: number, max: number) {
+        return Math.min(Math.max(value, min), max);
+    }
+
+    private attachmentPickerAnchorPixels(anchor: EditorCursorPosition) {
+        if (Number.isFinite(anchor.visualLeft) && Number.isFinite(anchor.visualTop)) {
+            return {
+                left: anchor.visualLeft,
+                top: anchor.visualTop,
+                height: Number.isFinite(anchor.visualHeight) ? anchor.visualHeight : 24
+            };
+        }
+        return this.editor?.getScrolledVisiblePosition?.(anchor);
+    }
+
+    public chooseAttachmentPickerItem(item = this.attachmentPickerItems[this.attachmentPickerIndex]) {
+        if (!item) return;
+        if (item.type === 'upload') {
+            this.triggerAttachmentUpload(this.attachmentPickerMode);
+            return;
+        }
+        if (item.attachment) this.insertAttachmentMarkdown(item.attachment, this.attachmentPickerMode);
+    }
+
+    public async triggerAttachmentUpload(mode: AttachmentPickerMode = 'file') {
+        if (!this.hasSelectedNote || this.attachmentUploadBusy) return;
+        this.attachmentInputMode = mode;
+        this.attachmentInputAccept = mode === 'image' ? 'image/*' : '';
+        this.attachmentUploadFromPicker = this.attachmentPickerOpen;
+        this.requestViewUpdate();
+
+        const api = (window as any).notedown?.storage;
+        const storagePath = this.storagePath();
+        if (api?.chooseAttachments && storagePath) {
+            await this.chooseAttachmentsWithElectron(mode, this.attachmentUploadFromPicker);
+            return;
+        }
+
+        window.setTimeout(() => {
+            const input = document.querySelector<HTMLInputElement>('[data-note-attachment-input="true"]');
+            input?.click();
+        }, 0);
+    }
+
+    public async handleAttachmentInputChange(event: Event) {
+        const input = event.target as HTMLInputElement | null;
+        const files = Array.from(input?.files || []);
+        if (input) input.value = '';
+        if (files.length === 0) return;
+        const insertAfterSave = this.attachmentUploadFromPicker;
+        this.attachmentUploadFromPicker = false;
+        await this.attachFiles(files, this.attachmentInputMode, insertAfterSave);
+    }
+
+    public async openAttachment(attachment: NoteAttachment, event?: Event) {
+        if (event) event.stopPropagation();
+        const api = (window as any).notedown?.storage;
+        const storagePath = this.storagePath();
+        if (!api?.openAttachment || !storagePath || !attachment?.relativePath) return;
+        try {
+            await api.openAttachment({ storagePath, relativePath: attachment.relativePath });
+        } catch (error) {
+            this.setAttachmentMessage(this.errorMessage(error, '첨부 파일을 열지 못했습니다.'), 'error');
+        }
+    }
+
+    private async chooseAttachmentsWithElectron(mode: AttachmentPickerMode, insertAfterSave: boolean) {
+        const api = (window as any).notedown?.storage;
+        const storagePath = this.storagePath();
+        if (!api?.chooseAttachments || !storagePath) return;
+
+        this.attachmentUploadBusy = true;
+        this.setAttachmentMessage('첨부 파일을 선택하는 중입니다...', 'info');
+        this.requestViewUpdate();
+
+        try {
+            const fileSave = this.persistFileNotes();
+            if (fileSave) await fileSave;
+
+            const result = await api.chooseAttachments({
+                storagePath,
+                note: this.activeNote,
+                mode
+            });
+            if (result?.canceled) return;
+            if (!result?.ok) {
+                throw new Error(result?.error || (mode === 'image' ? '선택한 이미지가 없습니다.' : '첨부 파일을 저장하지 못했습니다.'));
+            }
+
+            const attachments = Array.isArray(result.attachments)
+                ? result.attachments.filter((attachment: NoteAttachment) => attachment?.relativePath)
+                : (result.attachment ? [result.attachment] : []);
+            this.finishSavedAttachments(attachments, mode, insertAfterSave);
+        } catch (error) {
+            this.setAttachmentMessage(this.errorMessage(error, '첨부 파일을 저장하지 못했습니다.'), 'error');
+        } finally {
+            this.attachmentUploadBusy = false;
+            this.attachmentUploadFromPicker = false;
+            this.requestViewUpdate();
+        }
+    }
+
+    private async attachFiles(files: File[], mode: AttachmentPickerMode, insertAfterSave = false) {
+        const api = (window as any).notedown?.storage;
+        const storagePath = this.storagePath();
+        if (!api?.saveAttachment || !storagePath) {
+            this.setAttachmentMessage('첨부 파일 저장은 Electron 저장소에서 사용할 수 있습니다.', 'warning');
+            return;
+        }
+
+        this.attachmentUploadBusy = true;
+        this.setAttachmentMessage('첨부 파일을 저장하는 중입니다...', 'info');
+        this.requestViewUpdate();
+
+        try {
+            const fileSave = this.persistFileNotes();
+            if (fileSave) await fileSave;
+
+            const savedAttachments: NoteAttachment[] = [];
+            for (const file of files) {
+                if (mode === 'image' && !this.fileLooksLikeImage(file)) continue;
+                const content = await this.readFileAsBase64(file);
+                const result = await api.saveAttachment({
+                    storagePath,
+                    note: this.activeNote,
+                    fileName: file.name,
+                    mimeType: file.type || this.mimeTypeFromName(file.name),
+                    content,
+                    contentEncoding: 'base64'
+                });
+                if (result?.ok && result.attachment) {
+                    savedAttachments.push(result.attachment);
+                } else if (result?.error) {
+                    throw new Error(result.error);
+                }
+            }
+
+            this.finishSavedAttachments(savedAttachments, mode, insertAfterSave);
+        } catch (error) {
+            this.setAttachmentMessage(this.errorMessage(error, '첨부 파일을 저장하지 못했습니다.'), 'error');
+        } finally {
+            this.attachmentUploadBusy = false;
+            this.attachmentUploadFromPicker = false;
+            this.requestViewUpdate();
+        }
+    }
+
+    private readFileAsBase64(file: File): Promise<string> {
+        return new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = () => {
+                const value = String(reader.result || '');
+                resolve(value.includes(',') ? value.split(',').pop() || '' : value);
+            };
+            reader.onerror = () => reject(reader.error || new Error('파일을 읽지 못했습니다.'));
+            reader.readAsDataURL(file);
+        });
+    }
+
+    private fileLooksLikeImage(file: File) {
+        return String(file.type || '').toLowerCase().startsWith('image/') || this.isImageAttachment({ fileName: file.name, relativePath: file.name });
+    }
+
+    private finishSavedAttachments(attachments: NoteAttachment[], mode: AttachmentPickerMode, insertAfterSave: boolean) {
+        const savedAttachments = attachments
+            .map(attachment => this.normalizeAttachment(attachment, this.activeNote?.relativePath || ''))
+            .filter(attachment => attachment.relativePath && !attachment.deleted);
+
+        if (savedAttachments.length === 0) {
+            this.setAttachmentMessage(mode === 'image' ? '선택한 이미지가 없습니다.' : '저장한 첨부 파일이 없습니다.', 'warning');
+            return;
+        }
+
+        for (const attachment of savedAttachments) {
+            this.upsertActiveNoteAttachment(attachment);
+        }
+
+        this.touchNote(true);
+        this.rebuildAttachmentPickerItems();
+        this.setAttachmentMessage(`첨부 파일 ${savedAttachments.length}개를 저장했습니다.`, 'success');
+
+        if (insertAfterSave) {
+            this.insertAttachmentsMarkdown(savedAttachments, mode);
+            return;
+        }
+
+        this.closeAttachmentPicker();
+        this.attachmentPanelOpen = true;
+    }
+
+    private mimeTypeFromName(fileName: string) {
+        const lower = fileName.toLowerCase();
+        if (lower.endsWith('.png')) return 'image/png';
+        if (lower.endsWith('.jpg') || lower.endsWith('.jpeg')) return 'image/jpeg';
+        if (lower.endsWith('.gif')) return 'image/gif';
+        if (lower.endsWith('.webp')) return 'image/webp';
+        if (lower.endsWith('.svg')) return 'image/svg+xml';
+        if (lower.endsWith('.pdf')) return 'application/pdf';
+        if (lower.endsWith('.txt') || lower.endsWith('.md')) return 'text/plain';
+        return 'application/octet-stream';
+    }
+
+    private upsertActiveNoteAttachment(attachment: NoteAttachment) {
+        if (!attachment?.relativePath) return;
+        const attachments = this.noteAttachments();
+        const index = attachments.findIndex(item => item.relativePath === attachment.relativePath || (attachment.id && item.id === attachment.id));
+        const nextAttachment = this.normalizeAttachment(attachment, this.activeNote?.relativePath || '');
+        if (index >= 0) {
+            attachments[index] = { ...attachments[index], ...nextAttachment };
+        } else {
+            attachments.push(nextAttachment);
+        }
+        this.activeNote.attachments = attachments;
+    }
+
+    private noteAttachments(note = this.activeNote): NoteAttachment[] {
+        if (!Array.isArray(note?.attachments)) return [];
+        return note.attachments
+            .map(attachment => this.normalizeAttachment(attachment, note?.relativePath || ''))
+            .filter(attachment => attachment.relativePath && !attachment.deleted);
+    }
+
+    private normalizeAttachment(attachment: any, noteRelativePath = ''): NoteAttachment {
+        return {
+            id: attachment?.id || attachment?.attachmentId || '',
+            fileName: String(attachment?.fileName || this.basename(attachment?.relativePath || '첨부 파일')),
+            relativePath: String(attachment?.relativePath || ''),
+            noteRelativePath: attachment?.noteRelativePath || noteRelativePath || this.activeNote?.relativePath || '',
+            mimeType: attachment?.mimeType || '',
+            size: Number.isFinite(attachment?.size) ? Number(attachment.size) : undefined,
+            contentHash: attachment?.contentHash || null,
+            updatedAtMs: Number.isFinite(attachment?.updatedAtMs) ? Number(attachment.updatedAtMs) : null,
+            deleted: Boolean(attachment?.deleted)
+        };
+    }
+
+    private rebuildAttachmentPickerItems() {
+        const attachments = this.visibleAttachments(this.attachmentPickerMode);
+        const items: AttachmentPickerItem[] = attachments.map(attachment => ({
+            type: 'attachment',
+            label: attachment.fileName,
+            detail: [this.attachmentKindLabel(attachment), this.attachmentSizeLabel(attachment.size)].filter(Boolean).join(' · '),
+            attachment
+        }));
+        items.push({
+            type: 'upload',
+            label: this.attachmentPickerMode === 'image' ? '이미지 첨부...' : '파일 첨부...',
+            detail: this.attachmentPickerMode === 'image' ? '새 이미지를 현재 노트에 추가' : '새 파일을 현재 노트에 추가'
+        });
+        this.attachmentPickerItems = items;
+        if (this.attachmentPickerIndex >= items.length) this.attachmentPickerIndex = Math.max(0, items.length - 1);
+    }
+
+    private moveAttachmentPickerSelection(delta: number) {
+        if (this.attachmentPickerItems.length === 0) return;
+        const length = this.attachmentPickerItems.length;
+        this.attachmentPickerIndex = (this.attachmentPickerIndex + delta + length) % length;
+        this.requestViewUpdate();
+        this.scrollAttachmentPickerSelectionIntoView();
+    }
+
+    private scrollAttachmentPickerSelectionIntoView() {
+        window.setTimeout(() => {
+            const element = document.querySelector<HTMLElement>(`[data-attachment-picker-index="${this.attachmentPickerIndex}"]`);
+            element?.scrollIntoView({ block: 'nearest' });
+        }, 0);
+    }
+
+    private insertAttachmentMarkdown(attachment: NoteAttachment, mode: AttachmentPickerMode) {
+        if (!attachment?.relativePath) return;
+        this.insertAttachmentsMarkdown([attachment], mode);
+    }
+
+    private insertAttachmentsMarkdown(attachments: NoteAttachment[], mode: AttachmentPickerMode) {
+        const snippets = attachments
+            .filter(attachment => attachment?.relativePath)
+            .map(attachment => this.attachmentMarkdownText(attachment, mode));
+        if (snippets.length === 0) return;
+        const text = snippets.join('\n');
+        this.insertEditorText(text);
+        this.closeAttachmentPicker();
+        this.focusEditorSoon();
+        this.requestViewUpdate();
+    }
+
+    private attachmentMarkdownText(attachment: NoteAttachment, mode: AttachmentPickerMode) {
+        const label = this.escapeMarkdownLabel(attachment.fileName || this.basename(attachment.relativePath));
+        const url = this.markdownAttachmentUrl(attachment.relativePath);
+        return mode === 'image' ? `![${label}](${url})` : `[${label}](${url})`;
+    }
+
+    private insertEditorText(text: string) {
+        const editor = this.editor;
+        if (!editor?.getModel) return;
+        const selection = editor.getSelection?.();
+        const monaco = (window as any).monaco;
+        const model = editor.getModel();
+        if (!selection || !monaco?.Range || !model) return;
+
+        editor.executeEdits('notedown-attachment', [{
+            range: selection,
+            text,
+            forceMoveMarkers: true
+        }]);
+        const position = editor.getPosition?.();
+        if (position) editor.setPosition(position);
+        this.handleBodyChange(model.getValue());
+    }
+
+    private markdownAttachmentUrl(relativePath: string) {
+        const encoded = String(relativePath || '')
+            .split('/')
+            .map(part => encodeURIComponent(part))
+            .join('/');
+        return encoded || relativePath;
+    }
+
+    private escapeMarkdownLabel(value: string) {
+        return String(value || '첨부 파일').replace(/([\\[\\]])/g, '\\$1');
+    }
+
+    private basename(value: string) {
+        return String(value || '').split('/').filter(Boolean).pop() || '첨부 파일';
+    }
+
+    private setAttachmentMessage(message: string, tone: AttachmentMessageTone) {
+        this.attachmentMessage = message;
+        this.attachmentMessageTone = tone;
     }
 
     public showSyncConflictViewer() {
@@ -517,9 +1091,14 @@ export class Component implements OnInit, OnDestroy {
         try {
             const result = await api.resolveConflict(this.syncPayload({
                 relativePath,
+                type: conflict.type || '',
                 resolution: this.syncConflictResolveChoice,
                 serverRevision: this.syncConflictServerRevision(conflict),
                 serverFile: conflict.serverFile || this.syncConflictDetail?.serverFile || null,
+                serverAttachment: conflict.serverAttachment || null,
+                serverAttachmentMetadata: conflict.serverAttachmentMetadata || null,
+                clientAttachment: conflict.clientAttachment || null,
+                noteRelativePath: conflict.serverAttachmentMetadata?.noteRelativePath || conflict.clientAttachment?.noteRelativePath || '',
                 serverNote: conflict.serverNote || null,
                 serverWorkspace: conflict.serverWorkspace || null
             }));
@@ -649,11 +1228,13 @@ export class Component implements OnInit, OnDestroy {
 
     private selectNoteById(id?: string | null) {
         if (this.hasUnsavedChanges) this.saveNow(true);
-        const note = this.notes.find(item => item.id === id) || this.notes[0];
+        const note = id === '' ? null : (id ? this.notes.find(item => item.id === id) || this.notes[0] : this.notes[0]);
         if (!note) {
             this.activeNote = this.emptyNote();
             this.editingTitle = false;
             this.titleDraft = '';
+            this.attachmentPanelOpen = false;
+            this.closeAttachmentPicker();
             this.savedAt = '';
             this.hasUnsavedChanges = false;
             localStorage.removeItem(this.activeNoteKey);
@@ -667,6 +1248,8 @@ export class Component implements OnInit, OnDestroy {
         this.activeNote = note;
         this.editingTitle = false;
         this.titleDraft = note.title || '';
+        this.attachmentPanelOpen = false;
+        this.closeAttachmentPicker();
         this.autoFoldedStyleNoteId = '';
         localStorage.setItem(this.activeNoteKey, note.id);
         this.refreshPreview();
@@ -954,7 +1537,7 @@ export class Component implements OnInit, OnDestroy {
 
     private compactSyncConflict(conflict: any) {
         return {
-            relativePath: conflict.relativePath || conflict.serverFile?.relativePath || '',
+            relativePath: conflict.relativePath || conflict.serverFile?.relativePath || conflict.serverAttachment?.relativePath || '',
             reason: conflict.reason || conflict.status || '',
             type: conflict.type || '',
             clientRevision: conflict.clientRevision,
@@ -963,7 +1546,10 @@ export class Component implements OnInit, OnDestroy {
             serverNote: conflict.serverNote || null,
             clientNote: conflict.clientNote || null,
             clientWorkspace: conflict.clientWorkspace || null,
-            serverWorkspace: conflict.serverWorkspace || null
+            serverWorkspace: conflict.serverWorkspace || null,
+            clientAttachment: conflict.clientAttachment || null,
+            serverAttachment: this.compactServerFile(conflict.serverAttachment),
+            serverAttachmentMetadata: conflict.serverAttachmentMetadata || null
         };
     }
 
@@ -1022,6 +1608,7 @@ export class Component implements OnInit, OnDestroy {
     private syncConflictServerRevision(conflict = this.selectedSyncConflict()) {
         return Number(conflict?.serverRevision)
             || Number(conflict?.serverFile?.revision)
+            || Number(conflict?.serverAttachment?.revision)
             || Number(this.syncConflictDetail?.serverFile?.revision)
             || 0;
     }
@@ -1062,7 +1649,7 @@ export class Component implements OnInit, OnDestroy {
         this.renderSyncConflictDiffSoon();
         this.requestViewUpdate();
         try {
-            const result = await api.readFile(this.syncPayload({ relativePath }));
+            const result = await api.readFile(this.syncPayload({ relativePath, type: conflict.type || '' }));
             if (this.selectedSyncConflict()?.relativePath !== relativePath) return;
             if (result?.ok) {
                 this.syncConflictDetail = result;
@@ -1318,6 +1905,9 @@ export class Component implements OnInit, OnDestroy {
                 this.saveNow(true);
             }
         });
+        this.attachmentCommandId = this.editor.addCommand(0, (_accessor: any, mode: AttachmentPickerMode, anchor?: EditorCursorPosition) => {
+            this.openAttachmentPicker(mode === 'image' ? 'image' : 'file', anchor);
+        });
 
         if (this.completionDisposable) return;
 
@@ -1336,8 +1926,11 @@ export class Component implements OnInit, OnDestroy {
                     startColumn: 1,
                     endColumn: position.column
                 };
+                const visiblePosition = this.editor?.getScrolledVisiblePosition?.(position);
 
                 const blocks = [
+                    { ko: '파일', en: 'File', aliases: 'f file attachment attach document', insertText: '', detail: 'Insert attached file link', mode: 'file' as AttachmentPickerMode },
+                    { ko: '이미지', en: 'Image', aliases: 'i img image picture photo attachment', insertText: '', detail: 'Insert attached image', mode: 'image' as AttachmentPickerMode },
                     { ko: '제목 1', en: 'Heading 1', aliases: 'h1 title large', insertText: '# ${1:제목}', detail: 'Top-level heading' },
                     { ko: '제목 2', en: 'Heading 2', aliases: 'h2 subtitle medium', insertText: '## ${1:제목}', detail: 'Section heading' },
                     { ko: '제목 3', en: 'Heading 3', aliases: 'h3 small heading', insertText: '### ${1:제목}', detail: 'Small heading' },
@@ -1362,7 +1955,20 @@ export class Component implements OnInit, OnDestroy {
                             : `/${block.ko} ${block.en.toLowerCase()} ${block.aliases}`,
                         sortText: String(index).padStart(2, '0'),
                         insertText: block.insertText,
-                        insertTextRules: monaco.languages.CompletionItemInsertTextRule.InsertAsSnippet,
+                        insertTextRules: block.mode ? undefined : monaco.languages.CompletionItemInsertTextRule.InsertAsSnippet,
+                        command: block.mode && this.attachmentCommandId
+                            ? {
+                                id: this.attachmentCommandId,
+                                title: block.detail,
+                                arguments: [block.mode, {
+                                    lineNumber: position.lineNumber,
+                                    column: position.column,
+                                    visualLeft: visiblePosition?.left,
+                                    visualTop: visiblePosition?.top,
+                                    visualHeight: visiblePosition?.height
+                                }]
+                            }
+                            : undefined,
                         range
                     }))
                 };
@@ -1676,7 +2282,7 @@ ${documentCss}
 
         const flushMarkdown = () => {
             if (markdownLines.length === 0) return;
-            chunks.push(this.addLinkTargets(this.converter.makeHtml(markdownLines.join('\n'))));
+            chunks.push(this.renderMarkdownHtml(markdownLines.join('\n'), true));
             markdownLines.length = 0;
         };
 
@@ -1797,7 +2403,7 @@ ${documentCss}
                     }
                     index--;
 
-                    const html = this.addLinkTargets(this.converter.makeHtml(tableLines.map(line => line.text).join('\n')));
+                    const html = this.renderPreviewMarkdownLines(tableLines);
                     const lineEnd = tableLines[tableLines.length - 1].lineIndex;
                     blocks.push(this.withSectionStyle({
                         type: 'markdown',
@@ -1810,8 +2416,28 @@ ${documentCss}
                     continue;
                 }
 
-                const prepared = this.preparePreviewMarkdownLine(sourceLine.text, sourceLine.lineIndex);
-                const html = this.addLinkTargets(this.converter.makeHtml(prepared));
+                if (this.isMarkdownListLine(sourceLine.text)) {
+                    const listStartLine = index;
+                    const listLines: StyledMarkdownLine[] = [];
+                    while (index < lines.length && this.isMarkdownListBlockLine(lines, index, sourceLine.section)) {
+                        listLines.push(lines[index]);
+                        index++;
+                    }
+                    index--;
+
+                    const html = this.renderPreviewMarkdownLines(listLines, true);
+                    blocks.push(this.withSectionStyle({
+                        type: 'markdown',
+                        lineIndex: lines[listStartLine].lineIndex,
+                        lineEnd: listLines[listLines.length - 1].lineIndex,
+                        lineNumbers: listLines.map(line => line.lineIndex),
+                        variant: 'list',
+                        html: this.sanitizer.bypassSecurityTrustHtml(html)
+                    }, sourceLine.section));
+                    continue;
+                }
+
+                const html = this.renderPreviewMarkdownLines([sourceLine]);
                 const isQuote = this.isQuoteLine(sourceLine.text);
                 const variant = isQuote ? 'quote' : this.markdownCellVariant(sourceLine.text);
                 blocks.push(this.withSectionStyle({
@@ -1859,10 +2485,135 @@ ${documentCss}
         return /^\s{0,3}>\s?/.test(line);
     }
 
+    private renderPreviewMarkdownLines(lines: StyledMarkdownLine[], normalizeListIndent = false) {
+        const html = this.renderMarkdownHtml(lines.map(line => line.text).join('\n'), normalizeListIndent);
+        return this.decoratePreviewTaskListHtml(html, lines);
+    }
+
+    private renderMarkdownHtml(markdown: string, normalizeListIndent = false) {
+        const prepared = normalizeListIndent ? this.normalizeMarkdownListIndent(markdown) : markdown;
+        return this.addLinkTargets(this.converter.makeHtml(prepared));
+    }
+
+    private normalizeMarkdownListIndent(markdown: string) {
+        const tabSize = this.editorTabSize();
+        const sourceLines = markdown.split('\n');
+        let inCodeFence = false;
+        let inListBlock = false;
+
+        return sourceLines.map(line => {
+            const trimmed = line.trim();
+            if (/^```/.test(trimmed)) {
+                inCodeFence = !inCodeFence;
+                inListBlock = false;
+                return line;
+            }
+
+            if (inCodeFence || trimmed === '') {
+                if (trimmed === '') inListBlock = false;
+                return line;
+            }
+
+            const listIndent = this.markdownListIndent(line);
+            if (listIndent !== null) {
+                inListBlock = true;
+                return this.normalizeMarkdownIndent(line, listIndent, tabSize);
+            }
+
+            if (inListBlock) {
+                const continuationIndent = this.markdownIndentedContinuationIndent(line);
+                if (continuationIndent !== null) {
+                    return this.normalizeMarkdownIndent(line, continuationIndent, tabSize);
+                }
+            }
+
+            inListBlock = false;
+            return line;
+        }).join('\n');
+    }
+
+    private normalizeMarkdownIndent(line: string, indent: string, tabSize: number) {
+        const columns = this.leadingIndentColumns(indent, tabSize);
+        const depth = Math.max(0, Math.floor(columns / tabSize));
+        return `${' '.repeat(depth * 4)}${line.slice(indent.length)}`;
+    }
+
+    private leadingIndentColumns(indent: string, tabSize: number) {
+        let columns = 0;
+        for (const char of indent) {
+            if (char === '\t') {
+                const remainder = columns % tabSize;
+                columns += remainder === 0 ? tabSize : tabSize - remainder;
+            } else {
+                columns++;
+            }
+        }
+        return columns;
+    }
+
+    private markdownListIndent(line: string) {
+        return /^([\t ]*)(?:[-*+]|\d+[.)])[\t ]+/.exec(line)?.[1] ?? null;
+    }
+
+    private markdownIndentedContinuationIndent(line: string) {
+        return /^([\t ]{2,})\S/.exec(line)?.[1] ?? null;
+    }
+
+    private isMarkdownListBlockLine(lines: StyledMarkdownLine[], index: number, section?: DocumentSectionStyle) {
+        const line = lines[index];
+        if (!line || !this.sameDocumentSection(line.section, section)) return false;
+        if (line.text.trim() === '') return false;
+        if (this.isDividerLine(line.text) || this.isMarkdownTableStart(lines, index)) return false;
+        if (this.isMarkdownListLine(line.text)) return true;
+        return /^[\t ]{2,}\S/.test(line.text);
+    }
+
+    private sameDocumentSection(left?: DocumentSectionStyle, right?: DocumentSectionStyle) {
+        return (left?.id || 0) === (right?.id || 0);
+    }
+
+    private isMarkdownListLine(line: string) {
+        return /^[\t ]*(?:[-*+]|\d+[.)])[\t ]+/.test(line);
+    }
+
+    private decoratePreviewTaskListHtml(html: string, lines: StyledMarkdownLine[]) {
+        const taskLines = lines.filter(line => this.markdownTaskLine(line.text));
+        if (taskLines.length === 0 || typeof document === 'undefined') return html;
+
+        const previewDocument = document.implementation.createHTMLDocument('notedown-preview');
+        previewDocument.body.innerHTML = html;
+        const taskItems = Array.from(previewDocument.body.querySelectorAll('li.task-list-item'));
+
+        taskItems.forEach((item, index) => {
+            const sourceLine = taskLines[index];
+            if (!sourceLine) return;
+
+            const lineIndex = String(sourceLine.lineIndex);
+            item.setAttribute('data-task-line', lineIndex);
+
+            const input = item.querySelector('input[type="checkbox"]');
+            if (!input) return;
+
+            input.removeAttribute('disabled');
+            input.setAttribute('data-task-line', lineIndex);
+            input.setAttribute('aria-label', this.markdownTaskLineLabel(sourceLine.text));
+        });
+
+        return previewDocument.body.innerHTML;
+    }
+
+    private markdownTaskLine(line: string) {
+        return /^[\t ]*(?:[-*+]|\d+[.)])[\t ]+\[[ xX]\][\t ]+(.+)$/.exec(line);
+    }
+
+    private markdownTaskLineLabel(line: string) {
+        return this.markdownTaskLine(line)?.[1] || 'Task';
+    }
+
     private markdownCellVariant(line: string): PreviewBlock['variant'] {
-        if (/^\s*[-*]\s+\[[ xX]\]\s+/.test(line)) return 'task';
+        if (/^[\t ]*(?:[-*+]|\d+[.)])[\t ]+\[[ xX]\][\t ]+/.test(line)) return 'task';
         if (/^\s{0,3}#{1,6}\s+/.test(line)) return 'heading';
-        if (/^\s{0,3}(([-*+])|\d+\.)\s+/.test(line)) return 'list';
+        if (/^[\t ]*(?:[-*+]|\d+[.)])[\t ]+/.test(line)) return 'list';
         return 'text';
     }
 
@@ -1887,38 +2638,62 @@ ${documentCss}
         return trimmed.split('|').map(cell => cell.trim());
     }
 
-    private preparePreviewMarkdownLine(line: string, lineIndex: number) {
-        const task = /^(\s*)[-*]\s+\[([ xX])\]\s+(.*)$/.exec(line);
-        if (!task) return line;
-
-        const checked = task[2].toLowerCase() === 'x';
-        const label = this.escapeHtml(task[3]);
-        const checkedAttribute = checked ? ' checked' : '';
-        const checkedClass = checked ? ' is-checked' : '';
-        return `<div class="notedown-task${checkedClass}" data-task-line="${lineIndex}"><input type="checkbox" aria-label="${label}" data-task-line="${lineIndex}"${checkedAttribute}> <span>${label}</span></div>`;
-    }
-
     private toggleTaskLine(lineIndex: number, checked: boolean) {
         if (!this.activeNote?.id) return;
         const lines = this.activeNote.body.split('\n');
         if (!lines[lineIndex]) return;
 
-        lines[lineIndex] = lines[lineIndex].replace(/^(\s*[-*]\s+\[)[ xX](\]\s+)/, `$1${checked ? 'x' : ' '}$2`);
+        lines[lineIndex] = lines[lineIndex].replace(/^(\s*(?:[-*+]|\d+[.)])\s+\[)[ xX](\]\s+)/, `$1${checked ? 'x' : ' '}$2`);
         this.activeNote.body = lines.join('\n');
         this.touchNote();
     }
 
     private isTaskLineChecked(lineIndex: number) {
         const line = this.activeNote?.body.split('\n')[lineIndex] || '';
-        const task = /^\s*[-*]\s+\[([ xX])\]\s+/.exec(line);
+        const task = /^[\t ]*(?:[-*+]|\d+[.)])[\t ]+\[([ xX])\][\t ]+/.exec(line);
         return task ? task[1].toLowerCase() === 'x' : false;
     }
 
     private addLinkTargets(html: string) {
-        return html.replace(/<a\s+([^>]*href=["'][^"']+["'][^>]*)>/gi, (match, attributes) => {
+        return this.rewriteAttachmentImageSources(html).replace(/<a\s+([^>]*href=["'][^"']+["'][^>]*)>/gi, (match, attributes) => {
             if (/target=/i.test(attributes)) return match;
             return `<a ${attributes} target="_blank" rel="noopener noreferrer">`;
         });
+    }
+
+    private rewriteAttachmentImageSources(html: string) {
+        return html.replace(/\ssrc=(["'])([^"']+)\1/gi, (match, quote, rawPath) => {
+            const attachment = this.attachmentForMarkdownPath(rawPath);
+            if (!attachment) return match;
+            const fileUrl = this.attachmentFileUrl(attachment.relativePath);
+            return fileUrl ? ` src=${quote}${fileUrl}${quote}` : match;
+        });
+    }
+
+    private attachmentForMarkdownPath(value: string) {
+        const normalized = this.normalizeMarkdownAttachmentPath(value);
+        if (!normalized) return null;
+        return this.noteAttachments().find(attachment => attachment.relativePath === normalized) || null;
+    }
+
+    private normalizeMarkdownAttachmentPath(value: string) {
+        const raw = String(value || '').trim();
+        if (!raw || /^(?:[a-z][a-z0-9+.-]*:|#)/i.test(raw)) return '';
+        try {
+            return decodeURIComponent(raw).replace(/^\/+/g, '');
+        } catch (error) {
+            return raw.replace(/^\/+/g, '');
+        }
+    }
+
+    private attachmentFileUrl(relativePath: string) {
+        const storagePath = this.storagePath();
+        if (!storagePath || !relativePath) return '';
+        const params = new URLSearchParams({
+            storagePath,
+            relativePath
+        });
+        return `notedown-attachment://file?${params.toString()}`;
     }
 
     private parseDocumentStyles(markdown: string): ParsedDocumentStyles {
@@ -2178,6 +2953,7 @@ ${documentCss}
                 createdAtMs: now - 600000,
                 updatedAt: this.nowLabel(new Date(now - 120000)),
                 updatedAtMs: now - 120000,
+                attachments: [],
                 body: '# 오늘의 노트\n\n- [ ] Electron 앱 셸 정리\n- [ ] 로컬 저장소 구조 설계\n- [ ] Markdown 편집 경험 다듬기\n\n## 메모\n\nNotion처럼 가볍게 열고, Markdown으로 빠르게 남기는 흐름을 기준으로 잡는다.'
             },
             {
@@ -2191,6 +2967,7 @@ ${documentCss}
                 createdAtMs: now - 360000,
                 updatedAt: this.nowLabel(new Date(now - 180000)),
                 updatedAtMs: now - 180000,
+                attachments: [],
                 body: '# 제품 범위\n\n## 화면\n\n- 노트\n- 설정\n\n## 저장\n\n로컬 우선 저장을 기본값으로 둔다.'
             }
         ];
@@ -2208,8 +2985,42 @@ ${documentCss}
             createdAtMs: 0,
             updatedAt: '',
             updatedAtMs: 0,
+            attachments: [],
             body: ''
         };
+    }
+
+    private newNoteFolder() {
+        const activeFolder = localStorage.getItem(this.activeWorkspaceKey) || 'memo';
+        return activeFolder && activeFolder !== 'all' ? activeFolder : 'memo';
+    }
+
+    private workspaceLabel(folder: string) {
+        return this.readStoredFolders().find(item => item.id === folder)?.label || this.defaultWorkspaceLabel(folder);
+    }
+
+    private readStoredFolders(): Array<{ id: string; label: string }> {
+        try {
+            const stored = JSON.parse(localStorage.getItem(this.foldersKey) || '[]');
+            if (!Array.isArray(stored)) return [];
+            return stored
+                .map(folder => ({
+                    id: String(folder?.id || '').trim(),
+                    label: String(folder?.label || '').replace(/\s+/g, ' ').trim()
+                }))
+                .filter(folder => folder.id && folder.id !== 'all' && folder.label);
+        } catch (error) {
+            return [];
+        }
+    }
+
+    private defaultWorkspaceLabel(folder: string) {
+        if (folder === 'memo') return '메모';
+        if (folder === 'blog') return '블로그';
+        if (folder === 'project') return '프로젝트';
+        if (folder === 'unfiled') return '미지정 워크스페이스';
+        if (folder === '_imported') return '가져온 문서';
+        return folder;
     }
 
     private normalizeNote(note: any, index = 0): NoteItem {
@@ -2228,6 +3039,9 @@ ${documentCss}
             workspaceName: note?.workspaceName,
             fileName: note?.fileName,
             relativePath: note?.relativePath,
+            attachments: Array.isArray(note?.attachments)
+                ? note.attachments.map((attachment: any) => this.normalizeAttachment(attachment, note?.relativePath || '')).filter((attachment: NoteAttachment) => attachment.relativePath && !attachment.deleted)
+                : [],
             createdAt: note?.createdAt || this.nowLabel(new Date(createdAtMs)),
             createdAtMs,
             updatedAt: note?.updatedAt || this.nowLabel(new Date(updatedAtMs)),
