@@ -525,19 +525,19 @@ export class Component implements OnInit, OnDestroy {
     }
 
     public modeButtonClass(mode: ViewMode) {
-        const base = 'flex size-8 items-center justify-center rounded-md transition-colors';
+        const base = 'flex size-7 items-center justify-center rounded-md transition-colors';
         if (this.viewMode === mode) return `${base} bg-stone-900 text-white dark:bg-zinc-100 dark:text-zinc-950`;
         return `${base} text-stone-500 hover:bg-stone-100 hover:text-stone-950 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:text-zinc-50`;
     }
 
     public lineNumberButtonClass() {
-        const base = 'flex size-9 items-center justify-center rounded-md transition-colors';
+        const base = 'flex size-8 items-center justify-center rounded-md transition-colors';
         if (this.showLineNumbers) return `${base} bg-stone-100 text-stone-950 dark:bg-zinc-800 dark:text-zinc-50`;
         return `${base} text-stone-500 hover:bg-stone-100 hover:text-stone-950 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:text-zinc-50`;
     }
 
     public attachmentButtonClass() {
-        const base = 'ml-2 inline-flex h-9 shrink-0 items-center gap-1.5 rounded-md px-2.5 text-[12px] font-semibold transition-colors';
+        const base = 'inline-flex h-8 shrink-0 items-center gap-1 rounded-md px-2 text-[12px] font-semibold transition-colors';
         if (this.attachmentPanelOpen) return `${base} bg-stone-900 text-white dark:bg-zinc-100 dark:text-zinc-950`;
         return `${base} text-stone-500 hover:bg-stone-100 hover:text-stone-950 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:text-zinc-50`;
     }

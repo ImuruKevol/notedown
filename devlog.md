@@ -89,3 +89,4 @@
 | 2026-06-15 | 009 | Electron 첨부 이미지 미리보기 로딩 복구 및 실제 앱 검증 | [상세](devlog/2026-06-15/009-attachment-image-preview-protocol.md) |
 | 2026-06-15 | 010 | Electron 파일 선택 첨부 흐름을 main process dialog 저장으로 전환 | [상세](devlog/2026-06-15/010-electron-attachment-dialog-save.md) |
 | 2026-06-15 | 011 | Slash 첨부 팝오버 위치를 입력 줄 기준으로 보정 | [상세](devlog/2026-06-15/011-slash-attachment-popover-position.md) |
+| 2026-06-17 | 001 | 노트 헤더 우측 액션 버튼 간격 축소 | [상세](devlog/2026-06-17/001-note-header-action-spacing.md) |
