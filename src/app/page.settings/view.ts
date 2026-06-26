@@ -3,7 +3,7 @@ import { Service } from '@wiz/libs/portal/season/service';
 
 type ThemeMode = 'light' | 'dark' | 'system';
 type EditorMode = 'markdown' | 'split' | 'preview';
-type ToggleKey = 'autoSave' | 'syncAutoUpload' | 'keepInBackgroundOnClose';
+type ToggleKey = 'keepInBackgroundOnClose' | 'launchAtStartup';
 type StorageAction = '' | 'choose' | 'refresh' | 'initialize' | 'import';
 type SyncAction = '' | 'health' | 'setup' | 'login' | 'plan' | 'run';
 type StorageMessageTone = 'info' | 'success' | 'warning' | 'error';
@@ -13,15 +13,14 @@ interface AppSettings {
     storagePath: string;
     theme: ThemeMode;
     editorMode: EditorMode;
-    autoSave: boolean;
     keepInBackgroundOnClose: boolean;
+    launchAtStartup: boolean;
     tabSize: number;
     syncServerUrl: string;
     syncUsername: string;
     syncToken: string;
     syncTokenType: string;
     syncClientId: string;
-    syncAutoUpload: boolean;
 }
 
 interface StorageInfo {
@@ -78,6 +77,8 @@ export class Component implements OnInit, OnDestroy {
     private startupSyncResultKey = 'notedown.sync.startup.result.v1';
     private hadStoredSettings = false;
     private lastSyncedKeepInBackgroundOnClose: boolean | null = null;
+    private lastSyncedLaunchAtStartup: boolean | null = null;
+    private readonly androidSplitMinWidth = 840;
 
     public activeSection = 'general';
     public savedAt = '';
@@ -96,6 +97,7 @@ export class Component implements OnInit, OnDestroy {
     public selectedSyncConflictIndex = 0;
     public syncConflictDetail: SyncConflictDetail | null = null;
     public syncConflictBusy = false;
+    public launchAtStartupSupported = false;
     public sections = [
         { id: 'general', label: '일반' },
         { id: 'storage', label: '저장소' },
@@ -107,8 +109,19 @@ export class Component implements OnInit, OnDestroy {
         const settings = (event as CustomEvent<AppSettings>).detail;
         if (!settings) return;
         this.settings = this.normalizeSettings(settings);
+        this.ensureVisibleSection();
         this.savedAt = this.nowLabel();
         this.applyTheme();
+        void this.service.render();
+    };
+
+    private handleViewportResize = () => {
+        const normalizedEditorMode = this.normalizeEditorMode(this.settings.editorMode);
+        if (normalizedEditorMode !== this.settings.editorMode) {
+            this.settings.editorMode = normalizedEditorMode;
+            this.saveSettings();
+            return;
+        }
         void this.service.render();
     };
 
@@ -117,19 +130,22 @@ export class Component implements OnInit, OnDestroy {
     public async ngOnInit() {
         this.loadSettings();
         await this.hydrateAppPreferences();
+        this.ensureVisibleSection();
         this.applyStartupSyncResult();
         await this.ensureDefaultStoragePath();
         await this.refreshStorageInfo();
         this.applyTheme();
         window.addEventListener('notedown:settings-changed', this.handleExternalSettingsChanged);
+        window.addEventListener('resize', this.handleViewportResize);
     }
 
     public ngOnDestroy() {
         window.removeEventListener('notedown:settings-changed', this.handleExternalSettingsChanged);
+        window.removeEventListener('resize', this.handleViewportResize);
     }
 
     public setSection(id: string) {
-        this.activeSection = id;
+        this.activeSection = this.isVisibleSection(id) ? id : 'general';
     }
 
     public setTheme(theme: ThemeMode) {
@@ -139,8 +155,16 @@ export class Component implements OnInit, OnDestroy {
     }
 
     public setEditorMode(mode: EditorMode) {
-        this.settings.editorMode = mode;
+        this.settings.editorMode = this.normalizeEditorMode(mode);
         this.saveSettings();
+    }
+
+    public visibleSections() {
+        return this.sections.filter(section => this.isVisibleSection(section.id));
+    }
+
+    public shouldShowSplitEditorMode() {
+        return this.canUseSplitEditorMode();
     }
 
     public setTabSize(value: number | string) {
@@ -476,9 +500,10 @@ export class Component implements OnInit, OnDestroy {
         await this.runSyncAction('plan', '서버 메타데이터와 비교하는 중입니다...', async () => {
             const result = await api.plan(this.syncPayload());
             if (result?.ok) {
-                this.syncPlanSummary = result.summary;
+                const summary = this.normalizedSyncSummary(result.summary, result);
+                this.syncPlanSummary = summary;
                 this.setSyncConflictsFromResult(result);
-                this.setSyncMessage(this.syncSummaryMessage(result.summary), this.syncConflictCount(result) > 0 ? 'warning' : 'success');
+                this.setSyncMessage(this.syncSummaryMessage(summary), this.syncConflictCount(result) > 0 ? 'warning' : 'success');
                 return;
             }
             this.setSyncMessage(result?.error || '동기화 계획을 만들지 못했습니다.', 'error');
@@ -496,11 +521,11 @@ export class Component implements OnInit, OnDestroy {
 
         await this.runSyncAction('run', '전체 동기화를 실행하는 중입니다...', async () => {
             const result = await api.runFull(this.syncPayload());
-            if (result?.summary) this.syncPlanSummary = result.summary;
+            if (result?.summary) this.syncPlanSummary = this.normalizedSyncSummary(result.summary, result);
             const conflictCount = this.syncConflictCount(result);
-            if (result?.status === 'conflict' || conflictCount > 0) {
+            if (conflictCount > 0) {
                 this.setSyncConflictsFromResult(result);
-                this.setSyncMessage(`충돌 ${conflictCount || 1}건이 있어 자동 적용하지 않았습니다.`, 'warning');
+                this.setSyncMessage(`충돌 ${conflictCount}건이 있어 자동 적용하지 않았습니다.`, 'warning');
                 return;
             }
             if (result?.ok) {
@@ -538,16 +563,15 @@ export class Component implements OnInit, OnDestroy {
             workspaceName: 'Notedown',
             storagePath: '~/Documents/Notedown Notes',
             theme: 'light',
-            editorMode: 'split',
-            autoSave: true,
+            editorMode: this.canUseSplitEditorMode() ? 'split' : 'markdown',
             keepInBackgroundOnClose: true,
+            launchAtStartup: false,
             tabSize: 2,
             syncServerUrl: 'http://172.16.0.143:5500',
             syncUsername: '',
             syncToken: '',
             syncTokenType: '',
-            syncClientId: this.createClientId(),
-            syncAutoUpload: false
+            syncClientId: this.createClientId()
         };
     }
 
@@ -558,15 +582,14 @@ export class Component implements OnInit, OnDestroy {
             storagePath: typeof stored?.storagePath === 'string' ? stored.storagePath : defaults.storagePath,
             theme: this.normalizeTheme(stored?.theme),
             editorMode: this.normalizeEditorMode(stored?.editorMode),
-            autoSave: typeof stored?.autoSave === 'boolean' ? stored.autoSave : defaults.autoSave,
             keepInBackgroundOnClose: typeof stored?.keepInBackgroundOnClose === 'boolean' ? stored.keepInBackgroundOnClose : defaults.keepInBackgroundOnClose,
+            launchAtStartup: typeof stored?.launchAtStartup === 'boolean' ? stored.launchAtStartup : defaults.launchAtStartup,
             tabSize: this.normalizeTabSize(stored?.tabSize),
             syncServerUrl: typeof stored?.syncServerUrl === 'string' ? stored.syncServerUrl : defaults.syncServerUrl,
             syncUsername: typeof stored?.syncUsername === 'string' ? stored.syncUsername : defaults.syncUsername,
             syncToken: typeof stored?.syncToken === 'string' ? stored.syncToken : defaults.syncToken,
             syncTokenType: typeof stored?.syncTokenType === 'string' ? stored.syncTokenType : defaults.syncTokenType,
-            syncClientId: typeof stored?.syncClientId === 'string' && stored.syncClientId ? stored.syncClientId : defaults.syncClientId,
-            syncAutoUpload: typeof stored?.syncAutoUpload === 'boolean' ? stored.syncAutoUpload : defaults.syncAutoUpload
+            syncClientId: typeof stored?.syncClientId === 'string' && stored.syncClientId ? stored.syncClientId : defaults.syncClientId
         };
     }
 
@@ -575,7 +598,30 @@ export class Component implements OnInit, OnDestroy {
     }
 
     private normalizeEditorMode(value: unknown): EditorMode {
-        return value === 'markdown' || value === 'preview' || value === 'split' ? value : 'split';
+        if (value === 'split') return this.canUseSplitEditorMode() ? 'split' : 'markdown';
+        return value === 'markdown' || value === 'preview' ? value : (this.canUseSplitEditorMode() ? 'split' : 'markdown');
+    }
+
+    private isVisibleSection(id: string) {
+        return id !== 'storage' || !this.isAndroidPlatform();
+    }
+
+    private ensureVisibleSection() {
+        if (!this.isVisibleSection(this.activeSection)) this.activeSection = 'general';
+    }
+
+    private canUseSplitEditorMode() {
+        if (this.isAndroidPlatform()) return false;
+        if (!this.isAndroidPlatform()) return true;
+        const width = Math.max(
+            Number(window.innerWidth) || 0,
+            Number(document.documentElement?.clientWidth) || 0
+        );
+        return width >= this.androidSplitMinWidth;
+    }
+
+    public isAndroidPlatform() {
+        return String((window as any).notedown?.platform || '').toLowerCase() === 'android';
     }
 
     private normalizeTabSize(value: unknown) {
@@ -602,6 +648,10 @@ export class Component implements OnInit, OnDestroy {
             if (!this.hadStoredSettings && typeof result?.keepInBackgroundOnClose === 'boolean') {
                 this.settings.keepInBackgroundOnClose = result.keepInBackgroundOnClose;
             }
+            this.launchAtStartupSupported = result?.launchAtStartupSupported === true;
+            if (this.launchAtStartupSupported && typeof result?.launchAtStartup === 'boolean') {
+                this.settings.launchAtStartup = result.launchAtStartup;
+            }
             this.saveSettings();
         } catch (error) {
             this.syncAppPreferences(true);
@@ -610,15 +660,38 @@ export class Component implements OnInit, OnDestroy {
 
     private syncAppPreferences(force = false) {
         const keepInBackgroundOnClose = this.settings.keepInBackgroundOnClose !== false;
-        if (!force && this.lastSyncedKeepInBackgroundOnClose === keepInBackgroundOnClose) return;
+        const launchAtStartup = this.launchAtStartupSupported && this.settings.launchAtStartup === true;
+        if (
+            !force
+            && this.lastSyncedKeepInBackgroundOnClose === keepInBackgroundOnClose
+            && this.lastSyncedLaunchAtStartup === launchAtStartup
+        ) return;
 
         const api = this.appApi();
         this.lastSyncedKeepInBackgroundOnClose = keepInBackgroundOnClose;
+        this.lastSyncedLaunchAtStartup = launchAtStartup;
         if (!api?.setPreferences) return;
 
-        void api.setPreferences({ keepInBackgroundOnClose }).catch(() => {
-            this.lastSyncedKeepInBackgroundOnClose = null;
-        });
+        void api.setPreferences({ keepInBackgroundOnClose, launchAtStartup })
+            .then((result: any) => {
+                if (result?.launchAtStartupSupported === false) {
+                    this.launchAtStartupSupported = false;
+                    this.settings.launchAtStartup = false;
+                    localStorage.setItem(this.storageKey, JSON.stringify(this.settings));
+                    void this.service.render();
+                    return;
+                }
+                if (typeof result?.launchAtStartup === 'boolean' && this.settings.launchAtStartup !== result.launchAtStartup) {
+                    this.settings.launchAtStartup = result.launchAtStartup;
+                    this.lastSyncedLaunchAtStartup = result.launchAtStartup;
+                    localStorage.setItem(this.storageKey, JSON.stringify(this.settings));
+                    void this.service.render();
+                }
+            })
+            .catch(() => {
+                this.lastSyncedKeepInBackgroundOnClose = null;
+                this.lastSyncedLaunchAtStartup = null;
+            });
     }
 
     private async ensureDefaultStoragePath() {
@@ -626,7 +699,7 @@ export class Component implements OnInit, OnDestroy {
         if (!api?.defaultPath) return;
 
         const result = await api.defaultPath();
-        if (result?.ok && result.storagePath && this.shouldUseDefaultStoragePath(result.storagePath)) {
+        if (result?.ok && result.storagePath && (this.isAndroidPlatform() || this.shouldUseDefaultStoragePath(result.storagePath))) {
             this.settings.storagePath = result.storagePath;
             this.saveSettings();
         }
@@ -717,16 +790,16 @@ export class Component implements OnInit, OnDestroy {
         try {
             const result = JSON.parse(localStorage.getItem(this.startupSyncResultKey) || '{}');
             if (!result?.syncedAtMs || Date.now() - Number(result.syncedAtMs) > 30 * 60 * 1000) return;
-            if (result.summary) this.syncPlanSummary = result.summary;
+            if (result.summary) this.syncPlanSummary = this.normalizedSyncSummary(result.summary, result);
             const conflictCount = this.syncConflictCount(result);
             if (result.status === 'running') {
                 this.setSyncMessage('앱 시작 동기화가 진행 중입니다.', 'info');
                 return;
             }
-            if (result.status === 'conflict' || conflictCount > 0) {
+            if (conflictCount > 0) {
                 this.activeSection = 'sync';
                 this.setSyncConflictsFromResult(result);
-                this.setSyncMessage(`시작 동기화에서 충돌 ${conflictCount || 1}건이 감지되었습니다.`, 'warning');
+                this.setSyncMessage(`시작 동기화에서 충돌 ${conflictCount}건이 감지되었습니다.`, 'warning');
                 return;
             }
             if (result.ok) {
@@ -741,18 +814,25 @@ export class Component implements OnInit, OnDestroy {
     }
 
     private syncConflictCount(result: any) {
-        return Number(result?.summary?.conflicts)
-            || result?.conflicts?.length
-            || result?.plan?.conflicts?.length
-            || result?.operations?.conflicts?.length
-            || 0;
+        return this.extractSyncConflicts(result).length;
+    }
+
+    private normalizedSyncSummary(summary: any = {}, result: any): SyncPlanSummary {
+        return {
+            uploadFiles: Number(summary.uploadFiles) || 0,
+            downloadFiles: Number(summary.downloadFiles) || 0,
+            deleteServerFiles: Number(summary.deleteServerFiles) || 0,
+            deleteLocalFiles: Number(summary.deleteLocalFiles) || 0,
+            uploadAttachments: Number(summary.uploadAttachments) || 0,
+            downloadAttachments: Number(summary.downloadAttachments) || 0,
+            deleteServerAttachments: Number(summary.deleteServerAttachments) || 0,
+            deleteLocalAttachments: Number(summary.deleteLocalAttachments) || 0,
+            conflicts: this.syncConflictCount(result)
+        };
     }
 
     private setSyncConflictsFromResult(result: any) {
         this.syncConflicts = this.extractSyncConflicts(result);
-        if (this.syncConflicts.length === 0 && this.syncConflictCount(result) > 0) {
-            this.syncConflicts = [{ relativePath: '', reason: 'conflict' }];
-        }
         this.selectedSyncConflictIndex = 0;
         this.syncConflictDetail = null;
     }
@@ -775,6 +855,7 @@ export class Component implements OnInit, OnDestroy {
             const item = rawItem?.file || rawItem;
             const relativePath = item?.relativePath || item?.serverFile?.relativePath || '';
             if (!relativePath) continue;
+            if (this.isSystemSyncPath(relativePath)) continue;
             const conflict: SyncConflict = {
                 relativePath,
                 reason: item.reason || item.status || '',
@@ -790,6 +871,11 @@ export class Component implements OnInit, OnDestroy {
             conflicts.set(`${relativePath}:${conflict.reason || ''}`, conflict);
         }
         return Array.from(conflicts.values());
+    }
+
+    private isSystemSyncPath(relativePath: string) {
+        const firstPart = String(relativePath || '').replace(/\\/g, '/').replace(/^\/+/g, '').split('/').filter(Boolean)[0] || '';
+        return firstPart === 'metadata.json' || firstPart === '.notedown-sync.json';
     }
 
     private async loadSyncConflictDetail() {

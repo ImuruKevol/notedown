@@ -90,3 +90,25 @@
 | 2026-06-15 | 010 | Electron 파일 선택 첨부 흐름을 main process dialog 저장으로 전환 | [상세](devlog/2026-06-15/010-electron-attachment-dialog-save.md) |
 | 2026-06-15 | 011 | Slash 첨부 팝오버 위치를 입력 줄 기준으로 보정 | [상세](devlog/2026-06-15/011-slash-attachment-popover-position.md) |
 | 2026-06-17 | 001 | 노트 헤더 우측 액션 버튼 간격 축소 | [상세](devlog/2026-06-17/001-note-header-action-spacing.md) |
+| 2026-06-17 | 002 | Android Capacitor 환경 구성 및 권한/네트워크 정책 추가 | [상세](devlog/2026-06-17/002-android-capacitor-environment.md) |
+| 2026-06-17 | 003 | Android 네이티브 브리지 및 에뮬레이터 실행 검증 | [상세](devlog/2026-06-17/003-android-native-bridge-emulator.md) |
+| 2026-06-17 | 004 | Android 동기화·첨부·PDF 브리지 확장 | [상세](devlog/2026-06-17/004-android-sync-attachment-pdf-bridge.md) |
+| 2026-06-17 | 005 | Android 폰 편집 UX 및 metadata 동기화 충돌 필터 보강 | [상세](devlog/2026-06-17/005-android-phone-editor-sync-polish.md) |
+| 2026-06-17 | 006 | Android 툴바 아이콘화, 한글 입력, 기본 저장소 첨부 경로 보강 | [상세](devlog/2026-06-17/006-android-toolbar-ime-storage-fix.md) |
+| 2026-06-17 | 007 | Android preview 기본 모드 및 플로팅 토글/툴바 첨부 보강 | [상세](devlog/2026-06-17/007-android-preview-floating-toggle-toolbar.md) |
+| 2026-06-17 | 008 | Android 실기기 검증 및 preview 초기 진입 보정 | [상세](devlog/2026-06-17/008-android-device-preview-verification.md) |
+| 2026-06-17 | 009 | Android PDF export 0B 방지 및 첨부 picker toolbar 전환 | [상세](devlog/2026-06-17/009-android-pdf-attachment-picker.md) |
+| 2026-06-17 | 010 | Android PDF density 보정 및 이미지 첨부 preview 복구 | [상세](devlog/2026-06-17/010-android-pdf-density-attachment-preview.md) |
+| 2026-06-17 | 011 | 새 기기 첫 동기화 서버 삭제 방지 및 tombstone 조건 보강 | [상세](devlog/2026-06-17/011-sync-first-device-delete-guard.md) |
+| 2026-06-17 | 012 | Android 실기기 PDF 저장 Activity payload 크래시 수정 | [상세](devlog/2026-06-17/012-android-pdf-activity-payload-fix.md) |
+| 2026-06-17 | 013 | Android PDF 저장 로딩 표시 및 완료 알림 추가 | [상세](devlog/2026-06-17/013-android-pdf-export-ux.md) |
+| 2026-06-17 | 014 | Android 런처 아이콘을 Electron 앱 아이콘으로 교체 | [상세](devlog/2026-06-17/014-android-launcher-icon.md) |
+| 2026-06-17 | 015 | PDF export 이미지 레이아웃 안정화 및 첨부 ZIP 옵션 추가 | [상세](devlog/2026-06-17/015-pdf-export-attachments-layout.md) |
+| 2026-06-22 | 001 | 시작 프로그램 등록 설정 추가 | [상세](devlog/2026-06-22/001-startup-program-registration.md) |
+| 2026-06-22 | 002 | 자동 저장 제거 및 수동 저장 시 현재 노트 동기화 적용 | [상세](devlog/2026-06-22/002-manual-save-current-note-sync.md) |
+| 2026-06-22 | 003 | 폴더 패널 기본 표시 및 새 항목 생성 흐름 개선 | [상세](devlog/2026-06-22/003-sidebar-folder-note-create-flow.md) |
+| 2026-06-22 | 004 | 폴더 컨텍스트 메뉴와 새 노트 커서 위치 개선 | [상세](devlog/2026-06-22/004-folder-context-menu-note-cursor.md) |
+| 2026-06-22 | 005 | 노트 목록 정렬 기준 보존 | [상세](devlog/2026-06-22/005-sidebar-sort-persistence.md) |
+| 2026-06-22 | 006 | Electron 및 Android 앱 빌드 | [상세](devlog/2026-06-22/006-electron-android-build.md) |
+| 2026-06-26 | 001 | 저장 동기화 상태 표시 및 라인 넘버 기능 제거 | [상세](devlog/2026-06-26/001-sync-status-line-number-removal.md) |
+| 2026-06-26 | 002 | 서버 저장 로직 개선 후 Electron 및 Android 앱 빌드 | [상세](devlog/2026-06-26/002-electron-android-build-after-server-storage-update.md) |

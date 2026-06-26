@@ -31,15 +31,14 @@ interface AppSettings {
     storagePath: string;
     theme: ThemeMode;
     editorMode: EditorMode;
-    autoSave: boolean;
     keepInBackgroundOnClose: boolean;
+    launchAtStartup: boolean;
     tabSize: number;
     syncServerUrl: string;
     syncUsername: string;
     syncToken: string;
     syncTokenType: string;
     syncClientId: string;
-    syncAutoUpload: boolean;
 }
 
 interface PaletteCommand {
@@ -68,6 +67,7 @@ export class Component implements OnInit, OnDestroy {
     private settingsKey = 'notedown.settings.v1';
     private routeSubscription?: Subscription;
     private handleWorkspacePanel = (event: Event) => {
+        if (this.isSettingsRoute) return;
         this.workspacePanelOpen = Boolean((event as CustomEvent<boolean>).detail);
         this.renderSoon();
     };
@@ -100,7 +100,7 @@ export class Component implements OnInit, OnDestroy {
 
     public mobileOpen = false;
     public isSettingsRoute = false;
-    public workspacePanelOpen = false;
+    public workspacePanelOpen = true;
     public paletteOpen = false;
     public paletteQuery = '';
     public paletteIndex = 0;
@@ -322,7 +322,9 @@ export class Component implements OnInit, OnDestroy {
         if (this.isSettingsRoute) {
             this.closeSidebar();
             this.workspacePanelOpen = false;
+            return;
         }
+        this.workspacePanelOpen = true;
     }
 
     private refreshPaletteData() {
@@ -528,6 +530,15 @@ export class Component implements OnInit, OnDestroy {
     private settingsCommands(): PaletteCommand[] {
         const themeLabel = { light: 'Light', dark: 'Dark', system: 'System' }[this.settings.theme];
         const editorLabel = { markdown: '작성', split: '분할', preview: '미리보기' }[this.settings.editorMode];
+        const launchAtStartupCommands: PaletteCommand[] = this.canUseLaunchAtStartupCommand()
+            ? [{
+                id: 'launch-startup',
+                title: `시작 프로그램 등록 ${this.settings.launchAtStartup ? '끄기' : '켜기'}`,
+                subtitle: this.settings.launchAtStartup ? '현재 켜짐' : '현재 꺼짐',
+                keywords: 'startup launch login start 시작 프로그램 로그인 자동 실행',
+                run: () => this.updateSettings({ launchAtStartup: !this.settings.launchAtStartup })
+            }]
+            : [];
         return [
             {
                 id: 'open-settings',
@@ -551,19 +562,13 @@ export class Component implements OnInit, OnDestroy {
                 run: () => this.updateSettings({ editorMode: mode })
             })),
             {
-                id: 'auto-save',
-                title: `자동 저장 ${this.settings.autoSave ? '끄기' : '켜기'}`,
-                subtitle: this.settings.autoSave ? '현재 켜짐' : '현재 꺼짐',
-                keywords: 'auto save autosave 자동 저장',
-                run: () => this.updateSettings({ autoSave: !this.settings.autoSave })
-            },
-            {
                 id: 'keep-background',
                 title: `닫을 때 백그라운드 유지 ${this.settings.keepInBackgroundOnClose ? '끄기' : '켜기'}`,
                 subtitle: this.settings.keepInBackgroundOnClose ? '현재 켜짐' : '현재 꺼짐',
                 keywords: 'background close tray keep 백그라운드 트레이 종료',
                 run: () => this.updateSettings({ keepInBackgroundOnClose: !this.settings.keepInBackgroundOnClose })
             },
+            ...launchAtStartupCommands,
             ...([2, 4, 8] as number[]).map(size => ({
                 id: `tab-size-${size}`,
                 title: `탭 크기: ${size}`,
@@ -600,15 +605,14 @@ export class Component implements OnInit, OnDestroy {
             storagePath: '~/Documents/Notedown Notes',
             theme: 'light',
             editorMode: 'split',
-            autoSave: true,
             keepInBackgroundOnClose: true,
+            launchAtStartup: false,
             tabSize: 2,
             syncServerUrl: 'http://172.16.0.143:5500',
             syncUsername: '',
             syncToken: '',
             syncTokenType: '',
-            syncClientId: '',
-            syncAutoUpload: false
+            syncClientId: ''
         };
     }
 
@@ -626,6 +630,11 @@ export class Component implements OnInit, OnDestroy {
         return Math.min(8, Math.max(2, Math.round(parsed)));
     }
 
+    private canUseLaunchAtStartupCommand() {
+        const platform = String((window as any).notedown?.platform || '').toLowerCase();
+        return platform !== 'android' && Boolean((window as any).notedown?.app?.setPreferences);
+    }
+
     private applyTheme() {
         const prefersDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
         const dark = this.settings.theme === 'dark' || (this.settings.theme === 'system' && prefersDark);
@@ -635,7 +644,10 @@ export class Component implements OnInit, OnDestroy {
     private syncAppPreferences(settings: AppSettings) {
         const api = (window as any).notedown?.app;
         if (!api?.setPreferences) return;
-        void api.setPreferences({ keepInBackgroundOnClose: settings.keepInBackgroundOnClose !== false }).catch(() => { });
+        void api.setPreferences({
+            keepInBackgroundOnClose: settings.keepInBackgroundOnClose !== false,
+            launchAtStartup: settings.launchAtStartup === true
+        }).catch(() => { });
     }
 
     private activeWorkspaceLabel() {

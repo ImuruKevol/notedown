@@ -8,12 +8,20 @@ type SyncConflictResolution = 'server' | 'local';
 type SyncConflictResolveTone = 'info' | 'success' | 'warning' | 'error';
 type AttachmentPickerMode = 'file' | 'image';
 type AttachmentMessageTone = 'info' | 'success' | 'warning' | 'error';
+type PdfExportMode = 'markdown-images' | 'zip-with-attachments';
+type MarkdownToolbarActionId = 'task' | 'bullet' | 'quote' | 'code' | 'link' | 'divider' | 'file' | 'image';
+type HeadingLevel = 1 | 2 | 3 | 4;
+
+interface MarkdownToolbarAction {
+    id: MarkdownToolbarActionId;
+    label: string;
+    title: string;
+}
 
 interface PreviewBlock {
     type: 'markdown' | 'code' | 'blank';
     lineIndex: number;
     lineEnd?: number;
-    lineNumbers?: number[];
     variant?: 'quote' | 'table' | 'divider' | 'task' | 'heading' | 'list' | 'text';
     joinsPrevious?: boolean;
     joinsNext?: boolean;
@@ -41,6 +49,7 @@ interface NoteItem {
     fileName?: string;
     relativePath?: string;
     attachments?: NoteAttachment[];
+    titleManuallyEdited?: boolean;
 }
 
 interface NoteAttachment {
@@ -53,6 +62,13 @@ interface NoteAttachment {
     contentHash?: string | null;
     updatedAtMs?: number | null;
     deleted?: boolean;
+}
+
+interface PdfExportAttachment {
+    fileName: string;
+    relativePath: string;
+    mimeType?: string;
+    size?: number;
 }
 
 interface AttachmentPickerItem {
@@ -153,17 +169,18 @@ export class Component implements OnInit, OnDestroy {
     private attachmentInputMode: AttachmentPickerMode = 'file';
     private attachmentUploadFromPicker = false;
     private attachmentPickerAnchor: EditorCursorPosition | null = null;
+    private attachmentDataUrlCache = new Map<string, string>();
+    private attachmentPdfDataUrlCache = new Map<string, string>();
+    private attachmentDataUrlLoading = new Set<string>();
     private styleFoldTimeout: number | null = null;
-    private autoSaveTimeout: number | null = null;
     private syncUploadTimeout: number | null = null;
-    private readonly autoSaveDelayMs = 2500;
+    private readonly androidSplitMinWidth = 840;
     private autoFoldedStyleNoteId = '';
     private hoveredLineDecorationIds: string[] = [];
 
     private settingsKey = 'notedown.settings.v1';
     public viewMode: ViewMode = 'split';
     public savedAt = '';
-    public showLineNumbers = false;
     public notes: NoteItem[] = this.defaultNotes();
     public activeNote: NoteItem = this.notes[0];
     public editorOptions: any = this.createEditorOptions();
@@ -175,6 +192,7 @@ export class Component implements OnInit, OnDestroy {
     public editingTitle = false;
     public titleDraft = '';
     public hasUnsavedChanges = false;
+    public saveBusy = false;
     public syncConflicts: SyncConflict[] = [];
     public selectedSyncConflictIndex = 0;
     public syncConflictDetail: SyncConflictDetail | null = null;
@@ -199,6 +217,21 @@ export class Component implements OnInit, OnDestroy {
     public attachmentUploadBusy = false;
     public attachmentMessage = '';
     public attachmentMessageTone: AttachmentMessageTone = 'info';
+    public pdfExportBusy = false;
+    public pdfExportMessage = '';
+    public pdfExportOptionsOpen = false;
+    public headingMenuOpen = false;
+    public readonly headingLevels: HeadingLevel[] = [1, 2, 3];
+    public readonly markdownToolbarActions: MarkdownToolbarAction[] = [
+        { id: 'task', label: '체크리스트', title: '체크리스트' },
+        { id: 'bullet', label: '목록', title: '목록' },
+        { id: 'quote', label: '인용', title: '인용' },
+        { id: 'code', label: '코드', title: '코드' },
+        { id: 'link', label: '링크', title: '링크' },
+        { id: 'divider', label: '---', title: '구분선' },
+        { id: 'image', label: '이미지', title: '이미지 첨부' },
+        { id: 'file', label: '파일', title: '파일 첨부' }
+    ];
 
     public get hasSelectedNote() {
         return Boolean(this.activeNote?.id);
@@ -220,10 +253,16 @@ export class Component implements OnInit, OnDestroy {
         const source = (event as CustomEvent<{ source?: string }>).detail?.source;
         if (source === 'page.notes') return;
 
-        if (this.hasUnsavedChanges) this.saveNow(false);
         const activeId = this.activeNote?.id;
+        const unsavedNote = this.hasUnsavedChanges && activeId ? { ...this.activeNote } : null;
         await this.loadNotes(false);
+        if (unsavedNote?.id) {
+            const index = this.notes.findIndex(note => note.id === unsavedNote.id);
+            if (index >= 0) this.notes[index] = unsavedNote;
+            else this.notes = [unsavedNote, ...this.notes];
+        }
         this.selectNoteById(localStorage.getItem(this.activeNoteKey) || activeId);
+        if (unsavedNote?.id && this.activeNote?.id === unsavedNote.id) this.hasUnsavedChanges = true;
         this.requestViewUpdate();
     };
     private handleSettingsChanged = () => {
@@ -252,7 +291,7 @@ export class Component implements OnInit, OnDestroy {
         if (key !== 's' || (!event.metaKey && !event.ctrlKey) || event.altKey) return;
         event.preventDefault();
         if (this.showSyncConflictViewer()) return;
-        this.saveNow(true);
+        void this.saveNow(true);
     };
     private handleAttachmentPickerKeydown = (event: KeyboardEvent) => {
         if (!this.attachmentPickerOpen) return;
@@ -278,9 +317,9 @@ export class Component implements OnInit, OnDestroy {
         }
     };
     private handleAttachmentPickerReposition = () => {
-        if (!this.attachmentPickerOpen) return;
-        this.updateAttachmentPickerPosition();
-        this.requestViewUpdate();
+        const viewModeChanged = this.normalizeAndroidViewMode();
+        if (this.attachmentPickerOpen) this.updateAttachmentPickerPosition();
+        if (viewModeChanged || this.attachmentPickerOpen) this.requestViewUpdate();
     };
 
     constructor(
@@ -304,7 +343,6 @@ export class Component implements OnInit, OnDestroy {
     }
 
     public ngOnDestroy() {
-        if (this.hasUnsavedChanges) this.saveNow(false);
         window.removeEventListener('notedown:select-note', this.handleSelectNote);
         window.removeEventListener('notedown:notes-changed', this.handleNotesChanged);
         window.removeEventListener('notedown:settings-changed', this.handleSettingsChanged);
@@ -316,7 +354,6 @@ export class Component implements OnInit, OnDestroy {
         if (this.completionDisposable) this.completionDisposable.dispose();
         if (this.foldingDisposable) this.foldingDisposable.dispose();
         this.clearScheduledStyleFold();
-        this.clearScheduledAutoSave();
         this.clearScheduledSyncUpload();
         this.disposeEditorHoverHandlers();
         this.disposeDiffEditor();
@@ -344,7 +381,8 @@ export class Component implements OnInit, OnDestroy {
         this.activeNote = note;
         this.persist(true);
         this.refreshPreview();
-        if (!this.showSyncConflictViewer()) this.focusEditorSoon();
+        if (this.isAndroidPlatform()) this.viewMode = 'preview';
+        else if (!this.showSyncConflictViewer()) this.focusEditorSoon('first-line-end');
     }
 
     public handleBodyChange(nextBody: string) {
@@ -354,7 +392,13 @@ export class Component implements OnInit, OnDestroy {
         if (this.activeNote.body === body) return;
 
         this.activeNote.body = body;
+        this.syncDraftTitleFromFirstHeading();
         this.touchNote();
+    }
+
+    public handlePlainTextInput(event: Event) {
+        const target = event.target as HTMLTextAreaElement | null;
+        this.handleBodyChange(target?.value || '');
     }
 
     public touchNote(saveImmediately = false) {
@@ -365,10 +409,9 @@ export class Component implements OnInit, OnDestroy {
         this.refreshPreview();
         this.hasUnsavedChanges = true;
         if (saveImmediately) {
-            this.saveNow(true);
+            void this.saveNow(true);
             return;
         }
-        this.scheduleAutoSave();
     }
 
     public startTitleEdit() {
@@ -392,6 +435,8 @@ export class Component implements OnInit, OnDestroy {
         if ((this.activeNote.title || '') === nextTitle) return;
 
         this.activeNote.title = nextTitle;
+        this.activeNote.titleManuallyEdited = true;
+        this.emitActiveNoteTitleChanged();
         this.touchNote();
     }
 
@@ -400,25 +445,30 @@ export class Component implements OnInit, OnDestroy {
         this.editingTitle = false;
     }
 
-    public saveNow(emitChange = true) {
-        if (!this.hasSelectedNote) return;
-        this.clearScheduledAutoSave();
-        this.persist(emitChange);
+    public async saveNow(emitChange = true) {
+        if (!this.hasSelectedNote || this.saveBusy) return;
+        this.saveBusy = true;
+        this.requestViewUpdate();
+        try {
+            this.clearScheduledSyncUpload();
+            this.markActiveNoteSaved();
+            const syncNoteId = this.activeNote.id;
+            const fileSave = this.persist(emitChange);
+            if (fileSave) await fileSave;
+            if (emitChange) await this.uploadNoteToSyncServer(syncNoteId);
+        } finally {
+            this.saveBusy = false;
+            this.requestViewUpdate();
+        }
     }
 
     public setMode(mode: ViewMode) {
-        this.viewMode = mode;
+        this.viewMode = this.normalizeViewModeForPlatform(mode);
         if (this.showSyncConflictViewer()) {
             this.renderSyncConflictDiffSoon();
             return;
         }
-        this.focusEditorSoon();
-    }
-
-    public toggleLineNumbers() {
-        this.showLineNumbers = !this.showLineNumbers;
-        this.editorOptions = this.createEditorOptions();
-        if (this.editor) this.editor.updateOptions({ lineNumbers: this.showLineNumbers ? 'on' : 'off' });
+        if (!this.isAndroidPlatform()) this.focusEditorSoon();
     }
 
     public createdAtLabel() {
@@ -432,31 +482,73 @@ export class Component implements OnInit, OnDestroy {
 
     public lastSavedLabel() {
         const updatedAtMs = this.activeNote?.updatedAtMs;
-        if (typeof updatedAtMs === 'number' && Number.isFinite(updatedAtMs) && updatedAtMs > 0) {
-            return this.nowLabel(new Date(updatedAtMs));
-        }
-
-        return this.activeNote?.updatedAt || this.savedAt || '';
+        if (this.hasUnsavedChanges) return '저장 안 됨';
+        return this.savedAt || this.activeNote?.updatedAt || '';
     }
 
-    public async exportNotePdf() {
-        if (!this.hasSelectedNote) return;
-
-        const html = this.buildPdfDocumentHtml();
-        const pdfApi = (window as any).notedown?.pdf;
-        if (pdfApi?.saveNote) {
-            try {
-                const result = await pdfApi.saveNote({
-                    title: this.activeNote.title || '제목 없음',
-                    html
-                });
-                if (result?.ok || result?.canceled) return;
-            } catch (error) {
-                // Fall through to the browser print path when Electron PDF export is unavailable.
-            }
+    public openPdfExportOptionsOrExport() {
+        if (!this.hasSelectedNote || this.pdfExportBusy) return;
+        if (this.attachmentCount() > 0) {
+            this.pdfExportOptionsOpen = true;
+            this.closeAttachmentPicker();
+            this.requestViewUpdate();
+            return;
         }
 
-        this.openPdfPrintWindow(html);
+        void this.exportNotePdf('markdown-images');
+    }
+
+    public closePdfExportOptions() {
+        this.pdfExportOptionsOpen = false;
+    }
+
+    public async exportNotePdf(mode: PdfExportMode = 'markdown-images') {
+        if (!this.hasSelectedNote || this.pdfExportBusy) return;
+
+        let printHtml: string | null = null;
+        this.pdfExportOptionsOpen = false;
+        this.pdfExportBusy = true;
+        this.pdfExportMessage = this.isAndroidPlatform()
+            ? (mode === 'zip-with-attachments' ? 'PDF와 첨부 파일을 압축하는 중입니다.' : 'PDF 파일을 만드는 중입니다. 완료될 때까지 기다려 주세요.')
+            : (mode === 'zip-with-attachments' ? 'PDF와 첨부 파일 압축을 준비하는 중입니다.' : 'PDF 저장을 준비하는 중입니다.');
+        this.requestViewUpdate();
+
+        try {
+            const markdownImageAttachments = this.markdownImageAttachments();
+            await this.preloadAndroidAttachmentDataUrls(markdownImageAttachments, true);
+            const html = this.buildPdfDocumentHtml();
+            const pdfApi = (window as any).notedown?.pdf;
+            if (pdfApi?.saveNote) {
+                try {
+                    const result = await pdfApi.saveNote({
+                        title: this.activeNote.title || '제목 없음',
+                        html,
+                        exportMode: mode,
+                        storagePath: this.storagePath(),
+                        attachments: mode === 'zip-with-attachments' ? this.pdfExportAttachments() : []
+                    });
+                    if (result?.ok || result?.canceled) return;
+                    if (this.isAndroidPlatform() || mode === 'zip-with-attachments') {
+                        window.alert(result?.error || (mode === 'zip-with-attachments' ? 'ZIP 저장에 실패했습니다.' : 'PDF 저장에 실패했습니다.'));
+                        return;
+                    }
+                } catch (error) {
+                    if (this.isAndroidPlatform() || mode === 'zip-with-attachments') {
+                        window.alert(this.errorMessage(error, mode === 'zip-with-attachments' ? 'ZIP 저장에 실패했습니다.' : 'PDF 저장에 실패했습니다.'));
+                        return;
+                    }
+                    // Fall through to the browser print path when Electron PDF export is unavailable.
+                }
+            }
+
+            printHtml = html;
+        } finally {
+            this.pdfExportBusy = false;
+            this.pdfExportMessage = '';
+            this.requestViewUpdate();
+        }
+
+        if (printHtml) this.openPdfPrintWindow(printHtml);
     }
 
     public previewHtml(): SafeHtml {
@@ -530,10 +622,132 @@ export class Component implements OnInit, OnDestroy {
         return `${base} text-stone-500 hover:bg-stone-100 hover:text-stone-950 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:text-zinc-50`;
     }
 
-    public lineNumberButtonClass() {
-        const base = 'flex size-8 items-center justify-center rounded-md transition-colors';
-        if (this.showLineNumbers) return `${base} bg-stone-100 text-stone-950 dark:bg-zinc-800 dark:text-zinc-50`;
-        return `${base} text-stone-500 hover:bg-stone-100 hover:text-stone-950 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:text-zinc-50`;
+    public shouldShowSplitMode() {
+        return this.canUseSplitMode();
+    }
+
+    public showHeaderModeButtons() {
+        return !this.isAndroidPlatform();
+    }
+
+    public isSplitModeActive() {
+        return this.viewMode === 'split' && this.canUseSplitMode();
+    }
+
+    public editorGridClass() {
+        if (!this.isSplitModeActive()) return 'grid-cols-1';
+        return this.isAndroidPlatform() ? 'grid-cols-2' : 'lg:grid-cols-2';
+    }
+
+    public previewPaneClass() {
+        if (!this.isSplitModeActive()) return '';
+        return this.isAndroidPlatform() ? 'border-l' : 'border-t lg:border-l lg:border-t-0';
+    }
+
+    public showMarkdownToolbar() {
+        return this.isAndroidPlatform() && !this.showSyncConflictViewer() && this.viewMode !== 'preview';
+    }
+
+    public showAndroidViewToggle() {
+        return this.isAndroidPlatform() && !this.showSyncConflictViewer() && this.hasSelectedNote;
+    }
+
+    public showAndroidSaveButton() {
+        return this.isAndroidPlatform() && !this.showSyncConflictViewer() && this.hasSelectedNote;
+    }
+
+    public androidViewToggleButtonClass() {
+        const base = 'absolute bottom-20 right-5 z-40 flex size-12 items-center justify-center rounded-full border shadow-xl transition-colors';
+        if (this.viewMode === 'preview') return `${base} border-stone-900 bg-stone-900 text-white dark:border-zinc-100 dark:bg-zinc-100 dark:text-zinc-950`;
+        return `${base} border-stone-200 bg-white text-stone-700 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-100`;
+    }
+
+    public androidSaveButtonClass() {
+        const base = 'absolute bottom-5 right-5 z-50 flex size-12 items-center justify-center rounded-full border shadow-xl transition-colors disabled:cursor-wait disabled:opacity-70';
+        if (this.hasUnsavedChanges) return `${base} border-emerald-700 bg-emerald-700 text-white dark:border-emerald-300 dark:bg-emerald-300 dark:text-zinc-950`;
+        return `${base} border-stone-900 bg-stone-900 text-white dark:border-zinc-100 dark:bg-zinc-100 dark:text-zinc-950`;
+    }
+
+    public toggleAndroidPreviewMode() {
+        if (!this.isAndroidPlatform()) return;
+        this.headingMenuOpen = false;
+        this.viewMode = this.viewMode === 'preview' ? 'write' : 'preview';
+        this.requestViewUpdate();
+    }
+
+    public markdownToolbarButtonClass(actionId: MarkdownToolbarActionId) {
+        const base = 'flex size-9 shrink-0 items-center justify-center rounded-md transition-colors';
+        return `${base} text-stone-700 hover:bg-stone-100 dark:text-zinc-200 dark:hover:bg-zinc-800`;
+    }
+
+    public headingToolbarButtonClass() {
+        const base = 'flex h-9 min-w-10 shrink-0 items-center justify-center rounded-md px-2 text-[12px] font-semibold transition-colors';
+        if (this.headingMenuOpen) return `${base} bg-stone-900 text-white dark:bg-zinc-100 dark:text-zinc-950`;
+        return `${base} text-stone-700 hover:bg-stone-100 dark:text-zinc-200 dark:hover:bg-zinc-800`;
+    }
+
+    public headingMenuItemClass(level: HeadingLevel) {
+        const sizeClass = level === 1 ? 'text-[15px]' : level === 2 ? 'text-[14px]' : level === 3 ? 'text-[13px]' : 'text-[12px]';
+        return `flex h-9 min-w-12 items-center justify-center rounded-md px-3 font-semibold text-stone-700 transition-colors hover:bg-stone-100 dark:text-zinc-200 dark:hover:bg-zinc-800 ${sizeClass}`;
+    }
+
+    public toggleHeadingMenu() {
+        if (!this.hasSelectedNote) return;
+        this.headingMenuOpen = !this.headingMenuOpen;
+        this.requestViewUpdate();
+    }
+
+    public applyHeadingLevel(level: HeadingLevel) {
+        if (!this.hasSelectedNote) return;
+        this.headingMenuOpen = false;
+        this.prefixEditorLines(`${'#'.repeat(level)} `);
+        this.requestViewUpdate();
+    }
+
+    public applyMarkdownToolbarAction(actionId: MarkdownToolbarActionId) {
+        if (!this.hasSelectedNote) return;
+        this.headingMenuOpen = false;
+        this.requestViewUpdate();
+
+        if (actionId === 'task') {
+            this.prefixEditorLines('- [ ] ');
+            return;
+        }
+        if (actionId === 'bullet') {
+            this.prefixEditorLines('- ');
+            return;
+        }
+        if (actionId === 'quote') {
+            this.prefixEditorLines('> ');
+            return;
+        }
+        if (actionId === 'code') {
+            const selectedText = this.editorSelectedText();
+            const code = selectedText || '';
+            const text = `\n\`\`\`\n${code}\n\`\`\`\n`;
+            this.replaceEditorSelection(text, selectedText ? text.length : '\n```\n'.length);
+            return;
+        }
+        if (actionId === 'link') {
+            const selectedText = this.editorSelectedText() || '링크';
+            this.replaceEditorSelection(`[${selectedText}](https://)`, `[${selectedText}](https://`.length);
+            return;
+        }
+        if (actionId === 'divider') {
+            this.insertToolbarText('\n---\n');
+            return;
+        }
+        if (actionId === 'image') {
+            this.openAttachmentPicker('image');
+            return;
+        }
+        if (actionId === 'file') {
+            this.openAttachmentPicker('file');
+        }
+    }
+
+    public usePlainTextEditor() {
+        return this.isAndroidPlatform();
     }
 
     public attachmentButtonClass() {
@@ -568,6 +782,11 @@ export class Component implements OnInit, OnDestroy {
         if (value < 1024) return `${value} B`;
         if (value < 1024 * 1024) return `${Math.round(value / 1024)} KB`;
         return `${(value / 1024 / 1024).toFixed(value < 10 * 1024 * 1024 ? 1 : 0)} MB`;
+    }
+
+    public pdfAttachmentOptionDetail() {
+        const count = this.attachmentCount();
+        return count > 0 ? `첨부 ${count}개` : '첨부 없음';
     }
 
     public attachmentMessageClass() {
@@ -703,11 +922,11 @@ export class Component implements OnInit, OnDestroy {
         if (item.attachment) this.insertAttachmentMarkdown(item.attachment, this.attachmentPickerMode);
     }
 
-    public async triggerAttachmentUpload(mode: AttachmentPickerMode = 'file') {
+    public async triggerAttachmentUpload(mode: AttachmentPickerMode = 'file', insertAfterSave = false) {
         if (!this.hasSelectedNote || this.attachmentUploadBusy) return;
         this.attachmentInputMode = mode;
         this.attachmentInputAccept = mode === 'image' ? 'image/*' : '';
-        this.attachmentUploadFromPicker = this.attachmentPickerOpen;
+        this.attachmentUploadFromPicker = insertAfterSave || this.attachmentPickerOpen;
         this.requestViewUpdate();
 
         const api = (window as any).notedown?.storage;
@@ -886,6 +1105,8 @@ export class Component implements OnInit, OnDestroy {
         const attachments = this.noteAttachments();
         const index = attachments.findIndex(item => item.relativePath === attachment.relativePath || (attachment.id && item.id === attachment.id));
         const nextAttachment = this.normalizeAttachment(attachment, this.activeNote?.relativePath || '');
+        if (nextAttachment.relativePath) this.attachmentDataUrlCache.delete(nextAttachment.relativePath);
+        if (nextAttachment.relativePath) this.attachmentPdfDataUrlCache.delete(nextAttachment.relativePath);
         if (index >= 0) {
             attachments[index] = { ...attachments[index], ...nextAttachment };
         } else {
@@ -899,6 +1120,32 @@ export class Component implements OnInit, OnDestroy {
         return note.attachments
             .map(attachment => this.normalizeAttachment(attachment, note?.relativePath || ''))
             .filter(attachment => attachment.relativePath && !attachment.deleted);
+    }
+
+    private pdfExportAttachments(): PdfExportAttachment[] {
+        return this.noteAttachments().map(attachment => ({
+            fileName: attachment.fileName || this.basename(attachment.relativePath),
+            relativePath: attachment.relativePath,
+            mimeType: attachment.mimeType || this.mimeTypeFromName(attachment.fileName || attachment.relativePath),
+            size: attachment.size
+        }));
+    }
+
+    private markdownImageAttachments() {
+        const html = this.converter.makeHtml(this.activeNote?.body || '');
+        const documentForImages = document.implementation.createHTMLDocument('notedown-markdown-images');
+        documentForImages.body.innerHTML = html;
+
+        const seen = new Set<string>();
+        const attachments: NoteAttachment[] = [];
+        documentForImages.body.querySelectorAll('img[src]').forEach(image => {
+            const attachment = this.attachmentForMarkdownPath(image.getAttribute('src') || '');
+            if (!attachment || seen.has(attachment.relativePath)) return;
+            if (!this.isImageAttachment(attachment)) return;
+            seen.add(attachment.relativePath);
+            attachments.push(attachment);
+        });
+        return attachments;
     }
 
     private normalizeAttachment(attachment: any, noteRelativePath = ''): NoteAttachment {
@@ -971,21 +1218,7 @@ export class Component implements OnInit, OnDestroy {
     }
 
     private insertEditorText(text: string) {
-        const editor = this.editor;
-        if (!editor?.getModel) return;
-        const selection = editor.getSelection?.();
-        const monaco = (window as any).monaco;
-        const model = editor.getModel();
-        if (!selection || !monaco?.Range || !model) return;
-
-        editor.executeEdits('notedown-attachment', [{
-            range: selection,
-            text,
-            forceMoveMarkers: true
-        }]);
-        const position = editor.getPosition?.();
-        if (position) editor.setPosition(position);
-        this.handleBodyChange(model.getValue());
+        this.replaceEditorSelection(text, text.length);
     }
 
     private markdownAttachmentUrl(relativePath: string) {
@@ -1164,9 +1397,7 @@ export class Component implements OnInit, OnDestroy {
             tabSize: this.editorTabSize(),
             insertSpaces: true,
             detectIndentation: false,
-            lineNumbers: this.showLineNumbers
-                ? ((lineNumber: number) => String(block.lineIndex + lineNumber + 1))
-                : 'off',
+            lineNumbers: 'off',
             lineNumbersMinChars: 3,
             lineDecorationsWidth: 2,
             glyphMargin: false,
@@ -1217,17 +1448,49 @@ export class Component implements OnInit, OnDestroy {
         return 'cell-text';
     }
 
-    public previewLineNumberClass(block: PreviewBlock) {
-        const base = 'notedown-preview-line-number';
-        return block.lineNumbers && block.lineNumbers.length > 1 ? `${base} is-multi-line` : base;
+    private syncDraftTitleFromFirstHeading() {
+        if (!this.shouldSyncDraftTitleFromFirstHeading()) return;
+
+        const title = this.firstMarkdownH1Title(this.activeNote.body);
+        if (!title || this.activeNote.title === title) return;
+
+        this.activeNote.title = title;
+        this.titleDraft = title;
+        this.emitActiveNoteTitleChanged();
     }
 
-    public previewLineNumbers(block: PreviewBlock) {
-        return block.lineNumbers && block.lineNumbers.length > 0 ? block.lineNumbers : [block.lineIndex];
+    private shouldSyncDraftTitleFromFirstHeading() {
+        return this.hasSelectedNote
+            && this.activeNote.status === 'draft'
+            && !this.activeNote.titleManuallyEdited;
+    }
+
+    private firstMarkdownH1Title(body: string) {
+        const line = String(body || '')
+            .split('\n')
+            .find(item => /^\s{0,3}#\s+/.test(item));
+        if (!line) return '';
+
+        const match = /^\s{0,3}#\s+(.+?)\s*$/.exec(line);
+        return match ? match[1].replace(/\s+#+\s*$/, '').trim() : '';
+    }
+
+    private emitActiveNoteTitleChanged() {
+        if (!this.hasSelectedNote) return;
+        window.dispatchEvent(new CustomEvent('notedown:note-title-changed', {
+            detail: {
+                noteId: this.activeNote.id,
+                title: this.activeNote.title || ''
+            }
+        }));
+    }
+
+    private markActiveNoteSaved() {
+        if (!this.hasSelectedNote || this.activeNote.status !== 'draft') return;
+        this.activeNote.status = 'active';
     }
 
     private selectNoteById(id?: string | null) {
-        if (this.hasUnsavedChanges) this.saveNow(true);
         const note = id === '' ? null : (id ? this.notes.find(item => item.id === id) || this.notes[0] : this.notes[0]);
         if (!note) {
             this.activeNote = this.emptyNote();
@@ -1251,12 +1514,13 @@ export class Component implements OnInit, OnDestroy {
         this.attachmentPanelOpen = false;
         this.closeAttachmentPicker();
         this.autoFoldedStyleNoteId = '';
+        if (this.isAndroidPlatform()) this.viewMode = 'preview';
         localStorage.setItem(this.activeNoteKey, note.id);
         this.refreshPreview();
         if (this.showSyncConflictViewer()) {
             this.renderSyncConflictDiffSoon();
         } else {
-            this.focusEditorSoon();
+            this.focusEditorSoon(this.shouldFocusFirstLineEnd(note) ? 'first-line-end' : 'default');
             this.scheduleFoldStyleBlocks();
         }
     }
@@ -1342,7 +1606,6 @@ export class Component implements OnInit, OnDestroy {
 
     private persist(emitChange: boolean) {
         localStorage.setItem(this.storageKey, JSON.stringify(this.notes));
-        const syncNoteId = this.activeNote?.id || '';
         this.hasUnsavedChanges = false;
         if (this.hasSelectedNote) {
             localStorage.setItem(this.activeNoteKey, this.activeNote.id);
@@ -1354,29 +1617,13 @@ export class Component implements OnInit, OnDestroy {
         if (emitChange) {
             if (fileSave) {
                 fileSave.finally(() => {
-                    this.scheduleAutoSync(syncNoteId);
                     this.emitNotesChanged();
                 });
             } else {
-                this.scheduleAutoSync(syncNoteId);
                 this.emitNotesChanged();
             }
         }
-    }
-
-    private scheduleAutoSave() {
-        if (!this.autoSaveEnabled()) return;
-        this.clearScheduledAutoSave();
-        this.autoSaveTimeout = window.setTimeout(() => {
-            this.autoSaveTimeout = null;
-            this.saveNow(true);
-        }, this.autoSaveDelayMs);
-    }
-
-    private clearScheduledAutoSave() {
-        if (this.autoSaveTimeout == null) return;
-        window.clearTimeout(this.autoSaveTimeout);
-        this.autoSaveTimeout = null;
+        return fileSave;
     }
 
     private emitNotesChanged() {
@@ -1410,15 +1657,6 @@ export class Component implements OnInit, OnDestroy {
         return api.saveNotes({ storagePath, notes: this.notes }).catch(() => null);
     }
 
-    private scheduleAutoSync(noteId: string) {
-        if (!noteId || !this.autoSyncEnabled()) return;
-        this.clearScheduledSyncUpload();
-        this.syncUploadTimeout = window.setTimeout(() => {
-            this.syncUploadTimeout = null;
-            void this.uploadNoteToSyncServer(noteId);
-        }, 1200);
-    }
-
     private clearScheduledSyncUpload() {
         if (this.syncUploadTimeout == null) return;
         window.clearTimeout(this.syncUploadTimeout);
@@ -1429,28 +1667,47 @@ export class Component implements OnInit, OnDestroy {
         const api = (window as any).notedown?.sync;
         const settings = this.readSettings();
         const note = this.notes.find(item => item.id === noteId);
-        if (!api?.uploadNote || !note || !settings.syncAutoUpload || !settings.syncToken || !settings.storagePath) return;
+        if (!api?.uploadNote || !note || !this.canRunSavedSync(settings)) return;
 
+        this.emitSaveSyncStatus('동기화 중', this.saveSyncNoteDetail(note, '서버에 저장하는 중입니다.'), 'running');
         try {
-            await api.uploadNote({
+            const result = await api.uploadNote({
                 serverUrl: settings.syncServerUrl,
                 token: settings.syncToken,
                 clientId: settings.syncClientId,
                 storagePath: settings.storagePath,
                 note
             });
+            const conflictCount = this.startupSyncConflictCount(result);
+            if (result?.status === 'conflict' || conflictCount > 0) {
+                this.storeStartupSyncResult(result);
+                return;
+            }
+            if (result?.ok) {
+                this.emitSaveSyncStatus('동기화 완료', this.saveSyncNoteDetail(note, '서버에 저장했습니다.'), 'success');
+                return;
+            }
+            this.emitSaveSyncStatus('동기화 실패', result?.error || '문서 동기화에 실패했습니다.', 'error');
         } catch (error) {
-            // Local save remains authoritative when server sync is unavailable.
+            this.emitSaveSyncStatus('동기화 실패', this.errorMessage(error, '문서 동기화에 실패했습니다.'), 'error');
         }
     }
 
-    private autoSyncEnabled() {
-        const settings = this.readSettings();
-        return Boolean(settings.syncAutoUpload && settings.syncToken && settings.storagePath);
+    private emitSaveSyncStatus(label: string, detail: string, tone: 'running' | 'success' | 'warning' | 'error') {
+        window.dispatchEvent(new CustomEvent('notedown:save-sync-status', {
+            detail: {
+                label,
+                detail,
+                tone,
+                source: 'page.notes',
+                syncedAtMs: Date.now()
+            }
+        }));
     }
 
-    private autoSaveEnabled() {
-        return this.readSettings().autoSave !== false;
+    private saveSyncNoteDetail(note: NoteItem, fallback: string) {
+        const title = (note?.title || '').trim();
+        return title ? `${title} - ${fallback}` : fallback;
     }
 
     private async runStartupSync() {
@@ -1489,20 +1746,25 @@ export class Component implements OnInit, OnDestroy {
 
     private storeStartupSyncResult(result: any) {
         const conflicts = this.extractSyncConflicts(result);
-        const summary = result?.summary || {
+        const rawSummary = result?.summary || {
             uploadFiles: 0,
             downloadFiles: 0,
             deleteServerFiles: 0,
             deleteLocalFiles: 0,
             conflicts: conflicts.length
         };
-        const conflictCount = Number(summary.conflicts) || conflicts.length;
-        const hasConflicts = result?.status === 'conflict' || conflictCount > 0;
+        const summary = {
+            ...rawSummary,
+            conflicts: conflicts.length
+        };
+        const hasConflicts = conflicts.length > 0;
         const status = result?.status === 'running'
             ? 'running'
             : hasConflicts
                 ? 'conflict'
-                : result?.status || (result?.ok ? 'ok' : 'error');
+                : result?.status === 'conflict'
+                    ? (result?.ok ? 'ok' : 'ok')
+                    : result?.status || (result?.ok ? 'ok' : 'error');
         const payload = {
             status,
             ok: Boolean(result?.ok && !hasConflicts),
@@ -1523,16 +1785,25 @@ export class Component implements OnInit, OnDestroy {
         const items = [
             ...(Array.isArray(result?.conflicts) ? result.conflicts : []),
             ...(Array.isArray(result?.plan?.conflicts) ? result.plan.conflicts : []),
-            ...(Array.isArray(result?.operations?.conflicts) ? result.operations.conflicts : [])
+            ...(Array.isArray(result?.operations?.conflicts) ? result.operations.conflicts : []),
+            ...(Array.isArray(result?.attachmentConflicts) ? result.attachmentConflicts : []),
+            ...(result?.file ? [result.file] : []),
+            ...(result?.attachment ? [result.attachment] : [])
         ];
         const conflicts = new Map<string, any>();
         for (const rawItem of items) {
             const item = rawItem?.file || rawItem;
             const relativePath = item?.relativePath || item?.serverFile?.relativePath || '';
             if (!relativePath) continue;
+            if (this.isSystemSyncPath(relativePath)) continue;
             conflicts.set(`${relativePath}:${item.reason || item.status || ''}`, this.compactSyncConflict(item));
         }
         return Array.from(conflicts.values());
+    }
+
+    private isSystemSyncPath(relativePath: string) {
+        const firstPart = String(relativePath || '').replace(/\\/g, '/').replace(/^\/+/g, '').split('/').filter(Boolean)[0] || '';
+        return firstPart === 'metadata.json' || firstPart === '.notedown-sync.json';
     }
 
     private compactSyncConflict(conflict: any) {
@@ -1560,15 +1831,14 @@ export class Component implements OnInit, OnDestroy {
     }
 
     private applyStartupSyncConflict(result = this.readStartupSyncResult()) {
-        const conflictCount = this.startupSyncConflictCount(result);
         const isRecent = result?.syncedAtMs && Date.now() - Number(result.syncedAtMs) <= 30 * 60 * 1000;
-        if (!isRecent || (result?.status !== 'conflict' && conflictCount <= 0)) {
+        const conflicts = this.extractSyncConflicts(result) as SyncConflict[];
+        if (!isRecent || conflicts.length === 0) {
             this.clearSyncConflictViewer();
             return;
         }
 
-        const conflicts = this.extractSyncConflicts(result) as SyncConflict[];
-        this.syncConflicts = conflicts.length > 0 ? conflicts : [{ relativePath: '', reason: 'conflict' }];
+        this.syncConflicts = conflicts;
         if (this.selectedSyncConflictIndex >= this.syncConflicts.length) this.selectedSyncConflictIndex = 0;
         this.syncConflictDetail = null;
         this.syncConflictDiffReady = false;
@@ -1602,6 +1872,8 @@ export class Component implements OnInit, OnDestroy {
             || result?.conflicts?.length
             || result?.plan?.conflicts?.length
             || result?.operations?.conflicts?.length
+            || result?.attachmentConflicts?.length
+            || (result?.status === 'conflict' ? 1 : 0)
             || 0;
     }
 
@@ -1811,9 +2083,10 @@ export class Component implements OnInit, OnDestroy {
     private storagePath() {
         try {
             const settings = JSON.parse(localStorage.getItem(this.settingsKey) || '{}');
+            if (this.isAndroidPlatform()) return settings.storagePath || 'android-default';
             return settings.storagePath || '';
         } catch (error) {
-            return '';
+            return this.isAndroidPlatform() ? 'android-default' : '';
         }
     }
 
@@ -1830,7 +2103,7 @@ export class Component implements OnInit, OnDestroy {
             insertSpaces: true,
             detectIndentation: false,
             tabCompletion: 'on',
-            lineNumbers: this.showLineNumbers ? 'on' : 'off',
+            lineNumbers: 'off',
             lineNumbersMinChars: 3,
             lineDecorationsWidth: 2,
             minimap: { enabled: false },
@@ -1865,10 +2138,38 @@ export class Component implements OnInit, OnDestroy {
     }
 
     private settingsViewMode(): ViewMode {
+        if (this.isAndroidPlatform()) return 'preview';
         const mode = this.readSettings().editorMode;
-        if (mode === 'markdown') return 'write';
-        if (mode === 'preview') return 'preview';
-        return 'split';
+        if (mode === 'markdown') return this.normalizeViewModeForPlatform('write');
+        if (mode === 'preview') return this.normalizeViewModeForPlatform('preview');
+        return this.normalizeViewModeForPlatform('split');
+    }
+
+    private normalizeAndroidViewMode() {
+        if (this.viewMode !== 'split' || this.canUseSplitMode()) return false;
+        this.viewMode = 'write';
+        return true;
+    }
+
+    private normalizeViewModeForPlatform(mode: ViewMode): ViewMode {
+        if (mode === 'split' && !this.canUseSplitMode()) return 'write';
+        return mode;
+    }
+
+    private canUseSplitMode() {
+        if (this.isAndroidPlatform()) return false;
+        if (!this.isAndroidPlatform()) return true;
+        const width = Math.max(
+            Number(window.innerWidth) || 0,
+            Number(document.documentElement?.clientWidth) || 0
+        );
+        return width >= this.androidSplitMinWidth;
+    }
+
+    private isAndroidPlatform() {
+        const notedownPlatform = String((window as any).notedown?.platform || '').toLowerCase();
+        const capacitorPlatform = String((window as any).Capacitor?.getPlatform?.() || '').toLowerCase();
+        return notedownPlatform === 'android' || capacitorPlatform === 'android' || /android/i.test(navigator.userAgent || '');
     }
 
     private readSettings() {
@@ -1877,6 +2178,142 @@ export class Component implements OnInit, OnDestroy {
         } catch (error) {
             return {};
         }
+    }
+
+    private editorSelectedText() {
+        const textarea = this.plainTextEditorElement();
+        if (textarea) {
+            const start = textarea.selectionStart ?? textarea.value.length;
+            const end = textarea.selectionEnd ?? start;
+            return textarea.value.slice(Math.min(start, end), Math.max(start, end));
+        }
+
+        const selection = this.editor?.getSelection?.();
+        const model = this.editor?.getModel?.();
+        if (!selection || !model?.getValueInRange) return '';
+        return model.getValueInRange(selection) || '';
+    }
+
+    private wrapEditorSelection(prefix: string, suffix: string, placeholder: string) {
+        const selectedText = this.editorSelectedText();
+        const body = selectedText || placeholder;
+        this.replaceEditorSelection(`${prefix}${body}${suffix}`, prefix.length + body.length);
+    }
+
+    private prefixEditorLines(prefix: string) {
+        if (this.prefixPlainEditorLines(prefix)) return;
+
+        const editor = this.editor;
+        const model = editor?.getModel?.();
+        const selection = editor?.getSelection?.();
+        const monaco = (window as any).monaco;
+        if (!editor || !model || !selection || !monaco?.Range) {
+            this.insertToolbarText(prefix);
+            return;
+        }
+
+        let endLineNumber = Number(selection.endLineNumber) || Number(selection.startLineNumber) || 1;
+        if (Number(selection.endColumn) === 1 && endLineNumber > Number(selection.startLineNumber)) endLineNumber -= 1;
+        const startLineNumber = Number(selection.startLineNumber) || endLineNumber;
+        const lines: string[] = [];
+        for (let lineNumber = startLineNumber; lineNumber <= endLineNumber; lineNumber += 1) {
+            const line = model.getLineContent(lineNumber) || '';
+            lines.push(line.startsWith(prefix) ? line : `${prefix}${line}`);
+        }
+
+        const range = new monaco.Range(startLineNumber, 1, endLineNumber, model.getLineMaxColumn(endLineNumber));
+        this.replaceEditorRange(range, lines.join('\n'), prefix.length);
+    }
+
+    private insertToolbarText(text: string) {
+        this.replaceEditorSelection(text, text.length);
+    }
+
+    private replaceEditorSelection(text: string, cursorOffset = text.length) {
+        if (this.replacePlainEditorSelection(text, cursorOffset)) return;
+
+        const selection = this.editor?.getSelection?.();
+        const monaco = (window as any).monaco;
+        if (!selection || !monaco?.Range) {
+            this.appendEditorFallback(text);
+            return;
+        }
+        const range = new monaco.Range(
+            selection.startLineNumber,
+            selection.startColumn,
+            selection.endLineNumber,
+            selection.endColumn
+        );
+        this.replaceEditorRange(range, text, cursorOffset);
+    }
+
+    private replaceEditorRange(range: any, text: string, cursorOffset = text.length) {
+        const editor = this.editor;
+        const model = editor?.getModel?.();
+        if (!editor || !model?.getOffsetAt || !model?.getPositionAt) {
+            this.appendEditorFallback(text);
+            return;
+        }
+
+        const startOffset = model.getOffsetAt({ lineNumber: range.startLineNumber, column: range.startColumn });
+        editor.executeEdits('notedown-markdown-toolbar', [{ range, text, forceMoveMarkers: true }]);
+        const cursorPosition = model.getPositionAt(startOffset + Math.max(0, Math.min(cursorOffset, text.length)));
+        if (cursorPosition) editor.setPosition(cursorPosition);
+        editor.focus?.();
+        this.handleBodyChange(model.getValue());
+    }
+
+    private plainTextEditorElement() {
+        if (!this.usePlainTextEditor()) return null;
+        return document.querySelector<HTMLTextAreaElement>('[data-plain-markdown-editor="true"]');
+    }
+
+    private replacePlainEditorSelection(text: string, cursorOffset = text.length) {
+        const textarea = this.plainTextEditorElement();
+        if (!textarea) return false;
+
+        const start = textarea.selectionStart ?? textarea.value.length;
+        const end = textarea.selectionEnd ?? start;
+        const rangeStart = Math.min(start, end);
+        const rangeEnd = Math.max(start, end);
+        const nextValue = `${textarea.value.slice(0, rangeStart)}${text}${textarea.value.slice(rangeEnd)}`;
+        const nextCursor = rangeStart + Math.max(0, Math.min(cursorOffset, text.length));
+        textarea.value = nextValue;
+        textarea.setSelectionRange(nextCursor, nextCursor);
+        textarea.focus();
+        this.handleBodyChange(nextValue);
+        return true;
+    }
+
+    private prefixPlainEditorLines(prefix: string) {
+        const textarea = this.plainTextEditorElement();
+        if (!textarea) return false;
+
+        const value = textarea.value;
+        const selectionStart = textarea.selectionStart ?? value.length;
+        const selectionEnd = textarea.selectionEnd ?? selectionStart;
+        const rangeStart = Math.min(selectionStart, selectionEnd);
+        const rangeEnd = Math.max(selectionStart, selectionEnd);
+        const lineStart = value.lastIndexOf('\n', Math.max(0, rangeStart - 1)) + 1;
+        const adjustedEnd = rangeEnd > rangeStart && value.charAt(rangeEnd - 1) === '\n' ? rangeEnd - 1 : rangeEnd;
+        const nextNewline = value.indexOf('\n', adjustedEnd);
+        const lineEnd = nextNewline >= 0 ? nextNewline : value.length;
+        const block = value.slice(lineStart, lineEnd);
+        const lines = block.split('\n').map(line => line.startsWith(prefix) ? line : `${prefix}${line}`);
+        const replacement = lines.join('\n');
+        const nextValue = `${value.slice(0, lineStart)}${replacement}${value.slice(lineEnd)}`;
+        const nextCursor = lineStart + prefix.length;
+        textarea.value = nextValue;
+        textarea.setSelectionRange(nextCursor, nextCursor);
+        textarea.focus();
+        this.handleBodyChange(nextValue);
+        return true;
+    }
+
+    private appendEditorFallback(text: string) {
+        const nextBody = `${this.activeNote?.body || ''}${text}`;
+        this.handleBodyChange(nextBody);
+        this.focusEditorSoon();
     }
 
     private configureMarkdownEditor() {
@@ -1902,7 +2339,7 @@ export class Component implements OnInit, OnDestroy {
             label: 'Save note',
             keybindings: [monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS],
             run: () => {
-                this.saveNow(true);
+                void this.saveNow(true);
             }
         });
         this.attachmentCommandId = this.editor.addCommand(0, (_accessor: any, mode: AttachmentPickerMode, anchor?: EditorCursorPosition) => {
@@ -2171,16 +2608,33 @@ export class Component implements OnInit, OnDestroy {
 <meta charset="utf-8">
 <title>${this.escapeHtml(title)}</title>
 <style>
-@page { margin: 18mm 16mm; }
+@page { size: A4; margin: 18mm 16mm; }
 * { box-sizing: border-box; }
+html { width: 100%; }
 body {
     margin: 0;
+    min-width: 0;
     color: #1c1917;
     background: #ffffff;
     font-family: SUIT, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    font-size: 15px;
     line-height: 1.65;
 }
-main { max-width: 780px; margin: 0 auto; }
+@media screen {
+    body {
+        width: 595px;
+        min-height: 842px;
+        padding: 51px 45px;
+    }
+}
+@media print {
+    body {
+        width: auto;
+        min-height: 0;
+        padding: 0;
+    }
+}
+main { width: 100%; max-width: 100%; margin: 0 auto; }
 header {
     margin-bottom: 28px;
     padding-bottom: 16px;
@@ -2196,6 +2650,15 @@ h1 { margin: 0; font-size: 28px; line-height: 1.25; }
 .content p { margin: 0.45em 0; }
 .content .notedown-blank-line { display: block; height: 1.55em; min-height: 1.55em; margin: 0; }
 .content a { color: #2563eb; text-decoration: underline; }
+.content :where(img, svg, video, canvas) {
+    display: block;
+    max-width: 100% !important;
+    height: auto !important;
+    margin: 0.75em auto;
+    object-fit: contain;
+    page-break-inside: avoid;
+    break-inside: avoid;
+}
 .content ul, .content ol { margin: 0.45em 0 0.45em 1.25em; padding: 0; }
 .content .notedown-task-list { margin-left: 0; padding-left: 0; }
 .content .task-list-item { display: flex; align-items: center; gap: 8px; margin: 0.2em 0; list-style: none; }
@@ -2205,6 +2668,7 @@ h1 { margin: 0; font-size: 28px; line-height: 1.25; }
 .content pre {
     margin: 0.9em 0;
     padding: 12px;
+    max-width: 100%;
     overflow-wrap: anywhere;
     white-space: pre-wrap;
     border-radius: 0;
@@ -2214,8 +2678,8 @@ h1 { margin: 0; font-size: 28px; line-height: 1.25; }
     font-family: SFMono-Regular, ui-monospace, Menlo, Monaco, Consolas, monospace;
     font-size: 0.92em;
 }
-.content table { width: 100%; border-collapse: collapse; margin: 0.9em 0; font-size: 0.95em; line-height: 1.45; }
-.content th, .content td { border: 1px solid #e7e5e4; padding: 6px 8px; text-align: left; vertical-align: top; }
+.content table { width: 100%; max-width: 100%; border-collapse: collapse; margin: 0.9em 0; font-size: 0.95em; line-height: 1.45; table-layout: fixed; }
+.content th, .content td { border: 1px solid #e7e5e4; padding: 6px 8px; text-align: left; vertical-align: top; overflow-wrap: anywhere; }
 .content th { background: #f5f5f4; font-weight: 600; }
 .content .notedown-doc-section { display: block; margin: 0.9em 0; }
 .content .notedown-doc-section > :first-child { margin-top: 0; }
@@ -2282,7 +2746,7 @@ ${documentCss}
 
         const flushMarkdown = () => {
             if (markdownLines.length === 0) return;
-            chunks.push(this.renderMarkdownHtml(markdownLines.join('\n'), true));
+            chunks.push(this.renderMarkdownHtml(markdownLines.join('\n'), true, true));
             markdownLines.length = 0;
         };
 
@@ -2409,7 +2873,6 @@ ${documentCss}
                         type: 'markdown',
                         lineIndex: lines[tableStartLine].lineIndex,
                         lineEnd,
-                        lineNumbers: tableLines.map(line => line.lineIndex),
                         variant: 'table',
                         html: this.sanitizer.bypassSecurityTrustHtml(html)
                     }, sourceLine.section));
@@ -2430,7 +2893,6 @@ ${documentCss}
                         type: 'markdown',
                         lineIndex: lines[listStartLine].lineIndex,
                         lineEnd: listLines[listLines.length - 1].lineIndex,
-                        lineNumbers: listLines.map(line => line.lineIndex),
                         variant: 'list',
                         html: this.sanitizer.bypassSecurityTrustHtml(html)
                     }, sourceLine.section));
@@ -2490,9 +2952,9 @@ ${documentCss}
         return this.decoratePreviewTaskListHtml(html, lines);
     }
 
-    private renderMarkdownHtml(markdown: string, normalizeListIndent = false) {
+    private renderMarkdownHtml(markdown: string, normalizeListIndent = false, pdfExport = false) {
         const prepared = normalizeListIndent ? this.normalizeMarkdownListIndent(markdown) : markdown;
-        return this.addLinkTargets(this.converter.makeHtml(prepared));
+        return this.addLinkTargets(this.converter.makeHtml(prepared), pdfExport);
     }
 
     private normalizeMarkdownListIndent(markdown: string) {
@@ -2654,18 +3116,18 @@ ${documentCss}
         return task ? task[1].toLowerCase() === 'x' : false;
     }
 
-    private addLinkTargets(html: string) {
-        return this.rewriteAttachmentImageSources(html).replace(/<a\s+([^>]*href=["'][^"']+["'][^>]*)>/gi, (match, attributes) => {
+    private addLinkTargets(html: string, pdfExport = false) {
+        return this.rewriteAttachmentImageSources(html, pdfExport).replace(/<a\s+([^>]*href=["'][^"']+["'][^>]*)>/gi, (match, attributes) => {
             if (/target=/i.test(attributes)) return match;
             return `<a ${attributes} target="_blank" rel="noopener noreferrer">`;
         });
     }
 
-    private rewriteAttachmentImageSources(html: string) {
+    private rewriteAttachmentImageSources(html: string, pdfExport = false) {
         return html.replace(/\ssrc=(["'])([^"']+)\1/gi, (match, quote, rawPath) => {
             const attachment = this.attachmentForMarkdownPath(rawPath);
             if (!attachment) return match;
-            const fileUrl = this.attachmentFileUrl(attachment.relativePath);
+            const fileUrl = this.attachmentFileUrl(attachment.relativePath, pdfExport);
             return fileUrl ? ` src=${quote}${fileUrl}${quote}` : match;
         });
     }
@@ -2686,14 +3148,101 @@ ${documentCss}
         }
     }
 
-    private attachmentFileUrl(relativePath: string) {
+    private attachmentFileUrl(relativePath: string, pdfExport = false) {
         const storagePath = this.storagePath();
         if (!storagePath || !relativePath) return '';
+        if (this.isAndroidPlatform()) {
+            const cache = pdfExport ? this.attachmentPdfDataUrlCache : this.attachmentDataUrlCache;
+            const cached = cache.get(relativePath);
+            if (cached) return cached;
+            const attachment = this.noteAttachments().find(item => item.relativePath === relativePath);
+            if (attachment && this.isImageAttachment(attachment)) {
+                void this.loadAndroidAttachmentDataUrl(attachment, !pdfExport, pdfExport);
+            }
+            return '';
+        }
         const params = new URLSearchParams({
             storagePath,
             relativePath
         });
         return `notedown-attachment://file?${params.toString()}`;
+    }
+
+    private async preloadAndroidAttachmentDataUrls(attachments = this.noteAttachments(), pdfExport = false) {
+        if (!this.isAndroidPlatform()) return;
+        for (const attachment of attachments) {
+            if (!this.isImageAttachment(attachment)) continue;
+            await this.loadAndroidAttachmentDataUrl(attachment, false, pdfExport);
+        }
+    }
+
+    private async loadAndroidAttachmentDataUrl(attachment: NoteAttachment, refreshAfterLoad = true, pdfExport = false) {
+        const relativePath = attachment?.relativePath || '';
+        const cache = pdfExport ? this.attachmentPdfDataUrlCache : this.attachmentDataUrlCache;
+        const loadingKey = `${pdfExport ? 'pdf' : 'preview'}:${relativePath}`;
+        if (!relativePath || cache.has(relativePath) || this.attachmentDataUrlLoading.has(loadingKey)) {
+            return cache.get(relativePath) || '';
+        }
+
+        const api = (window as any).notedown?.storage;
+        const storagePath = this.storagePath();
+        if (!api?.readFile || !storagePath) return '';
+
+        this.attachmentDataUrlLoading.add(loadingKey);
+        try {
+            const result = await api.readFile({ storagePath, relativePath });
+            const contentBase64 = String(result?.contentBase64 || '');
+            if (!result?.ok || !contentBase64) return '';
+            const mimeType = result.mimeType || attachment.mimeType || this.mimeTypeFromName(attachment.fileName || relativePath);
+            const rawDataUrl = `data:${mimeType || 'application/octet-stream'};base64,${contentBase64}`;
+            const dataUrl = pdfExport
+                ? await this.compactImageDataUrlForPdf(rawDataUrl, mimeType)
+                : rawDataUrl;
+            cache.set(relativePath, dataUrl);
+            if (refreshAfterLoad && !pdfExport) {
+                this.refreshPreview();
+                this.requestViewUpdate();
+            }
+            return dataUrl;
+        } catch (error) {
+            return '';
+        } finally {
+            this.attachmentDataUrlLoading.delete(loadingKey);
+        }
+    }
+
+    private async compactImageDataUrlForPdf(dataUrl: string, mimeType = '') {
+        const lowerMimeType = String(mimeType || '').toLowerCase();
+        if (!lowerMimeType.startsWith('image/') || lowerMimeType.includes('svg')) return dataUrl;
+
+        try {
+            const image = await this.loadImageElement(dataUrl);
+            const maxWidth = 1400;
+            const maxHeight = 2000;
+            const scale = Math.min(1, maxWidth / image.naturalWidth, maxHeight / image.naturalHeight);
+            if (!Number.isFinite(scale) || scale >= 0.98) return dataUrl;
+
+            const canvas = document.createElement('canvas');
+            canvas.width = Math.max(1, Math.round(image.naturalWidth * scale));
+            canvas.height = Math.max(1, Math.round(image.naturalHeight * scale));
+            const context = canvas.getContext('2d');
+            if (!context) return dataUrl;
+            context.fillStyle = '#ffffff';
+            context.fillRect(0, 0, canvas.width, canvas.height);
+            context.drawImage(image, 0, 0, canvas.width, canvas.height);
+            return canvas.toDataURL('image/jpeg', 0.86);
+        } catch (error) {
+            return dataUrl;
+        }
+    }
+
+    private loadImageElement(src: string): Promise<HTMLImageElement> {
+        return new Promise((resolve, reject) => {
+            const image = new Image();
+            image.onload = () => resolve(image);
+            image.onerror = () => reject(new Error('이미지를 PDF용으로 처리하지 못했습니다.'));
+            image.src = src;
+        });
     }
 
     private parseDocumentStyles(markdown: string): ParsedDocumentStyles {
@@ -2931,12 +3480,38 @@ ${documentCss}
             .replace(/'/g, '&#39;');
     }
 
-    private focusEditorSoon() {
+    private focusEditorSoon(position: 'default' | 'first-line-end' = 'default') {
         if (this.showSyncConflictViewer()) return;
         if (!this.hasSelectedNote) return;
+        if (this.isAndroidPlatform()) return;
         window.setTimeout(() => {
-            if (this.editor && this.viewMode !== 'preview') this.editor.focus();
+            if (this.viewMode === 'preview') return;
+            const offset = position === 'first-line-end' ? this.firstLineEndOffset() : null;
+            const textarea = this.plainTextEditorElement();
+            if (textarea) {
+                textarea.focus();
+                if (offset != null) textarea.setSelectionRange(offset, offset);
+                return;
+            }
+            if (this.editor && this.viewMode !== 'preview') {
+                if (offset != null) {
+                    const column = offset + 1;
+                    this.editor.setPosition?.({ lineNumber: 1, column });
+                    this.editor.revealPositionInCenterIfOutsideViewport?.({ lineNumber: 1, column });
+                }
+                this.editor.focus();
+            }
         }, 0);
+    }
+
+    private firstLineEndOffset() {
+        return (this.activeNote?.body || '').split('\n')[0]?.length || 0;
+    }
+
+    private shouldFocusFirstLineEnd(note: NoteItem) {
+        return note.status === 'draft'
+            && (note.title || '') === '새 노트'
+            && (note.body || '').startsWith('# 새 노트');
     }
 
     private defaultNotes(): NoteItem[] {
@@ -3039,6 +3614,7 @@ ${documentCss}
             workspaceName: note?.workspaceName,
             fileName: note?.fileName,
             relativePath: note?.relativePath,
+            titleManuallyEdited: Boolean(note?.titleManuallyEdited),
             attachments: Array.isArray(note?.attachments)
                 ? note.attachments.map((attachment: any) => this.normalizeAttachment(attachment, note?.relativePath || '')).filter((attachment: NoteAttachment) => attachment.relativePath && !attachment.deleted)
                 : [],

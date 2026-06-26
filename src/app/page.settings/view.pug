@@ -10,12 +10,12 @@ section(class="flex h-full min-h-0 flex-col bg-[#fbfbfa] text-stone-950 dark:bg-
     div(class="grid min-h-0 flex-1 lg:grid-cols-[260px_minmax(0,1fr)]")
         aside(class="hidden min-h-0 border-r border-stone-200 bg-[#f6f5f1] p-4 lg:flex lg:flex-col dark:border-zinc-800 dark:bg-zinc-900/45")
             nav(class="space-y-1")
-                button(type="button", *ngFor="let section of sections", [class]="sectionButtonClass(section.id)", (click)="setSection(section.id)") {{section.label}}
+                button(type="button", *ngFor="let section of visibleSections()", [class]="sectionButtonClass(section.id)", (click)="setSection(section.id)") {{section.label}}
 
         main(class="min-h-0 overflow-y-auto px-5 py-6 sm:px-8 lg:px-10")
             div(class="mx-auto w-full max-w-[920px]")
                 nav(class="mb-6 flex gap-1 overflow-x-auto rounded-lg bg-stone-100 p-1 lg:hidden dark:bg-zinc-900")
-                    button(type="button", *ngFor="let section of sections", [class]="sectionButtonClass(section.id)", (click)="setSection(section.id)") {{section.label}}
+                    button(type="button", *ngFor="let section of visibleSections()", [class]="sectionButtonClass(section.id)", (click)="setSection(section.id)") {{section.label}}
 
                 section(*ngIf="activeSection === 'general'", class="space-y-8")
                     div(class="border-b border-stone-200 pb-5 dark:border-zinc-800")
@@ -25,23 +25,23 @@ section(class="flex h-full min-h-0 flex-col bg-[#fbfbfa] text-stone-950 dark:bg-
                             h3(class="text-[15px] font-semibold text-stone-900 dark:text-zinc-100") 앱
                             div(class="flex items-center justify-between gap-4 border-y border-stone-200 py-4 dark:border-zinc-800")
                                 div
-                                    p(class="text-[13px] font-medium text-stone-700 dark:text-zinc-300") 자동 저장
-                                    p(class="mt-1 text-[12px] text-stone-400 dark:text-zinc-500") Markdown + metadata.json
-                                button(type="button", role="switch", [attr.aria-checked]="settings.autoSave", [class]="toggleTrackClass(settings.autoSave)", (click)="toggle('autoSave')")
-                                    span([class]="toggleKnobClass(settings.autoSave)")
-                            div(class="flex items-center justify-between gap-4 border-b border-stone-200 pb-4 dark:border-zinc-800")
-                                div
                                     p(class="text-[13px] font-medium text-stone-700 dark:text-zinc-300") 닫을 때 백그라운드 유지
                                     p(class="mt-1 text-[12px] text-stone-400 dark:text-zinc-500") 상태바/트레이에서 다시 열기
                                 button(type="button", role="switch", [attr.aria-checked]="settings.keepInBackgroundOnClose", [class]="toggleTrackClass(settings.keepInBackgroundOnClose)", (click)="toggle('keepInBackgroundOnClose')")
                                     span([class]="toggleKnobClass(settings.keepInBackgroundOnClose)")
+                            div(*ngIf="launchAtStartupSupported", class="flex items-center justify-between gap-4 border-b border-stone-200 pb-4 dark:border-zinc-800")
+                                div
+                                    p(class="text-[13px] font-medium text-stone-700 dark:text-zinc-300") 시작 프로그램 등록
+                                    p(class="mt-1 text-[12px] text-stone-400 dark:text-zinc-500") 로그인 후 백그라운드에서 실행
+                                button(type="button", role="switch", [attr.aria-checked]="settings.launchAtStartup", [class]="toggleTrackClass(settings.launchAtStartup)", (click)="toggle('launchAtStartup')")
+                                    span([class]="toggleKnobClass(settings.launchAtStartup)")
                         div(class="space-y-5 border-t border-stone-200 pt-6 dark:border-zinc-800")
                             h3(class="text-[15px] font-semibold text-stone-900 dark:text-zinc-100") 편집기
                             div
                                 p(class="mb-2 text-[13px] font-medium text-stone-700 dark:text-zinc-300") 기본 보기
                                 div(class="inline-flex rounded-lg bg-stone-100 p-1 dark:bg-zinc-800")
                                     button(type="button", [class]="optionClass(settings.editorMode === 'markdown')", (click)="setEditorMode('markdown')") 작성
-                                    button(type="button", [class]="optionClass(settings.editorMode === 'split')", (click)="setEditorMode('split')") 분할
+                                    button(*ngIf="shouldShowSplitEditorMode()", type="button", [class]="optionClass(settings.editorMode === 'split')", (click)="setEditorMode('split')") 분할
                                     button(type="button", [class]="optionClass(settings.editorMode === 'preview')", (click)="setEditorMode('preview')") 미리보기
                             label(class="grid max-w-xs gap-2")
                                 span(class="text-[13px] font-medium text-stone-700 dark:text-zinc-300") 탭 크기
@@ -55,7 +55,7 @@ section(class="flex h-full min-h-0 flex-col bg-[#fbfbfa] text-stone-950 dark:bg-
                                     button(type="button", [class]="optionClass(settings.theme === 'dark')", (click)="setTheme('dark')") Dark
                                     button(type="button", [class]="optionClass(settings.theme === 'system')", (click)="setTheme('system')") System
 
-                section(*ngIf="activeSection === 'storage'", class="space-y-6")
+                section(*ngIf="activeSection === 'storage' && !isAndroidPlatform()", class="space-y-6")
                     div(class="border-b border-stone-200 pb-5 dark:border-zinc-800")
                         div(class="flex flex-wrap items-center justify-between gap-3")
                             div
@@ -124,12 +124,6 @@ section(class="flex h-full min-h-0 flex-col bg-[#fbfbfa] text-stone-950 dark:bg-
                                 div(class="grid gap-2 sm:grid-cols-2 md:grid-cols-1")
                                     button(type="button", class="h-10 rounded-md border border-emerald-200 bg-white px-3 text-[13px] font-semibold text-emerald-700 shadow-sm transition hover:bg-emerald-50 disabled:cursor-not-allowed disabled:opacity-50 dark:border-emerald-500/30 dark:bg-zinc-900 dark:text-emerald-300 dark:hover:bg-emerald-500/10", (click)="testSyncServer()", [disabled]="syncBusy", [attr.aria-busy]="syncAction === 'health'") {{syncAction === 'health' ? '확인 중...' : '연결 확인'}}
                                     button(type="button", class="h-10 rounded-md border border-stone-200 bg-white px-3 text-[13px] font-semibold text-stone-700 shadow-sm transition hover:bg-stone-50 disabled:cursor-not-allowed disabled:opacity-50 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-200 dark:hover:bg-zinc-800", (click)="logoutSyncServer()", [disabled]="syncBusy") 로그아웃
-                        div(class="flex items-center justify-between gap-4 border-y border-stone-200 py-4 dark:border-zinc-800")
-                            div
-                                p(class="text-[13px] font-medium text-stone-700 dark:text-zinc-300") 저장 시 업로드
-                                p(class="mt-1 text-[12px] text-stone-400 dark:text-zinc-500") 개별 파일 저장 이벤트를 서버에 반영합니다.
-                            button(type="button", role="switch", [attr.aria-checked]="settings.syncAutoUpload", [class]="toggleTrackClass(settings.syncAutoUpload)", (click)="toggle('syncAutoUpload')")
-                                span([class]="toggleKnobClass(settings.syncAutoUpload)")
                         div(class="rounded-lg border border-stone-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-900")
                             div(class="grid gap-3 sm:grid-cols-5")
                                 div

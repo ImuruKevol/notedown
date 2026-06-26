@@ -3,6 +3,8 @@ const fs = require('node:fs/promises');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const { pathToFileURL } = require('node:url');
+const zlib = require('node:zlib');
+const { promisify } = require('node:util');
 
 const DEV_URL = process.env.NOTEDOWN_DEV_URL;
 const DIST_DIR = path.resolve(__dirname, '..', 'bundle', 'www');
@@ -11,6 +13,7 @@ const APP_ID = 'com.notedown.app';
 const APP_ICON_PATH = path.resolve(__dirname, '..', 'build-resources', 'icon.png');
 const TRAY_ICON_PATH = path.resolve(__dirname, '..', 'build-resources', 'tray-icon.png');
 const APP_PREFERENCES_FILE = 'app-preferences.json';
+const START_HIDDEN_ARG = '--notedown-start-hidden';
 let protocolRegistered = false;
 let attachmentProtocolRegistered = false;
 let mainWindow = null;
@@ -18,8 +21,10 @@ let tray = null;
 let isQuitting = false;
 let currentWorkspaceRevealTimer = null;
 const activeStorageRoots = new Set();
+const deflateRaw = promisify(zlib.deflateRaw);
 let appPreferences = {
-    keepInBackgroundOnClose: true
+    keepInBackgroundOnClose: true,
+    launchAtStartup: false
 };
 
 const METADATA_FILE = 'metadata.json';
@@ -28,6 +33,10 @@ const DEFAULT_SYNC_SERVER_URL = 'http://172.16.0.143:5500';
 const SYNC_REQUEST_TIMEOUT_MS = 15000;
 const IMPORTED_WORKSPACE_ID = '_imported';
 const UNFILED_WORKSPACE_ID = 'unfiled';
+
+function isDeletedFlag(value) {
+    return value === true || value === 'true';
+}
 
 function expandHome(filePath) {
     if (!filePath) return '';
@@ -38,8 +47,80 @@ function expandHome(filePath) {
 
 function normalizeAppPreferences(preferences = {}) {
     return {
-        keepInBackgroundOnClose: preferences.keepInBackgroundOnClose !== false
+        keepInBackgroundOnClose: preferences.keepInBackgroundOnClose !== false,
+        launchAtStartup: preferences.launchAtStartup === true
     };
+}
+
+function supportsLaunchAtStartup() {
+    return process.platform === 'darwin' || process.platform === 'win32';
+}
+
+function loginItemSettingsOptions() {
+    if (process.platform !== 'win32') return {};
+    return {
+        path: process.execPath,
+        args: [START_HIDDEN_ARG]
+    };
+}
+
+function loginItemOptions(openAtLogin) {
+    const options = { openAtLogin: Boolean(openAtLogin) };
+    if (process.platform === 'darwin') {
+        options.openAsHidden = true;
+    } else if (process.platform === 'win32') {
+        options.path = process.execPath;
+        options.args = [START_HIDDEN_ARG];
+        options.name = APP_NAME;
+    }
+    return options;
+}
+
+function launchAtStartupState() {
+    if (!supportsLaunchAtStartup()) {
+        return { launchAtStartupSupported: false, launchAtStartup: false };
+    }
+
+    try {
+        const settings = app.getLoginItemSettings(loginItemSettingsOptions());
+        return {
+            launchAtStartupSupported: true,
+            launchAtStartup: Boolean(settings.openAtLogin)
+        };
+    } catch (error) {
+        return {
+            launchAtStartupSupported: false,
+            launchAtStartup: false,
+            error: error instanceof Error ? error.message : '시작 프로그램 상태를 확인하지 못했습니다.'
+        };
+    }
+}
+
+function applyLaunchAtStartup(openAtLogin) {
+    if (!supportsLaunchAtStartup()) return launchAtStartupState();
+
+    try {
+        app.setLoginItemSettings(loginItemOptions(openAtLogin));
+        return launchAtStartupState();
+    } catch (error) {
+        return {
+            launchAtStartupSupported: false,
+            launchAtStartup: false,
+            error: error instanceof Error ? error.message : '시작 프로그램 설정을 변경하지 못했습니다.'
+        };
+    }
+}
+
+function launchedAsHiddenLoginItem() {
+    if (process.argv.includes(START_HIDDEN_ARG)) return true;
+    if (process.platform !== 'darwin') return false;
+
+    try {
+        const settings = app.getLoginItemSettings();
+        return Boolean(settings.wasOpenedAsHidden || settings.wasOpenedAtLogin);
+    } catch (error) {
+        return false;
+    }
 }
 
 function appPreferencesPath() {
@@ -53,15 +134,20 @@ async function readAppPreferences() {
     } catch (error) {
         appPreferences = normalizeAppPreferences(appPreferences);
     }
+    appPreferences.launchAtStartup = launchAtStartupState().launchAtStartup;
     return appPreferences;
 }
 
 async function writeAppPreferences(preferences = {}) {
     appPreferences = normalizeAppPreferences({ ...appPreferences, ...preferences });
+    const launchState = typeof preferences.launchAtStartup === 'boolean'
+        ? applyLaunchAtStartup(preferences.launchAtStartup)
+        : launchAtStartupState();
+    appPreferences.launchAtStartup = launchState.launchAtStartup;
     await fs.mkdir(app.getPath('userData'), { recursive: true });
     await fs.writeFile(appPreferencesPath(), `${JSON.stringify(appPreferences, null, 2)}\n`, 'utf8');
     syncTrayState();
-    return appPreferences;
+    return { ...appPreferences, ...launchState };
 }
 
 function defaultStoragePath() {
@@ -148,6 +234,11 @@ function normalizeRelativePath(relativePath) {
     if (parts.some(part => part === '.' || part === '..')) throw new Error('허용되지 않는 파일 경로입니다.');
     if (parts[0] === METADATA_FILE || parts[0] === SYNC_STATE_FILE) throw new Error('동기화할 수 없는 시스템 파일입니다.');
     return parts.join('/');
+}
+
+function isSystemRelativePath(relativePath) {
+    const firstPart = toPosixPath(relativePath).replace(/^\/+/g, '').split('/').filter(Boolean)[0] || '';
+    return firstPart === METADATA_FILE || firstPart === SYNC_STATE_FILE;
 }
 
 function isAttachmentRelativePath(relativePath) {
@@ -319,24 +410,26 @@ async function writeSyncStateFromManifest(storagePath, manifest, previousState =
     const files = {};
     for (const file of manifest.files || []) {
         if (!file?.relativePath) continue;
+        if (isSystemRelativePath(file.relativePath)) continue;
         const relativePath = normalizeRelativePath(file.relativePath);
         files[relativePath] = {
             lastKnownRevision: Number(file.revision) || 0,
             contentHash: file.contentHash || null,
             updatedAtMs: Number(file.clientUpdatedAtMs) || null,
-            deleted: Boolean(file.deleted)
+            deleted: isDeletedFlag(file.deleted)
         };
     }
 
     const attachments = {};
     for (const file of manifest.attachments || []) {
         if (!file?.relativePath) continue;
+        if (isSystemRelativePath(file.relativePath)) continue;
         const relativePath = normalizeRelativePath(file.relativePath);
         attachments[relativePath] = {
             lastKnownRevision: Number(file.revision) || 0,
             contentHash: file.contentHash || null,
             updatedAtMs: Number(file.clientUpdatedAtMs) || null,
-            deleted: Boolean(file.deleted)
+            deleted: isDeletedFlag(file.deleted)
         };
     }
 
@@ -355,6 +448,122 @@ async function writeSyncStateFromManifest(storagePath, manifest, previousState =
 
 function sha256(buffer) {
     return crypto.createHash('sha256').update(buffer).digest('hex');
+}
+
+const CRC32_TABLE = Array.from({ length: 256 }, (_value, index) => {
+    let crc = index;
+    for (let bit = 0; bit < 8; bit++) {
+        crc = (crc & 1) ? (0xedb88320 ^ (crc >>> 1)) : (crc >>> 1);
+    }
+    return crc >>> 0;
+});
+
+function crc32(buffer) {
+    let crc = 0xffffffff;
+    for (const byte of buffer) {
+        crc = CRC32_TABLE[(crc ^ byte) & 0xff] ^ (crc >>> 8);
+    }
+    return (crc ^ 0xffffffff) >>> 0;
+}
+
+function dosDateTime(date = new Date()) {
+    const year = Math.max(1980, date.getFullYear());
+    return {
+        time: (date.getHours() << 11) | (date.getMinutes() << 5) | Math.floor(date.getSeconds() / 2),
+        date: ((year - 1980) << 9) | ((date.getMonth() + 1) << 5) | date.getDate()
+    };
+}
+
+function zipEntryName(value, fallback = 'file') {
+    const normalized = toPosixPath(value || fallback)
+        .replace(/^\/+/g, '')
+        .split('/')
+        .filter(part => part && part !== '.' && part !== '..')
+        .join('/');
+    return normalized || fallback;
+}
+
+function uniqueZipEntryName(usedNames, entryName) {
+    const normalized = zipEntryName(entryName);
+    if (!usedNames.has(normalized)) {
+        usedNames.add(normalized);
+        return normalized;
+    }
+
+    const ext = path.posix.extname(normalized);
+    const base = normalized.slice(0, normalized.length - ext.length);
+    let suffix = 2;
+    while (usedNames.has(`${base}-${suffix}${ext}`)) suffix++;
+    const next = `${base}-${suffix}${ext}`;
+    usedNames.add(next);
+    return next;
+}
+
+async function createZipBuffer(entries = []) {
+    const localParts = [];
+    const centralParts = [];
+    let offset = 0;
+
+    for (const entry of entries) {
+        const data = Buffer.isBuffer(entry.data) ? entry.data : Buffer.from(entry.data || '');
+        const compressedCandidate = await deflateRaw(data, { level: 9 });
+        const useDeflate = compressedCandidate.length < data.length;
+        const compressedData = useDeflate ? compressedCandidate : data;
+        const compression = useDeflate ? 8 : 0;
+        const nameBuffer = Buffer.from(zipEntryName(entry.name), 'utf8');
+        const { time, date } = dosDateTime(entry.date || new Date());
+        const checksum = crc32(data);
+
+        const localHeader = Buffer.alloc(30);
+        localHeader.writeUInt32LE(0x04034b50, 0);
+        localHeader.writeUInt16LE(20, 4);
+        localHeader.writeUInt16LE(0x0800, 6);
+        localHeader.writeUInt16LE(compression, 8);
+        localHeader.writeUInt16LE(time, 10);
+        localHeader.writeUInt16LE(date, 12);
+        localHeader.writeUInt32LE(checksum, 14);
+        localHeader.writeUInt32LE(compressedData.length, 18);
+        localHeader.writeUInt32LE(data.length, 22);
+        localHeader.writeUInt16LE(nameBuffer.length, 26);
+        localHeader.writeUInt16LE(0, 28);
+
+        localParts.push(localHeader, nameBuffer, compressedData);
+
+        const centralHeader = Buffer.alloc(46);
+        centralHeader.writeUInt32LE(0x02014b50, 0);
+        centralHeader.writeUInt16LE(20, 4);
+        centralHeader.writeUInt16LE(20, 6);
+        centralHeader.writeUInt16LE(0x0800, 8);
+        centralHeader.writeUInt16LE(compression, 10);
+        centralHeader.writeUInt16LE(time, 12);
+        centralHeader.writeUInt16LE(date, 14);
+        centralHeader.writeUInt32LE(checksum, 16);
+        centralHeader.writeUInt32LE(compressedData.length, 20);
+        centralHeader.writeUInt32LE(data.length, 24);
+        centralHeader.writeUInt16LE(nameBuffer.length, 28);
+        centralHeader.writeUInt16LE(0, 30);
+        centralHeader.writeUInt16LE(0, 32);
+        centralHeader.writeUInt16LE(0, 34);
+        centralHeader.writeUInt16LE(0, 36);
+        centralHeader.writeUInt32LE(0, 38);
+        centralHeader.writeUInt32LE(offset, 42);
+        centralParts.push(centralHeader, nameBuffer);
+
+        offset += localHeader.length + nameBuffer.length + compressedData.length;
+    }
+
+    const centralDirectory = Buffer.concat(centralParts);
+    const endRecord = Buffer.alloc(22);
+    endRecord.writeUInt32LE(0x06054b50, 0);
+    endRecord.writeUInt16LE(0, 4);
+    endRecord.writeUInt16LE(0, 6);
+    endRecord.writeUInt16LE(entries.length, 8);
+    endRecord.writeUInt16LE(entries.length, 10);
+    endRecord.writeUInt32LE(centralDirectory.length, 12);
+    endRecord.writeUInt32LE(offset, 16);
+    endRecord.writeUInt16LE(0, 20);
+
+    return Buffer.concat([...localParts, centralDirectory, endRecord]);
 }
 
 async function removeEmptyParents(dirPath, stopPath) {
@@ -431,7 +640,7 @@ function normalizeAttachmentMetadata(attachment = {}, noteRelativePath = '') {
         size: Number.isFinite(attachment.size) ? Number(attachment.size) : null,
         contentHash: attachment.contentHash || null,
         updatedAtMs: Number.isFinite(attachment.updatedAtMs) ? Number(attachment.updatedAtMs) : null,
-        deleted: Boolean(attachment.deleted)
+        deleted: isDeletedFlag(attachment.deleted)
     };
 }
 
@@ -844,17 +1053,35 @@ function syncError(error, fallback = '동기화 작업 중 오류가 발생했�
     };
 }
 
+function planItemRelativePath(item = {}) {
+    return item?.relativePath
+        || item?.file?.relativePath
+        || item?.serverFile?.relativePath
+        || item?.serverAttachment?.relativePath
+        || item?.attachment?.relativePath
+        || '';
+}
+
+function isSystemPlanItem(item) {
+    return isSystemRelativePath(planItemRelativePath(item));
+}
+
+function nonSystemPlanItems(items = []) {
+    if (!Array.isArray(items)) return [];
+    return items.filter(item => !isSystemPlanItem(item));
+}
+
 function summarizePlan(plan = {}) {
     return {
-        uploadFiles: plan.uploadFiles?.length || 0,
-        downloadFiles: plan.downloadFiles?.length || 0,
-        deleteServerFiles: plan.deleteServerFiles?.length || 0,
-        deleteLocalFiles: plan.deleteLocalFiles?.length || 0,
-        uploadAttachments: plan.uploadAttachments?.length || 0,
-        downloadAttachments: plan.downloadAttachments?.length || 0,
-        deleteServerAttachments: plan.deleteServerAttachments?.length || 0,
-        deleteLocalAttachments: plan.deleteLocalAttachments?.length || 0,
-        conflicts: plan.conflicts?.length || 0
+        uploadFiles: nonSystemPlanItems(plan.uploadFiles).length,
+        downloadFiles: nonSystemPlanItems(plan.downloadFiles).length,
+        deleteServerFiles: nonSystemPlanItems(plan.deleteServerFiles).length,
+        deleteLocalFiles: nonSystemPlanItems(plan.deleteLocalFiles).length,
+        uploadAttachments: nonSystemPlanItems(plan.uploadAttachments).length,
+        downloadAttachments: nonSystemPlanItems(plan.downloadAttachments).length,
+        deleteServerAttachments: nonSystemPlanItems(plan.deleteServerAttachments).length,
+        deleteLocalAttachments: nonSystemPlanItems(plan.deleteLocalAttachments).length,
+        conflicts: nonSystemPlanItems(plan.conflicts).length
     };
 }
 
@@ -872,11 +1099,59 @@ function clonePlan(plan = {}) {
     };
 }
 
+function filterSyncPlan(plan = {}) {
+    const next = clonePlan(plan);
+    next.uploadFiles = nonSystemPlanItems(next.uploadFiles);
+    next.downloadFiles = nonSystemPlanItems(next.downloadFiles);
+    next.deleteServerFiles = nonSystemPlanItems(next.deleteServerFiles);
+    next.deleteLocalFiles = nonSystemPlanItems(next.deleteLocalFiles);
+    next.uploadAttachments = nonSystemPlanItems(next.uploadAttachments);
+    next.downloadAttachments = nonSystemPlanItems(next.downloadAttachments);
+    next.deleteServerAttachments = nonSystemPlanItems(next.deleteServerAttachments);
+    next.deleteLocalAttachments = nonSystemPlanItems(next.deleteLocalAttachments);
+    next.conflicts = nonSystemPlanItems(next.conflicts);
+    return next;
+}
+
+function hasSyncHistory(syncState = {}) {
+    if (Number(syncState.serverRevision) > 0 || Number(syncState.metadataRevision) > 0) return true;
+    const fileStates = Object.values(syncState.files || {});
+    const attachmentStates = Object.values(syncState.attachments || {});
+    return fileStates.concat(attachmentStates).some(state => Number(state?.lastKnownRevision) > 0);
+}
+
+function serverDeleteLastKnownRevision(syncState = {}, item = {}, attachment = false) {
+    const itemRevision = Number(item?.lastKnownRevision)
+        || Number(item?.file?.lastKnownRevision)
+        || Number(item?.attachment?.lastKnownRevision)
+        || Number(item?.clientFile?.lastKnownRevision)
+        || Number(item?.clientAttachment?.lastKnownRevision)
+        || 0;
+    if (itemRevision > 0) return itemRevision;
+
+    const relativePath = planItemRelativePath(item);
+    if (!relativePath || isSystemRelativePath(relativePath)) return 0;
+    try {
+        const state = (attachment ? syncState.attachments : syncState.files)?.[normalizeRelativePath(relativePath)] || {};
+        return Number(state.lastKnownRevision) || 0;
+    } catch (error) {
+        return 0;
+    }
+}
+
+function filterUnsafeServerDeletes(plan = {}, syncState = {}) {
+    const next = filterSyncPlan(plan);
+    next.deleteServerFiles = next.deleteServerFiles.filter(item => serverDeleteLastKnownRevision(syncState, item, false) > 0);
+    next.deleteServerAttachments = next.deleteServerAttachments.filter(item => serverDeleteLastKnownRevision(syncState, item, true) > 0);
+    return next;
+}
+
 function planIncludesPath(plan, relativePath) {
     const groups = ['uploadFiles', 'downloadFiles', 'deleteServerFiles', 'deleteLocalFiles', 'conflicts'];
     return groups.some(group => (plan[group] || []).some(item => {
-        if (!item?.relativePath) return false;
-        return normalizeRelativePath(item.relativePath) === relativePath;
+        const itemPath = planItemRelativePath(item);
+        if (!itemPath || isSystemRelativePath(itemPath)) return false;
+        return normalizeRelativePath(itemPath) === relativePath;
     }));
 }
 
@@ -884,6 +1159,7 @@ function mapManifestFiles(manifest = {}) {
     const files = new Map();
     for (const file of manifest.files || []) {
         if (!file?.relativePath) continue;
+        if (isSystemRelativePath(file.relativePath)) continue;
         files.set(normalizeRelativePath(file.relativePath), file);
     }
     return files;
@@ -956,7 +1232,7 @@ function isLocalDirty(localInfo) {
 async function reconcilePlanWithServerMetadata(storagePath, localMetadata, syncState, response) {
     const serverMetadata = response.metadata?.serverMetadata;
     const metadataStatus = response.metadata?.status;
-    const plan = clonePlan(response.plan);
+    const plan = filterSyncPlan(response.plan);
     if (!serverMetadata || metadataStatus === 'same' || metadataStatus === 'server_empty') return plan;
 
     const serverFiles = mapManifestFiles(response.manifest);
@@ -968,7 +1244,7 @@ async function reconcilePlanWithServerMetadata(storagePath, localMetadata, syncS
         if (planIncludesPath(plan, relativePath)) continue;
 
         const serverFile = serverFiles.get(relativePath);
-        if (!serverFile || serverFile.deleted) continue;
+        if (!serverFile || isDeletedFlag(serverFile.deleted)) continue;
 
         const localInfo = await localFileSyncInfo(storagePath, syncState, relativePath);
         const localNote = localNotes.get(relativePath);
@@ -1124,6 +1400,7 @@ function removeMetadataNote(metadata, relativePath) {
 
 async function buildKnownFiles(storagePath, metadata, syncState) {
     const files = [];
+    const activePaths = new Set();
     for (const note of metadata.notes || []) {
         if (!note?.relativePath) continue;
         const relativePath = normalizeRelativePath(note.relativePath);
@@ -1138,18 +1415,34 @@ async function buildKnownFiles(storagePath, metadata, syncState) {
                 lastKnownRevision: Number(state.lastKnownRevision) || 0,
                 updatedAtMs: Number(note.updatedAtMs) || Math.round(stat.mtimeMs)
             });
+            activePaths.add(relativePath);
         } catch (error) {
             // Missing local files are represented by metadata differences in the plan response.
         }
     }
+
+    for (const [rawRelativePath, state] of Object.entries(syncState.files || {})) {
+        if (!rawRelativePath || isDeletedFlag(state?.deleted)) continue;
+        const relativePath = normalizeRelativePath(rawRelativePath);
+        const lastKnownRevision = Number(state?.lastKnownRevision) || 0;
+        if (lastKnownRevision <= 0 || activePaths.has(relativePath) || isSystemRelativePath(relativePath)) continue;
+        try {
+            const { absolutePath } = resolveStorageFile(storagePath, relativePath);
+            await fs.stat(absolutePath);
+        } catch (error) {
+            files.push({ relativePath, deleted: true, lastKnownRevision });
+        }
+    }
+
     return files;
 }
 
 async function buildKnownAttachments(storagePath, metadata, syncState) {
     const attachments = [];
+    const activePaths = new Set();
     for (const note of metadata.notes || []) {
         for (const attachment of note.attachments || []) {
-            if (!attachment?.relativePath || attachment.deleted) continue;
+            if (!attachment?.relativePath || isDeletedFlag(attachment.deleted)) continue;
             const relativePath = normalizeRelativePath(attachment.relativePath);
             try {
                 const { absolutePath } = resolveStorageFile(storagePath, relativePath);
@@ -1162,11 +1455,26 @@ async function buildKnownAttachments(storagePath, metadata, syncState) {
                     lastKnownRevision: Number(state.lastKnownRevision) || 0,
                     updatedAtMs: Number(attachment.updatedAtMs) || Math.round(stat.mtimeMs)
                 });
+                activePaths.add(relativePath);
             } catch (error) {
                 // Missing local attachment bytes are handled through metadata differences and conflicts.
             }
         }
     }
+
+    for (const [rawRelativePath, state] of Object.entries(syncState.attachments || {})) {
+        if (!rawRelativePath || isDeletedFlag(state?.deleted)) continue;
+        const relativePath = normalizeRelativePath(rawRelativePath);
+        const lastKnownRevision = Number(state?.lastKnownRevision) || 0;
+        if (lastKnownRevision <= 0 || activePaths.has(relativePath) || isSystemRelativePath(relativePath)) continue;
+        try {
+            const { absolutePath } = resolveStorageFile(storagePath, relativePath);
+            await fs.stat(absolutePath);
+        } catch (error) {
+            attachments.push({ relativePath, deleted: true, lastKnownRevision });
+        }
+    }
+
     return attachments;
 }
 
@@ -1174,8 +1482,9 @@ async function createSyncPlan(args = {}) {
     const { storagePath, serverUrl, token, clientId } = syncConfig(args);
     const metadata = await ensureMetadata(storagePath);
     const syncState = await readSyncState(storagePath);
-    const knownFiles = await buildKnownFiles(storagePath, metadata, syncState);
-    const knownAttachments = await buildKnownAttachments(storagePath, metadata, syncState);
+    const syncHistoryExists = hasSyncHistory(syncState);
+    const knownFiles = syncHistoryExists ? await buildKnownFiles(storagePath, metadata, syncState) : [];
+    const knownAttachments = syncHistoryExists ? await buildKnownAttachments(storagePath, metadata, syncState) : [];
 
     const response = await syncRequest(serverUrl, '/api/sync/plan', {
         token,
@@ -1190,7 +1499,10 @@ async function createSyncPlan(args = {}) {
             }
         }
     });
-    response.plan = await reconcilePlanWithServerMetadata(storagePath, metadata, syncState, response);
+    response.plan = filterUnsafeServerDeletes(
+        await reconcilePlanWithServerMetadata(storagePath, metadata, syncState, response),
+        syncState
+    );
 
     return {
         ok: true,
@@ -1207,14 +1519,18 @@ async function uploadLocalFile(args = {}, relativePathOverride = '') {
     const note = findMetadataNote(metadata, relativePathOverride || args.relativePath, payloadNote);
     const relativePath = normalizeRelativePath(relativePathOverride || args.relativePath || note?.relativePath || relativePathForNote(payloadNote));
     const fileState = syncState.files?.[relativePath] || {};
-    const deleted = Boolean(args.deleted);
+    const deleted = isDeletedFlag(args.deleted);
+    const lastKnownRevision = Number(args.lastKnownRevision) || Number(fileState.lastKnownRevision) || 0;
+    if (deleted && lastKnownRevision <= 0) {
+        throw new Error('서버 파일 삭제에는 lastKnownRevision이 필요합니다.');
+    }
     const body = {
         clientId,
         baseRevision: Number(syncState.serverRevision) || 0,
         relativePath,
-        deleted,
-        lastKnownRevision: Number(args.lastKnownRevision) || Number(fileState.lastKnownRevision) || 0
+        lastKnownRevision
     };
+    if (deleted) body.deleted = true;
 
     if (note) {
         body.note = notePayload(note, relativePath);
@@ -1279,15 +1595,19 @@ async function uploadLocalAttachment(args = {}, item = {}) {
     const note = findMetadataNoteByAttachment(metadata, attachment || item) || findMetadataNote(metadata, item.noteRelativePath || attachment?.noteRelativePath || args.noteRelativePath, item.note || args.note);
     const noteRelativePath = normalizeRelativePath(item.noteRelativePath || attachment?.noteRelativePath || note?.relativePath || args.noteRelativePath);
     const state = syncState.attachments?.[relativePath] || {};
-    const deleted = Boolean(args.deleted || item.deleted);
+    const deleted = isDeletedFlag(args.deleted) || isDeletedFlag(item.deleted);
+    const lastKnownRevision = Number(args.lastKnownRevision) || Number(item.lastKnownRevision) || Number(state.lastKnownRevision) || 0;
+    if (deleted && lastKnownRevision <= 0) {
+        throw new Error('서버 첨부 파일 삭제에는 lastKnownRevision이 필요합니다.');
+    }
     const body = {
         clientId,
         baseRevision: Number(syncState.serverRevision) || 0,
         relativePath,
         noteRelativePath,
-        deleted,
-        lastKnownRevision: Number(args.lastKnownRevision) || Number(item.lastKnownRevision) || Number(state.lastKnownRevision) || 0
+        lastKnownRevision
     };
+    if (deleted) body.deleted = true;
 
     if (attachment) {
         body.attachment = normalizeAttachmentMetadata({ ...attachment, noteRelativePath }, noteRelativePath);
@@ -1343,12 +1663,13 @@ async function uploadLocalNoteWithAttachments(args = {}) {
     const noteResult = await uploadLocalFile(args);
     const note = args.note || null;
     const attachments = Array.isArray(note?.attachments) ? note.attachments : [];
+    const deleting = isDeletedFlag(args.deleted);
     const uploadedAttachments = [];
     const attachmentConflicts = [];
 
-    if (!args.deleted && noteResult.status !== 'conflict') {
+    if (!deleting && noteResult.status !== 'conflict') {
         for (const attachment of attachments) {
-            if (!attachment?.relativePath || attachment.deleted) continue;
+            if (!attachment?.relativePath || isDeletedFlag(attachment.deleted)) continue;
             const result = await uploadLocalAttachment(args, {
                 ...attachment,
                 attachment,
@@ -1362,7 +1683,7 @@ async function uploadLocalNoteWithAttachments(args = {}) {
         }
     }
 
-    if (args.deleted) {
+    if (deleting) {
         for (const attachment of attachments) {
             if (!attachment?.relativePath) continue;
             const result = await uploadLocalAttachment({ ...args, deleted: true }, {
@@ -1391,13 +1712,13 @@ function encodeRelativePathForUrl(relativePath) {
 }
 
 function decodeFilePayloadContent(payload = {}) {
-    if (payload.deleted) return '';
+    if (isDeletedFlag(payload.deleted)) return '';
     if (payload.contentEncoding === 'base64') return Buffer.from(payload.content || '', 'base64').toString('utf8');
     return String(payload.content || '');
 }
 
 function decodeBinaryPayloadContent(payload = {}) {
-    if (payload.deleted) return Buffer.alloc(0);
+    if (isDeletedFlag(payload.deleted)) return Buffer.alloc(0);
     if (payload.contentEncoding === 'base64') return Buffer.from(payload.content || '', 'base64');
     return Buffer.from(String(payload.content || ''), 'utf8');
 }
@@ -1408,7 +1729,7 @@ async function downloadServerAttachment(args = {}, item, metadata) {
     const payload = await syncRequest(serverUrl, `/api/attachments/${encodeRelativePathForUrl(relativePath)}`, { token });
     const { absolutePath } = resolveStorageFile(storagePath, relativePath);
 
-    if (payload.deleted) {
+    if (isDeletedFlag(payload.deleted)) {
         await fs.rm(absolutePath, { force: true });
         await removeEmptyParents(path.dirname(absolutePath), path.resolve(storagePath));
         removeMetadataAttachment(metadata, relativePath);
@@ -1451,7 +1772,7 @@ async function downloadServerFile(args = {}, item, metadata) {
     const payload = await syncRequest(serverUrl, `/api/files/${encodeRelativePathForUrl(relativePath)}`, { token });
     const { absolutePath } = resolveStorageFile(storagePath, relativePath);
 
-    if (payload.deleted) {
+    if (isDeletedFlag(payload.deleted)) {
         await fs.rm(absolutePath, { force: true });
         await removeEmptyParents(path.dirname(absolutePath), path.resolve(storagePath));
         removeMetadataNote(metadata, relativePath);
@@ -1508,6 +1829,14 @@ async function deleteLocalAttachment(storagePath, item, metadata) {
 
 async function readSyncConflictFile(args = {}) {
     const { storagePath, serverUrl, token } = syncConfig(args);
+    if (isSystemRelativePath(args.relativePath)) {
+        return {
+            ok: false,
+            relativePath: String(args.relativePath || ''),
+            localExists: false,
+            error: '시스템 파일은 충돌 비교 대상이 아닙니다.'
+        };
+    }
     const relativePath = normalizeRelativePath(args.relativePath);
     const isAttachment = args.type === 'attachment' || relativePath.includes('/.attachments/');
     const metadata = await ensureMetadata(storagePath);
@@ -1638,6 +1967,7 @@ async function resolveSyncConflict(args = {}) {
 
 async function runFullSync(args = {}) {
     const { storagePath } = syncConfig(args);
+    const syncState = await readSyncState(storagePath);
     const planResponse = await createSyncPlan(args);
     const plan = planResponse.plan || {};
 
@@ -1711,7 +2041,9 @@ async function runFullSync(args = {}) {
     }
 
     for (const item of plan.deleteServerFiles || []) {
-        const result = await uploadLocalFile({ ...args, deleted: true }, item.relativePath);
+        const lastKnownRevision = serverDeleteLastKnownRevision(syncState, item, false);
+        if (lastKnownRevision <= 0) continue;
+        const result = await uploadLocalFile({ ...args, deleted: true, lastKnownRevision }, item.relativePath);
         latestManifest = result.manifest || latestManifest;
         if (result.status === 'conflict') {
             operations.conflicts.push(result.file);
@@ -1721,7 +2053,9 @@ async function runFullSync(args = {}) {
     }
 
     for (const item of plan.deleteServerAttachments || []) {
-        const result = await uploadLocalAttachment({ ...args, deleted: true }, item);
+        const lastKnownRevision = serverDeleteLastKnownRevision(syncState, item, true);
+        if (lastKnownRevision <= 0) continue;
+        const result = await uploadLocalAttachment({ ...args, deleted: true, lastKnownRevision }, item);
         latestManifest = result.manifest || latestManifest;
         if (result.status === 'conflict') {
             operations.conflicts.push(result.attachment || result.file);
@@ -1796,6 +2130,17 @@ function registerStorageHandlers() {
     ipcMain.handle('notedown:storage:save-notes', async (_event, args = {}) => {
         const storagePath = rememberStoragePath(args.storagePath);
         return saveNotesToStorage(storagePath, args.notes || []);
+    });
+
+    ipcMain.handle('notedown:storage:export-folder-zip', async (event, args = {}) => {
+        try {
+            return await exportFolderZip(event, args);
+        } catch (error) {
+            return {
+                ok: false,
+                error: error instanceof Error ? error.message : '폴더 ZIP 내보내기에 실패했습니다.'
+            };
+        }
     });
 
     ipcMain.handle('notedown:storage:save-attachment', async (_event, args = {}) => {
@@ -1918,21 +2263,7 @@ function registerSyncHandlers() {
     });
 }
 
-async function saveNotePdf(args = {}) {
-    const title = String(args.title || '제목 없음');
-    const html = String(args.html || '');
-    const parent = BrowserWindow.getFocusedWindow() || undefined;
-    const result = await dialog.showSaveDialog(parent, {
-        title: 'PDF로 저장',
-        defaultPath: path.join(app.getPath('documents'), safeExportFileName(title, 'pdf')),
-        filters: [{ name: 'PDF', extensions: ['pdf'] }]
-    });
-
-    if (result.canceled || !result.filePath) return { ok: false, canceled: true };
-
-    const targetPath = result.filePath.toLowerCase().endsWith('.pdf')
-        ? result.filePath
-        : `${result.filePath}.pdf`;
+async function renderPdfBuffer(html) {
     const pdfWindow = new BrowserWindow({
         show: false,
         webPreferences: {
@@ -1944,21 +2275,209 @@ async function saveNotePdf(args = {}) {
 
     try {
         await pdfWindow.loadURL(`data:text/html;charset=UTF-8,${encodeURIComponent(html)}`);
-        const pdfBuffer = await pdfWindow.webContents.printToPDF({
+        return await pdfWindow.webContents.printToPDF({
             printBackground: true,
             pageSize: 'A4',
             preferCSSPageSize: true,
             margins: { marginType: 'none' }
         });
-        await fs.writeFile(targetPath, pdfBuffer);
-        return { ok: true, filePath: targetPath };
+    } finally {
+        if (!pdfWindow.isDestroyed()) pdfWindow.destroy();
+    }
+}
+
+function normalizePdfExportAttachments(attachments = []) {
+    if (!Array.isArray(attachments)) return [];
+    const normalized = [];
+    for (const attachment of attachments) {
+        try {
+            const relativePath = normalizeRelativePath(attachment?.relativePath || '');
+            normalized.push({
+                fileName: safeAttachmentFileName(attachment?.fileName || path.posix.basename(relativePath)),
+                relativePath,
+                mimeType: attachment?.mimeType || mimeTypeForFileName(relativePath),
+                size: Number.isFinite(Number(attachment?.size)) ? Number(attachment.size) : null
+            });
+        } catch (error) {
+            // Ignore invalid attachment paths in export payloads.
+        }
+    }
+    return normalized;
+}
+
+async function pdfAttachmentZipEntries(storagePath, attachments = [], usedNames = new Set()) {
+    const entries = [];
+    const skippedAttachments = [];
+
+    for (const attachment of normalizePdfExportAttachments(attachments)) {
+        try {
+            const { relativePath, absolutePath } = resolveStorageFile(storagePath, attachment.relativePath);
+            const data = await fs.readFile(absolutePath);
+            entries.push({
+                name: uniqueZipEntryName(usedNames, path.posix.join('attachments', relativePath)),
+                data,
+                date: attachment.updatedAtMs ? new Date(Number(attachment.updatedAtMs)) : new Date()
+            });
+        } catch (error) {
+            skippedAttachments.push({
+                relativePath: attachment.relativePath,
+                fileName: attachment.fileName,
+                error: error instanceof Error ? error.message : '첨부 파일을 읽지 못했습니다.'
+            });
+        }
+    }
+
+    return { entries, skippedAttachments };
+}
+
+function folderExportEntryName(rootName, folderId, relativePath) {
+    const safeRelativePath = normalizeRelativePath(relativePath);
+    const parts = safeRelativePath.split('/');
+    const innerPath = parts[0] === folderId ? parts.slice(1).join('/') : safeRelativePath;
+    return path.posix.join(rootName, innerPath || path.posix.basename(safeRelativePath));
+}
+
+async function folderExportNotes(storagePath, args = {}) {
+    if (Array.isArray(args.notes) && args.notes.length > 0) return args.notes;
+
+    let metadata = await readMetadata(storagePath);
+    if (!metadata) {
+        const generated = await generateMetadata(storagePath, { importDeepMarkdown: false });
+        metadata = generated.metadata;
+    }
+    return Promise.all((metadata.notes || []).map(note => readMarkdownNote(storagePath, note)));
+}
+
+async function folderZipEntries(storagePath, args = {}) {
+    const folderId = String(args.folderId || '').trim();
+    if (!folderId || folderId === 'all') throw new Error('내보낼 폴더가 올바르지 않습니다.');
+
+    const folderLabel = String(args.folderLabel || folderId).trim() || folderId;
+    const rootName = zipEntryName(folderLabel, 'folder');
+    const notes = (await folderExportNotes(storagePath, args))
+        .filter(note => noteWorkspaceId(note) === folderId);
+    const usedNames = new Set();
+    const entries = [];
+    const skipped = [];
+
+    for (const note of notes) {
+        const relativePath = relativePathForNote(note);
+        try {
+            let data;
+            try {
+                data = await fs.readFile(resolveStorageFile(storagePath, relativePath).absolutePath);
+            } catch (error) {
+                data = Buffer.from(note.body || '', 'utf8');
+            }
+            entries.push({
+                name: uniqueZipEntryName(usedNames, folderExportEntryName(rootName, folderId, relativePath)),
+                data,
+                date: note.updatedAtMs ? new Date(Number(note.updatedAtMs)) : new Date()
+            });
+        } catch (error) {
+            skipped.push({
+                relativePath,
+                error: error instanceof Error ? error.message : '노트 파일을 읽지 못했습니다.'
+            });
+        }
+
+        for (const attachment of noteAttachmentsForMetadata(note, relativePath)) {
+            try {
+                const { relativePath: attachmentPath, absolutePath } = resolveStorageFile(storagePath, attachment.relativePath);
+                entries.push({
+                    name: uniqueZipEntryName(usedNames, folderExportEntryName(rootName, folderId, attachmentPath)),
+                    data: await fs.readFile(absolutePath),
+                    date: attachment.updatedAtMs ? new Date(Number(attachment.updatedAtMs)) : new Date()
+                });
+            } catch (error) {
+                skipped.push({
+                    relativePath: attachment.relativePath,
+                    error: error instanceof Error ? error.message : '첨부 파일을 읽지 못했습니다.'
+                });
+            }
+        }
+    }
+
+    return { entries, skipped, noteCount: notes.length };
+}
+
+async function exportFolderZip(event, args = {}) {
+    const storagePath = rememberStoragePath(args.storagePath);
+    const folderLabel = String(args.folderLabel || args.folderId || 'folder').trim() || 'folder';
+    const { entries, skipped, noteCount } = await folderZipEntries(storagePath, args);
+    if (entries.length === 0) return { ok: false, error: '내보낼 노트나 첨부 파일이 없습니다.' };
+
+    const parent = BrowserWindow.fromWebContents(event.sender) || BrowserWindow.getFocusedWindow() || undefined;
+    const result = await dialog.showSaveDialog(parent, {
+        title: '폴더를 ZIP으로 내보내기',
+        defaultPath: path.join(app.getPath('documents'), safeExportFileName(folderLabel, 'zip')),
+        filters: [{ name: 'ZIP', extensions: ['zip'] }]
+    });
+
+    if (result.canceled || !result.filePath) return { ok: false, canceled: true };
+
+    const targetPath = result.filePath.toLowerCase().endsWith('.zip')
+        ? result.filePath
+        : `${result.filePath}.zip`;
+    const zipBuffer = await createZipBuffer(entries);
+    await fs.writeFile(targetPath, zipBuffer);
+    return {
+        ok: true,
+        filePath: targetPath,
+        bytes: zipBuffer.length,
+        files: entries.length,
+        notes: noteCount,
+        skipped
+    };
+}
+
+async function saveNotePdf(args = {}) {
+    const title = String(args.title || '제목 없음');
+    const html = String(args.html || '');
+    const exportMode = args.exportMode === 'zip-with-attachments' ? 'zip-with-attachments' : 'markdown-images';
+    const zipExport = exportMode === 'zip-with-attachments';
+    const parent = BrowserWindow.getFocusedWindow() || undefined;
+    const extension = zipExport ? 'zip' : 'pdf';
+    const result = await dialog.showSaveDialog(parent, {
+        title: zipExport ? 'PDF와 첨부를 ZIP으로 저장' : 'PDF로 저장',
+        defaultPath: path.join(app.getPath('documents'), safeExportFileName(title, extension)),
+        filters: [zipExport ? { name: 'ZIP', extensions: ['zip'] } : { name: 'PDF', extensions: ['pdf'] }]
+    });
+
+    if (result.canceled || !result.filePath) return { ok: false, canceled: true };
+
+    const targetPath = result.filePath.toLowerCase().endsWith(`.${extension}`)
+        ? result.filePath
+        : `${result.filePath}.${extension}`;
+
+    try {
+        const pdfBuffer = await renderPdfBuffer(html);
+        if (!zipExport) {
+            await fs.writeFile(targetPath, pdfBuffer);
+            return { ok: true, filePath: targetPath, bytes: pdfBuffer.length };
+        }
+
+        const usedNames = new Set();
+        const pdfName = uniqueZipEntryName(usedNames, safeExportFileName(title, 'pdf'));
+        const storagePath = normalizeStoragePath(args.storagePath);
+        const { entries: attachmentEntries, skippedAttachments } = await pdfAttachmentZipEntries(storagePath, args.attachments, usedNames);
+        const zipBuffer = await createZipBuffer([
+            { name: pdfName, data: pdfBuffer, date: new Date() },
+            ...attachmentEntries
+        ]);
+        await fs.writeFile(targetPath, zipBuffer);
+        return {
+            ok: true,
+            filePath: targetPath,
+            bytes: zipBuffer.length,
+            attachments: attachmentEntries.length,
+            skippedAttachments
+        };
     } catch (error) {
         return {
             ok: false,
-            error: error instanceof Error ? error.message : 'PDF 저장에 실패했습니다.'
+            error: error instanceof Error ? error.message : (zipExport ? 'ZIP 저장에 실패했습니다.' : 'PDF 저장에 실패했습니다.')
         };
-    } finally {
-        if (!pdfWindow.isDestroyed()) pdfWindow.destroy();
     }
 }
 
@@ -2091,7 +2610,7 @@ async function showMainWindow(options = {}) {
 }
 
 function registerAppHandlers() {
-    ipcMain.handle('notedown:app:preferences', async () => ({ ok: true, ...appPreferences }));
+    ipcMain.handle('notedown:app:preferences', async () => ({ ok: true, ...appPreferences, ...launchAtStartupState() }));
     ipcMain.handle('notedown:app:set-preferences', async (_event, args = {}) => {
         const nextPreferences = await writeAppPreferences(args);
         return { ok: true, ...nextPreferences };
@@ -2199,7 +2718,7 @@ async function registerAttachmentProtocol() {
     attachmentProtocolRegistered = true;
 }
 
-async function createWindow() {
+async function createWindow(options = {}) {
     if (mainWindow && !mainWindow.isDestroyed()) return mainWindow;
     if (!DEV_URL) await registerLocalProtocol();
     await registerAttachmentProtocol();
@@ -2213,6 +2732,7 @@ async function createWindow() {
         title: APP_NAME,
         icon: APP_ICON_PATH,
         frame: true,
+        show: options.show !== false,
         webPreferences: {
             preload: path.join(__dirname, 'preload.cjs'),
             contextIsolation: true,
@@ -2256,7 +2776,9 @@ app.whenReady().then(async () => {
     registerStorageHandlers();
     registerSyncHandlers();
     registerPdfHandlers();
-    await createWindow();
+    const startHidden = appPreferences.keepInBackgroundOnClose && appPreferences.launchAtStartup && launchedAsHiddenLoginItem();
+    await createWindow({ show: !startHidden });
+    if (startHidden && process.platform === 'darwin' && app.dock) app.dock.hide();
 
     app.on('activate', async () => {
         await showMainWindow();

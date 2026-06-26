@@ -185,37 +185,6 @@ html.dark * {
     color: inherit !important;
 }
 
-.notedown-preview-line-number {
-    display: flex;
-    flex: 0 0 2rem;
-    flex-direction: column;
-    align-items: flex-end;
-    padding-top: 0;
-    color: #a8a29e;
-    font-family: SFMono-Regular, ui-monospace, Menlo, Monaco, Consolas, monospace;
-    font-size: 0.75rem;
-    font-variant-numeric: tabular-nums;
-    line-height: 1.5rem;
-    text-align: right;
-    user-select: none;
-    -webkit-user-select: none;
-}
-
-.notedown-preview-line-number > span {
-    display: block;
-    height: 1.5rem;
-    line-height: 1.5rem;
-}
-
-html.dark .notedown-preview-line-number {
-    color: #71717a;
-}
-
-.notedown-preview-row.has-section-style .notedown-preview-line-number {
-    color: inherit;
-    opacity: 0.55;
-}
-
 .notedown-preview-content {
     flex: 1 1 auto;
     min-width: 0;

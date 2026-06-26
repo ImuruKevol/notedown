@@ -26,11 +26,11 @@ Notedown은 데스크톱에서 Markdown 문서를 빠르게 작성하고 로컬 
 - 문서 렌더링: 체크리스트 진행률, 코드 블록, 인용문, 표, 구분선, 문서/구역 단위 스타일 지시문을 미리보기와 PDF 출력에 반영합니다.
 - 사이드바: 워크스페이스 패널, 노트 검색, 정렬, 새 노트 생성, 노트 삭제, 최근 동기화 상태 표시를 제공합니다.
 - 커맨드 팔렛트: `Cmd/Ctrl+P`로 노트 검색을 열고, `@`로 워크스페이스 선택, `>`로 설정 명령을 실행할 수 있습니다.
-- 설정: 자동 저장, 닫을 때 백그라운드 유지, 기본 보기 모드, 탭 크기, Light/Dark/System 테마를 관리합니다.
+- 설정: 자동 저장, 닫을 때 백그라운드 유지, 시작 프로그램 등록, 기본 보기 모드, 탭 크기, Light/Dark/System 테마를 관리합니다.
 - PDF 내보내기: 현재 노트를 Electron `printToPDF` 흐름으로 PDF 파일로 저장합니다.
 - 서버 동기화: 서버 연결 확인, 초기 설정, 로그인, 전체 동기화, 저장 시 업로드, 시작 시 동기화, 충돌 감지를 지원합니다.
 - 충돌 해결: 동기화 충돌이 발생하면 노트 화면에서 서버 버전과 로컬 버전을 Monaco diff 뷰어로 비교하고 선택한 버전을 적용합니다.
-- 데스크톱 동작: macOS 상태바/Windows 트레이에서 다시 열기, 백그라운드 유지 설정, Notedown 이름과 앱 아이콘이 적용된 패키징을 지원합니다.
+- 데스크톱 동작: macOS 상태바/Windows 트레이에서 다시 열기, 백그라운드 유지와 시작 프로그램 등록 설정, Notedown 이름과 앱 아이콘이 적용된 패키징을 지원합니다.
 
 ### 기본 워크플로
 
@@ -45,6 +45,7 @@ Notedown은 데스크톱에서 Markdown 문서를 빠르게 작성하고 로컬 
 ```text
 project/main/
 ├── electron/              # Electron main/preload 프로세스
+├── android/               # Capacitor Android native project
 ├── src/app/               # WIZ/Angular 화면 앱
 ├── src/assets/brand/      # 서비스 로고와 원본 브랜드 에셋
 ├── build-resources/       # Electron 빌드용 icon.icns/icon.ico/icon.png
@@ -65,6 +66,19 @@ npm run electron
 ```bash
 NOTEDOWN_DEV_URL=http://localhost:4200 npm run electron
 ```
+
+### Android 환경
+
+Android 앱은 Capacitor로 구성되어 있으며 `bundle/www/`의 WIZ/Angular 번들을 로드합니다. 현재 Android 브리지는 앱 설정, 앱 전용 로컬 저장소, Markdown/metadata 저장, 첨부 파일 선택/저장/열기, 동기화 서버 health/setup/login, 전체 동기화, 충돌 파일 비교/해결, PDF 저장을 지원합니다.
+
+```bash
+npm install
+npm run android:sync
+npm run android:open
+npm run android:build:debug
+```
+
+필요 SDK, 권한, 로컬 HTTP 정책은 [Android Environment](./docs/android-environment.md)를 참고하세요.
 
 ### 배포 빌드
 
@@ -110,7 +124,7 @@ Notedown is a desktop Markdown note app for writing quickly, keeping notes as lo
 - PDF export: save the current note through Electron's `printToPDF` flow.
 - Server sync: health check, initial setup, login, full sync, save-time upload, startup sync, and conflict detection.
 - Conflict resolution: compare server and local versions in a Monaco diff viewer, then apply the selected version.
-- Desktop behavior: reopen from macOS status bar or Windows tray, configure background close behavior, and package with the Notedown name and app icon.
+- Desktop behavior: reopen from macOS status bar or Windows tray, configure background close and launch-at-startup behavior, and package with the Notedown name and app icon.
 
 ### Basic Workflow
 
@@ -125,6 +139,7 @@ Notedown is a desktop Markdown note app for writing quickly, keeping notes as lo
 ```text
 project/main/
 ├── electron/              # Electron main/preload process
+├── android/               # Capacitor Android native project
 ├── src/app/               # WIZ/Angular app screens
 ├── src/assets/brand/      # Source brand logo assets
 ├── build-resources/       # Electron build icons: icon.icns/icon.ico/icon.png
@@ -145,6 +160,19 @@ To attach Electron to a development server:
 ```bash
 NOTEDOWN_DEV_URL=http://localhost:4200 npm run electron
 ```
+
+### Android Environment
+
+The Android app is configured with Capacitor and loads the WIZ/Angular bundle from `bundle/www/`. The current Android bridge supports app preferences, app-specific local note storage, Markdown/metadata persistence, attachment pick/save/open, sync server health/setup/login, full sync, conflict read/resolve, and PDF export.
+
+```bash
+npm install
+npm run android:sync
+npm run android:open
+npm run android:build:debug
+```
+
+See [Android Environment](./docs/android-environment.md) for SDK prerequisites, permissions, and local HTTP policy.
 
 ### Release Builds
 

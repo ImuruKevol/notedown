@@ -37,17 +37,23 @@ export class Component implements OnInit, OnDestroy {
     private activeNoteKey = 'notedown.activeNoteId.v1';
     private activeWorkspaceKey = 'notedown.activeWorkspace.v1';
     private foldersKey = 'notedown.folders.v1';
+    private sortKey = 'notedown.sidebar.sort.v1';
     private settingsKey = 'notedown.settings.v1';
     private startupSyncResultKey = 'notedown.sync.startup.result.v1';
+    private syncStatusHideTimeout: number | null = null;
 
     public query = '';
     public searchOpen = false;
     public sortOpen = false;
     public activeFolder = 'all';
     public activeNoteId = '';
-    public workspaceOpen = false;
+    public workspaceOpen = true;
     public editingFolderId = '';
     public folderNameDraft = '';
+    public folderContextMenuOpen = false;
+    public folderContextFolderId = '';
+    public folderContextMenuStyle: Record<string, string> = { left: '0px', top: '0px' };
+    public folderExportBusy = false;
     public sortField: SortField = 'updatedAt';
     public sortDirection: SortDirection = 'desc';
     public sortOptions: SortOption[] = [
@@ -60,11 +66,23 @@ export class Component implements OnInit, OnDestroy {
     ];
     public folders: FolderItem[] = [{ id: 'all', label: '모든 노트' }];
     public notes: NoteItem[] = [];
-    public syncStatusLabel = '동기화 대기';
-    public syncStatusDetail = '서버 동기화 상태';
+    public syncStatusVisible = false;
+    public syncStatusLabel = '';
+    public syncStatusDetail = '';
     public syncStatusTone: SyncStatusTone = 'idle';
 
     private handleNotesChanged = () => { void this.loadNotes().then(() => this.renderSoon()); };
+    private handleNoteTitleChanged = (event: Event) => {
+        const detail = (event as CustomEvent<{ noteId?: string; title?: string }>).detail || {};
+        if (!detail.noteId) return;
+
+        const title = String(detail.title || '').trim() || '제목 없음';
+        const index = this.notes.findIndex(note => note.id === detail.noteId);
+        if (index < 0 || this.notes[index].title === title) return;
+
+        this.notes[index] = { ...this.notes[index], title };
+        this.renderSoon();
+    };
     private handleSelectNote = (event: Event) => {
         const noteId = (event as CustomEvent<string>).detail;
         if (!noteId) return;
@@ -78,7 +96,14 @@ export class Component implements OnInit, OnDestroy {
         }
         this.renderSoon();
     };
-    private handleStartupSyncStatus = () => { this.loadStartupSyncStatus(); };
+    private handleStartupSyncStatus = () => {
+        this.loadStartupSyncStatus();
+        this.renderSoon();
+    };
+    private handleSaveSyncStatus = (event: Event) => {
+        const detail = (event as CustomEvent<any>).detail || {};
+        this.showSaveSyncStatus(detail);
+    };
     private handleWorkspaceChanged = (event: Event) => {
         const workspaceId = (event as CustomEvent<{ workspaceId?: string }>).detail?.workspaceId;
         if (!workspaceId) return;
@@ -91,6 +116,7 @@ export class Component implements OnInit, OnDestroy {
         if (event.key === this.activeWorkspaceKey) {
             this.activeFolder = localStorage.getItem(this.activeWorkspaceKey) || 'all';
         }
+        if (event.key === this.sortKey) this.loadSortPreference();
         this.renderSoon();
     };
 
@@ -98,22 +124,29 @@ export class Component implements OnInit, OnDestroy {
 
     public ngOnInit() {
         this.activeFolder = localStorage.getItem(this.activeWorkspaceKey) || this.activeFolder;
+        this.loadSortPreference();
+        this.workspaceOpen = true;
+        this.emitWorkspaceState(true);
         this.loadStartupSyncStatus();
         void this.loadNotes().then(() => this.renderSoon());
         window.addEventListener('notedown:notes-changed', this.handleNotesChanged);
+        window.addEventListener('notedown:note-title-changed', this.handleNoteTitleChanged);
         window.addEventListener('notedown:select-note', this.handleSelectNote);
         window.addEventListener('notedown:startup-sync-status', this.handleStartupSyncStatus);
+        window.addEventListener('notedown:save-sync-status', this.handleSaveSyncStatus);
         window.addEventListener('notedown:workspace-changed', this.handleWorkspaceChanged);
         window.addEventListener('storage', this.handleStorageChanged);
     }
 
     public ngOnDestroy() {
-        this.emitWorkspaceState(false);
         window.removeEventListener('notedown:notes-changed', this.handleNotesChanged);
+        window.removeEventListener('notedown:note-title-changed', this.handleNoteTitleChanged);
         window.removeEventListener('notedown:select-note', this.handleSelectNote);
         window.removeEventListener('notedown:startup-sync-status', this.handleStartupSyncStatus);
+        window.removeEventListener('notedown:save-sync-status', this.handleSaveSyncStatus);
         window.removeEventListener('notedown:workspace-changed', this.handleWorkspaceChanged);
         window.removeEventListener('storage', this.handleStorageChanged);
+        this.clearSyncStatusTimer();
     }
 
     public get activeFolderLabel() {
@@ -187,8 +220,14 @@ export class Component implements OnInit, OnDestroy {
         this.saveStoredFolders([...this.readStoredFolders(), folder]);
         this.syncFolders();
         this.selectFolder(folder.id);
+        this.editingFolderId = folder.id;
+        this.folderNameDraft = folder.label;
         window.dispatchEvent(new CustomEvent('notedown:notes-changed', { detail: { source: 'component.nav.sidebar', foldersChanged: true } }));
-        this.renderSoon();
+        this.renderSoon(() => this.focusFolderNameInput(folder.id));
+        window.setTimeout(() => {
+            if (this.editingFolderId !== folder.id) this.startFolderRename(folder.id);
+            else this.focusFolderNameInput(folder.id);
+        }, 80);
     }
 
     public startFolderRename(folderId: string, event?: Event) {
@@ -203,11 +242,8 @@ export class Component implements OnInit, OnDestroy {
 
         this.editingFolderId = folderId;
         this.folderNameDraft = folder.label;
-        this.renderSoon(() => {
-            const input = document.querySelector<HTMLInputElement>('[data-folder-name-input="true"]');
-            input?.focus();
-            input?.select();
-        });
+        this.closeFolderContextMenu();
+        this.renderSoon(() => this.focusFolderNameInput(folderId));
     }
 
     public cancelFolderRename() {
@@ -243,6 +279,110 @@ export class Component implements OnInit, OnDestroy {
         this.renderSoon();
     }
 
+    public openFolderContextMenu(folderId: string, event: MouseEvent) {
+        event.preventDefault();
+        event.stopPropagation();
+        if (!folderId || folderId === 'all') return;
+
+        this.folderContextFolderId = folderId;
+        this.folderContextMenuOpen = true;
+        this.folderContextMenuStyle = {
+            left: `${Math.min(event.clientX, window.innerWidth - 188)}px`,
+            top: `${Math.min(event.clientY, window.innerHeight - 136)}px`
+        };
+        this.renderSoon();
+    }
+
+    public closeFolderContextMenu() {
+        if (!this.folderContextMenuOpen) return;
+        this.folderContextMenuOpen = false;
+        this.folderContextFolderId = '';
+        this.renderSoon();
+    }
+
+    public async deleteFolder(folderId: string, event?: Event) {
+        if (event) {
+            event.preventDefault();
+            event.stopPropagation();
+        }
+        if (!folderId || folderId === 'all') return;
+
+        const folder = this.folders.find(item => item.id === folderId);
+        if (!folder) return;
+
+        const notesToDelete = this.notes.filter(note => (note.folder || 'memo') === folderId);
+        const countLabel = notesToDelete.length > 0 ? `와 노트 ${notesToDelete.length}개` : '';
+        const confirmed = window.confirm(`'${folder.label}' 폴더${countLabel}를 삭제할까요?\n이 작업은 되돌릴 수 없습니다.`);
+        if (!confirmed) return;
+
+        const deletedActiveNote = notesToDelete.some(note => note.id === this.activeNoteId);
+        this.closeFolderContextMenu();
+        this.saveStoredFolders(this.readStoredFolders().filter(item => item.id !== folderId));
+        this.notes = this.notes.filter(note => (note.folder || 'memo') !== folderId);
+        if (this.activeFolder === folderId) {
+            this.activeFolder = 'all';
+            localStorage.setItem(this.activeWorkspaceKey, this.activeFolder);
+            window.dispatchEvent(new CustomEvent('notedown:workspace-changed', { detail: { workspaceId: this.activeFolder } }));
+        }
+        this.syncFolders();
+        await this.persistNotes();
+        await Promise.all(notesToDelete.map(note => this.syncNoteWithServer(note, true)));
+
+        const nextNote = deletedActiveNote ? (this.visibleNotes[0] || this.notes[0]) : null;
+        if (nextNote) {
+            this.activeNoteId = nextNote.id;
+            localStorage.setItem(this.activeNoteKey, nextNote.id);
+        } else if (deletedActiveNote) {
+            this.activeNoteId = '';
+            localStorage.removeItem(this.activeNoteKey);
+        }
+
+        window.dispatchEvent(new CustomEvent('notedown:notes-changed', { detail: { source: 'component.nav.sidebar', foldersChanged: true } }));
+        if (deletedActiveNote) {
+            window.dispatchEvent(new CustomEvent('notedown:select-note', { detail: nextNote?.id || '' }));
+        }
+        this.renderSoon();
+    }
+
+    public async exportFolderZip(folderId: string, event?: Event) {
+        if (event) {
+            event.preventDefault();
+            event.stopPropagation();
+        }
+        if (!folderId || folderId === 'all' || this.folderExportBusy) return;
+
+        const folder = this.folders.find(item => item.id === folderId);
+        if (!folder) return;
+
+        const api = (window as any).notedown?.storage;
+        const storagePath = this.storagePath();
+        if (!api?.exportFolderZip || !storagePath) {
+            window.alert('폴더 ZIP 내보내기는 Electron 저장소에서 사용할 수 있습니다.');
+            this.closeFolderContextMenu();
+            return;
+        }
+
+        this.folderExportBusy = true;
+        this.renderSoon();
+        try {
+            const result = await api.exportFolderZip({
+                storagePath,
+                folderId,
+                folderLabel: folder.label,
+                notes: this.notes.filter(note => (note.folder || 'memo') === folderId)
+            });
+            if (!result?.ok && !result?.canceled) {
+                window.alert(result?.error || '폴더 ZIP 내보내기에 실패했습니다.');
+            }
+        } catch (error) {
+            window.alert(error instanceof Error ? error.message : '폴더 ZIP 내보내기에 실패했습니다.');
+        } finally {
+            this.folderExportBusy = false;
+            this.closeFolderContextMenu();
+            this.renderSoon();
+        }
+    }
+
     public async createNote() {
         const now = Date.now();
         const note: NoteItem = {
@@ -261,11 +401,12 @@ export class Component implements OnInit, OnDestroy {
             attachments: []
         };
         this.notes = [note, ...this.notes];
+        this.activeNoteId = note.id;
+        localStorage.setItem(this.activeNoteKey, note.id);
         this.syncFolders();
         await this.persistNotes();
-        await this.syncNoteWithServer(note);
-        window.dispatchEvent(new CustomEvent('notedown:notes-changed'));
-        this.selectNote(note.id);
+        window.dispatchEvent(new CustomEvent('notedown:notes-changed', { detail: { source: 'component.nav.sidebar' } }));
+        this.renderSoon();
     }
 
     public async deleteNote(id: string, event?: Event) {
@@ -340,6 +481,7 @@ export class Component implements OnInit, OnDestroy {
         if (!['asc', 'desc'].includes(direction)) return;
         this.sortField = field;
         this.sortDirection = direction;
+        localStorage.setItem(this.sortKey, this.sortValue);
     }
 
     public noteSummary(note: NoteItem) {
@@ -356,7 +498,7 @@ export class Component implements OnInit, OnDestroy {
     }
 
     public workspacePanelClass() {
-        return 'flex h-full w-[236px] shrink-0 flex-col border-r border-stone-300/70 bg-[#e8e6e1] px-3 pb-3 pt-14 transition-[width,opacity] duration-200 dark:border-zinc-800 dark:bg-zinc-900';
+        return 'flex h-full w-[236px] shrink-0 flex-col border-r border-stone-300/70 bg-[#e8e6e1] px-3 pb-3 pt-3 transition-[width,opacity] duration-200 dark:border-zinc-800 dark:bg-zinc-900';
     }
 
     public folderRowClass(folder: string) {
@@ -414,7 +556,7 @@ export class Component implements OnInit, OnDestroy {
     }
 
     public syncStatusClass() {
-        const base = 'group min-w-0 flex flex-1 items-center justify-between gap-2 rounded-md border px-2 py-1 text-left text-[12px] font-semibold transition focus-visible:outline-none focus-visible:ring-2';
+        const base = 'group flex w-full min-w-0 items-center justify-between gap-2 rounded-md border px-2 py-1 text-left text-[12px] font-semibold transition focus-visible:outline-none focus-visible:ring-2';
         const toneClass = {
             idle: 'border-transparent text-stone-500 hover:border-stone-200 hover:bg-white/60 hover:text-stone-700 focus-visible:ring-stone-300 dark:text-zinc-400 dark:hover:border-zinc-800 dark:hover:bg-zinc-800 dark:hover:text-zinc-200',
             running: 'border-blue-200/70 bg-blue-50 text-blue-700 hover:bg-blue-100 focus-visible:ring-blue-300 dark:border-blue-500/20 dark:bg-blue-500/10 dark:text-blue-300 dark:hover:bg-blue-500/15',
@@ -426,7 +568,11 @@ export class Component implements OnInit, OnDestroy {
     }
 
     public isSyncConflictStatus() {
-        return this.syncStatusTone === 'warning';
+        return this.syncStatusVisible && this.syncStatusTone === 'warning';
+    }
+
+    public showSyncStatus() {
+        return this.syncStatusVisible;
     }
 
     public openSyncConflict() {
@@ -447,7 +593,7 @@ export class Component implements OnInit, OnDestroy {
 
     @HostListener('document:keydown.escape')
     public closeOnEscape() {
-        this.closeWorkspace();
+        this.closeFolderContextMenu();
         this.sortOpen = false;
         if (this.searchOpen && !this.query) this.searchOpen = false;
     }
@@ -455,18 +601,28 @@ export class Component implements OnInit, OnDestroy {
     @HostListener('document:click')
     public closeFloatingMenus() {
         this.sortOpen = false;
+        this.closeFolderContextMenu();
+    }
+
+    private loadSortPreference() {
+        const value = localStorage.getItem(this.sortKey) || '';
+        const [field, direction] = value.split(':') as [SortField, SortDirection];
+        if (!['createdAt', 'updatedAt', 'title'].includes(field)) return;
+        if (!['asc', 'desc'].includes(direction)) return;
+        this.sortField = field;
+        this.sortDirection = direction;
     }
 
     private loadStartupSyncStatus() {
         const settings = this.readSettings();
         if (!settings.syncToken || !settings.storagePath) {
-            this.setSyncStatus('동기화 미설정', '설정에서 동기화 서버에 로그인하세요.', 'idle');
+            this.clearSyncStatus();
             return;
         }
 
         const result = this.readStartupSyncResult();
         if (!result?.syncedAtMs) {
-            this.setSyncStatus('동기화 대기', '앱 시작 동기화를 기다리는 중입니다.', 'idle');
+            this.clearSyncStatus();
             return;
         }
 
@@ -477,7 +633,7 @@ export class Component implements OnInit, OnDestroy {
         }
 
         if (elapsedMs > 30 * 60 * 1000) {
-            this.setSyncStatus('동기화 대기', '최근 시작 동기화 결과가 없습니다.', 'idle');
+            this.clearSyncStatus();
             return;
         }
 
@@ -489,11 +645,29 @@ export class Component implements OnInit, OnDestroy {
         }
 
         if (result.ok && conflictCount === 0) {
-            this.setSyncStatus('동기화 완료', this.syncResultDetail(result), 'success');
+            if (elapsedMs <= 10 * 1000) {
+                this.setSyncStatus('동기화 완료', this.syncResultDetail(result), 'success', 4000);
+            } else {
+                this.clearSyncStatus();
+            }
             return;
         }
 
-        this.setSyncStatus('동기화 실패', result.error || '시작 동기화에 실패했습니다.', 'error');
+        if (elapsedMs <= 10 * 1000) {
+            this.setSyncStatus('동기화 실패', result.error || '시작 동기화에 실패했습니다.', 'error', 5000);
+        } else {
+            this.clearSyncStatus();
+        }
+    }
+
+    private showSaveSyncStatus(detail: any) {
+        const label = String(detail?.label || '').trim();
+        if (!label) return;
+        const tone = this.normalizeSyncStatusTone(detail?.tone);
+        const statusDetail = String(detail?.detail || label);
+        const ttlMs = Number(detail?.ttlMs) || (tone === 'running' ? 0 : 4000);
+        this.setSyncStatus(label, statusDetail, tone, ttlMs);
+        this.renderSoon();
     }
 
     private readStartupSyncResult() {
@@ -518,10 +692,38 @@ export class Component implements OnInit, OnDestroy {
         ].join(', ');
     }
 
-    private setSyncStatus(label: string, detail: string, tone: SyncStatusTone) {
+    private setSyncStatus(label: string, detail: string, tone: SyncStatusTone, ttlMs = 0) {
+        this.clearSyncStatusTimer();
         this.syncStatusLabel = label;
         this.syncStatusDetail = detail;
         this.syncStatusTone = tone;
+        this.syncStatusVisible = true;
+        if (ttlMs > 0) {
+            this.syncStatusHideTimeout = window.setTimeout(() => {
+                this.syncStatusHideTimeout = null;
+                this.clearSyncStatus();
+                this.renderSoon();
+            }, ttlMs);
+        }
+    }
+
+    private clearSyncStatus() {
+        this.clearSyncStatusTimer();
+        this.syncStatusVisible = false;
+        this.syncStatusLabel = '';
+        this.syncStatusDetail = '';
+        this.syncStatusTone = 'idle';
+    }
+
+    private clearSyncStatusTimer() {
+        if (this.syncStatusHideTimeout == null) return;
+        window.clearTimeout(this.syncStatusHideTimeout);
+        this.syncStatusHideTimeout = null;
+    }
+
+    private normalizeSyncStatusTone(tone: any): SyncStatusTone {
+        if (tone === 'running' || tone === 'success' || tone === 'warning' || tone === 'error') return tone;
+        return 'idle';
     }
 
     private async loadNotes() {
@@ -700,7 +902,7 @@ export class Component implements OnInit, OnDestroy {
     private async syncNoteWithServer(note: NoteItem, deleted = false) {
         const api = (window as any).notedown?.sync;
         const settings = this.readSettings();
-        if (!api?.uploadNote || !settings.syncAutoUpload || !settings.syncToken || !settings.storagePath) return;
+        if (!api?.uploadNote || !settings.syncToken || !settings.storagePath) return;
 
         try {
             await api.uploadNote({
@@ -812,6 +1014,13 @@ export class Component implements OnInit, OnDestroy {
             .split('\n')
             .map(line => line.replace(/^#+\s*/, '').trim())
             .some(line => line && line !== title);
+    }
+
+    private focusFolderNameInput(folderId: string) {
+        const escapedFolderId = typeof CSS !== 'undefined' && CSS.escape ? CSS.escape(folderId) : folderId.replace(/"/g, '\\"');
+        const input = document.querySelector<HTMLInputElement>(`[data-folder-name-input="${escapedFolderId}"]`);
+        input?.focus();
+        input?.select();
     }
 
     private emitWorkspaceState(open: boolean) {
