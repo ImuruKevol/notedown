@@ -60,7 +60,7 @@ section(class="flex h-full min-h-0 flex-col bg-[#fbfbfa] text-stone-950 dark:bg-
                         div(class="flex flex-wrap items-center justify-between gap-3")
                             div
                                 h2(class="text-[20px] font-semibold") 저장소
-                                p(class="mt-1 text-[13px] text-stone-500 dark:text-zinc-400") Markdown 파일과 metadata.json을 기준으로 로컬에 저장합니다.
+                                p(class="mt-1 text-[13px] text-stone-500 dark:text-zinc-400") Markdown 파일과 metadata.db를 기준으로 로컬에 저장합니다.
                             span([class]="storageStatusClass()") {{storageInfo.metadataExists ? 'metadata 준비됨' : '초기화 필요'}}
                     div(class="grid gap-5")
                         div(class="grid gap-2")
@@ -84,7 +84,7 @@ section(class="flex h-full min-h-0 flex-col bg-[#fbfbfa] text-stone-950 dark:bg-
                                     p(class="text-[12px] text-stone-400 dark:text-zinc-500") 깊은 경로 MD
                                     p(class="mt-1 text-[22px] font-semibold") {{storageInfo.deepMarkdownCount || 0}}
                             div(class="mt-4 border-t border-stone-200 pt-3 dark:border-zinc-800")
-                                p(class="break-all font-mono text-[12px] text-stone-500 dark:text-zinc-400") {{storageInfo.metadataPath || settings.storagePath + '/metadata.json'}}
+                                p(class="break-all font-mono text-[12px] text-stone-500 dark:text-zinc-400") {{storageInfo.metadataPath || settings.storagePath + '/metadata.db'}}
                                 p(*ngIf="storageMessage", [class]="storageMessageClass()", aria-live="polite") {{storageMessage}}
                         div(class="grid gap-3 sm:grid-cols-3")
                             button(type="button", class="h-10 rounded-md bg-stone-900 px-3 text-[13px] font-semibold text-white shadow-sm transition hover:bg-stone-700 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-zinc-100 dark:text-zinc-950 dark:hover:bg-zinc-200", (click)="initializeStorage()", [disabled]="storageBusy", [attr.aria-busy]="storageAction === 'initialize'") {{storageAction === 'initialize' ? 'metadata 생성 중...' : 'metadata 생성/갱신'}}

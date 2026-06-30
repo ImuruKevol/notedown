@@ -5,6 +5,12 @@ const crypto = require('node:crypto');
 const { pathToFileURL } = require('node:url');
 const zlib = require('node:zlib');
 const { promisify } = require('node:util');
+const {
+    METADATA_DB_FILE,
+    metadataPath: metadataDbPath,
+    readMetadata,
+    writeMetadata
+} = require('./metadata-store.cjs');
 
 const DEV_URL = process.env.NOTEDOWN_DEV_URL;
 const DIST_DIR = path.resolve(__dirname, '..', 'bundle', 'www');
@@ -27,7 +33,7 @@ let appPreferences = {
     launchAtStartup: false
 };
 
-const METADATA_FILE = 'metadata.json';
+const LEGACY_METADATA_FILE = 'metadata.json';
 const SYNC_STATE_FILE = '.notedown-sync.json';
 const DEFAULT_SYNC_SERVER_URL = 'http://172.16.0.143:5500';
 const SYNC_REQUEST_TIMEOUT_MS = 15000;
@@ -223,6 +229,34 @@ function safePathSegment(name, fallback = 'item') {
         .slice(0, 80) || fallback;
 }
 
+function safeStorageSegment(value, fallback = 'folder') {
+    let text = String(value || '').trim();
+    if (!text) text = fallback;
+    text = text
+        .normalize('NFC')
+        .replace(/[\\/]+/g, ' ')
+        .replace(/[\x00-\x1f\x7f]+/g, ' ')
+        .replace(/[<>:"|?*]+/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .replace(/^[. ]+|[. ]+$/g, '');
+    if (!text || text === '.' || text === '..') text = fallback;
+    if (text.length > 120) text = text.slice(0, 120).replace(/[. ]+$/g, '');
+    return text || fallback;
+}
+
+function safeStorageFileName(name, fallback = 'note', defaultSuffix = '.md') {
+    const source = String(name || '').trim();
+    const suffix = defaultSuffix || '.md';
+    const stem = source.toLowerCase().endsWith(suffix.toLowerCase())
+        ? source.slice(0, -suffix.length)
+        : source;
+    const safeStem = safeStorageSegment(stem || fallback, fallback);
+    let safeSuffix = safeStorageSegment(suffix || defaultSuffix, defaultSuffix).replace(/\s+/g, '');
+    if (safeSuffix && !safeSuffix.startsWith('.')) safeSuffix = `.${safeSuffix}`;
+    return `${safeStem}${safeSuffix || defaultSuffix}`;
+}
+
 function toPosixPath(filePath) {
     return String(filePath || '').replace(/\\/g, '/');
 }
@@ -232,13 +266,13 @@ function normalizeRelativePath(relativePath) {
     const parts = normalized.split('/').filter(Boolean);
     if (parts.length === 0) throw new Error('파일 경로가 비어 있습니다.');
     if (parts.some(part => part === '.' || part === '..')) throw new Error('허용되지 않는 파일 경로입니다.');
-    if (parts[0] === METADATA_FILE || parts[0] === SYNC_STATE_FILE) throw new Error('동기화할 수 없는 시스템 파일입니다.');
+    if ([LEGACY_METADATA_FILE, METADATA_DB_FILE, SYNC_STATE_FILE].includes(parts[0])) throw new Error('동기화할 수 없는 시스템 파일입니다.');
     return parts.join('/');
 }
 
 function isSystemRelativePath(relativePath) {
     const firstPart = toPosixPath(relativePath).replace(/^\/+/g, '').split('/').filter(Boolean)[0] || '';
-    return firstPart === METADATA_FILE || firstPart === SYNC_STATE_FILE;
+    return [LEGACY_METADATA_FILE, METADATA_DB_FILE, SYNC_STATE_FILE].includes(firstPart);
 }
 
 function isAttachmentRelativePath(relativePath) {
@@ -285,7 +319,7 @@ function noteWorkspaceId(note = {}) {
 }
 
 function noteWorkspaceName(note = {}, workspaceId = noteWorkspaceId(note)) {
-    return note.workspaceName || note.workspaceLabel || workspaceId;
+    return note.workspaceName || note.workspaceLabel || (workspaceId === UNFILED_WORKSPACE_ID ? '미지정 워크스페이스' : workspaceId);
 }
 
 function noteFileName(note = {}) {
@@ -301,6 +335,46 @@ function relativePathForNote(note = {}) {
             ? fileName
             : path.posix.join(workspaceId, fileName)
     );
+}
+
+function storageFolderPartsForNote(note = {}, relativePath = '') {
+    const logicalPath = relativePath ? path.posix.parse(normalizeRelativePath(relativePath)) : null;
+    let folder = note.folder;
+    if (!folder && logicalPath) folder = logicalPath.dir;
+
+    const rawParts = String(folder || '')
+        .replace(/\\/g, '/')
+        .split('/')
+        .filter(part => part && part !== '.' && part !== '..');
+    const workspaceId = note.workspace || note.folder || '';
+    const workspaceName = noteWorkspaceName(note, workspaceId);
+    const workspaceFirst = workspaceId ? String(workspaceId).replace(/\\/g, '/').split('/', 1)[0] : '';
+
+    if (workspaceName) {
+        if (rawParts.length > 0) {
+            const first = rawParts[0];
+            if (!workspaceId || first === workspaceId || first === workspaceFirst || first === '미지정 워크스페이스' || first === UNFILED_WORKSPACE_ID) {
+                rawParts[0] = workspaceName;
+            }
+        } else {
+            rawParts.push(workspaceName);
+        }
+    }
+
+    return rawParts.map(part => safeStorageSegment(part, 'folder'));
+}
+
+function desiredNoteStoragePath(note = {}, relativePath = relativePathForNote(note)) {
+    const safeRelativePath = normalizeRelativePath(relativePath);
+    const suffix = path.posix.extname(note.fileName || safeRelativePath) || '.md';
+    const fallbackStem = path.posix.basename(safeRelativePath, path.posix.extname(safeRelativePath)) || 'note';
+    const fileName = safeStorageFileName(note.title || note.fileName || fallbackStem, fallbackStem, suffix);
+    return normalizeRelativePath(path.posix.join(...storageFolderPartsForNote(note, safeRelativePath), fileName));
+}
+
+function noteStoragePath(note = {}, relativePath = relativePathForNote(note)) {
+    if (note.storagePath) return normalizeRelativePath(note.storagePath);
+    return desiredNoteStoragePath(note, relativePath);
 }
 
 function noteIdFromRelativePath(relativePath) {
@@ -326,7 +400,7 @@ async function listMarkdownFiles(dirPath, depth = 1, rootPath = dirPath) {
     const files = [];
 
     for (const entry of entries) {
-        if (entry.name.startsWith('.') || entry.name === METADATA_FILE) continue;
+        if (entry.name.startsWith('.') || entry.name === LEGACY_METADATA_FILE || entry.name === METADATA_DB_FILE) continue;
         const entryPath = path.join(dirPath, entry.name);
         if (entry.isDirectory()) {
             if (depth > 0) {
@@ -343,7 +417,9 @@ async function listMarkdownFiles(dirPath, depth = 1, rootPath = dirPath) {
 }
 
 async function readMarkdownNote(storagePath, metadataNote) {
-    const absolutePath = path.join(storagePath, metadataNote.relativePath);
+    const relativePath = normalizeRelativePath(metadataNote.relativePath);
+    const storageRelativePath = noteStoragePath(metadataNote, relativePath);
+    const { absolutePath } = resolveStorageFile(storagePath, storageRelativePath);
     let body = '';
     try {
         body = await fs.readFile(absolutePath, 'utf8');
@@ -353,20 +429,11 @@ async function readMarkdownNote(storagePath, metadataNote) {
 
     return {
         ...metadataNote,
+        relativePath,
+        storagePath: storageRelativePath,
         body,
         folder: metadataNote.workspace || metadataNote.folder || UNFILED_WORKSPACE_ID
     };
-}
-
-async function writeMetadata(storagePath, metadata) {
-    await fs.mkdir(storagePath, { recursive: true });
-    await fs.writeFile(path.join(storagePath, METADATA_FILE), `${JSON.stringify(metadata, null, 2)}\n`, 'utf8');
-}
-
-async function readMetadata(storagePath) {
-    const metadataPath = path.join(storagePath, METADATA_FILE);
-    if (!await exists(metadataPath)) return null;
-    return JSON.parse(await fs.readFile(metadataPath, 'utf8'));
 }
 
 async function ensureMetadata(storagePath) {
@@ -581,14 +648,16 @@ async function removeEmptyParents(dirPath, stopPath) {
     }
 }
 
-async function removeMetadataOrphans(storagePath, previousMetadata, writtenRelativePaths, writtenAttachmentPaths = new Set()) {
+async function removeMetadataOrphans(storagePath, previousMetadata, writtenStoragePaths, writtenAttachmentStoragePaths = new Set()) {
     const root = path.resolve(storagePath);
     const previousNotes = Array.isArray(previousMetadata?.notes) ? previousMetadata.notes : [];
 
     for (const note of previousNotes) {
-        if (!note?.relativePath || writtenRelativePaths.has(note.relativePath)) continue;
-        const absolutePath = path.resolve(storagePath, note.relativePath);
-        if (!isInsidePath(root, absolutePath) || path.basename(absolutePath) === METADATA_FILE) continue;
+        if (!note?.relativePath) continue;
+        const storageRelativePath = noteStoragePath(note, note.relativePath);
+        if (writtenStoragePaths.has(storageRelativePath)) continue;
+        const absolutePath = path.resolve(storagePath, storageRelativePath);
+        if (!isInsidePath(root, absolutePath) || [LEGACY_METADATA_FILE, METADATA_DB_FILE].includes(path.basename(absolutePath))) continue;
         await fs.rm(absolutePath, { force: true });
         await removeEmptyParents(path.dirname(absolutePath), root);
     }
@@ -597,8 +666,9 @@ async function removeMetadataOrphans(storagePath, previousMetadata, writtenRelat
         for (const attachment of note.attachments || []) {
             if (!attachment?.relativePath) continue;
             const relativePath = normalizeRelativePath(attachment.relativePath);
-            if (writtenAttachmentPaths.has(relativePath)) continue;
-            const absolutePath = path.resolve(storagePath, relativePath);
+            const storageRelativePath = normalizeRelativePath(attachment.storagePath || relativePath);
+            if (writtenAttachmentStoragePaths.has(storageRelativePath)) continue;
+            const absolutePath = path.resolve(storagePath, storageRelativePath);
             if (!isInsidePath(root, absolutePath)) continue;
             await fs.rm(absolutePath, { force: true });
             await removeEmptyParents(path.dirname(absolutePath), root);
@@ -610,6 +680,14 @@ function makeMetadataNote(storagePath, relativePath, workspaceId, workspaceName,
     const fileName = path.basename(relativePath);
     const updatedAtMs = stat?.mtimeMs ? Math.round(stat.mtimeMs) : Date.now();
     const createdAtMs = stat?.birthtimeMs ? Math.round(stat.birthtimeMs) : updatedAtMs;
+    const note = {
+        workspace: workspaceId,
+        workspaceName,
+        folder: workspaceId,
+        fileName,
+        relativePath
+    };
+    const storageRelativePath = noteStoragePath(note, relativePath);
     return {
         id: noteIdFromRelativePath(relativePath),
         icon: 'N',
@@ -619,8 +697,9 @@ function makeMetadataNote(storagePath, relativePath, workspaceId, workspaceName,
         workspace: workspaceId,
         workspaceName,
         folder: workspaceId,
-        fileName,
+        fileName: path.posix.basename(storageRelativePath),
         relativePath,
+        storagePath: storageRelativePath,
         createdAt: labelForDate(createdAtMs),
         createdAtMs,
         updatedAt: labelForDate(updatedAtMs),
@@ -630,11 +709,13 @@ function makeMetadataNote(storagePath, relativePath, workspaceId, workspaceName,
 
 function normalizeAttachmentMetadata(attachment = {}, noteRelativePath = '') {
     const relativePath = normalizeRelativePath(attachment.relativePath);
+    const storagePath = normalizeRelativePath(attachment.storagePath || relativePath);
     const fileName = safeAttachmentFileName(attachment.fileName || path.posix.basename(relativePath));
     return {
         id: attachment.id || attachment.attachmentId || `att-${crypto.createHash('sha1').update(relativePath).digest('hex').slice(0, 16)}`,
         fileName,
         relativePath,
+        storagePath,
         noteRelativePath: attachment.noteRelativePath ? normalizeRelativePath(attachment.noteRelativePath) : noteRelativePath,
         mimeType: attachment.mimeType || null,
         size: Number.isFinite(attachment.size) ? Number(attachment.size) : null,
@@ -646,10 +727,11 @@ function normalizeAttachmentMetadata(attachment = {}, noteRelativePath = '') {
 
 function noteAttachmentDirectory(noteRelativePath, note = {}) {
     const safeNoteRelativePath = normalizeRelativePath(noteRelativePath);
-    const noteDir = path.posix.dirname(safeNoteRelativePath);
-    const noteName = path.posix.basename(safeNoteRelativePath, path.posix.extname(safeNoteRelativePath));
-    const noteSegment = safePathSegment(note.id || noteName || 'note', 'note');
-    return normalizeRelativePath(path.posix.join(noteDir === '.' ? '' : noteDir, '.attachments', noteSegment));
+    const noteRelativeStoragePath = noteStoragePath(note, safeNoteRelativePath);
+    const noteDir = path.posix.dirname(noteRelativeStoragePath);
+    const noteName = path.posix.basename(noteRelativeStoragePath, path.posix.extname(noteRelativeStoragePath));
+    const noteSegment = safeStorageSegment(note.title || noteName || 'note', 'note');
+    return normalizeRelativePath(path.posix.join(noteDir === '.' ? '' : noteDir, 'attachments', noteSegment));
 }
 
 async function uniqueAttachmentRelativePath(storagePath, baseRelativePath) {
@@ -663,6 +745,27 @@ async function uniqueAttachmentRelativePath(storagePath, baseRelativePath) {
         candidate = normalizeRelativePath(path.posix.join(dir === '.' ? '' : dir, `${stem}-${suffix}${ext}`));
         suffix++;
     }
+    return candidate;
+}
+
+async function uniqueStorageRelativePath(storagePath, baseRelativePath, usedPaths = new Set(), currentRelativePath = '') {
+    const safeRelativePath = normalizeRelativePath(baseRelativePath);
+    const currentPath = currentRelativePath ? normalizeRelativePath(currentRelativePath) : '';
+    const ext = path.posix.extname(safeRelativePath);
+    const dir = path.posix.dirname(safeRelativePath);
+    const stem = path.posix.basename(safeRelativePath, ext);
+    let candidate = safeRelativePath;
+    let suffix = 2;
+
+    while (
+        usedPaths.has(candidate)
+        || (candidate !== currentPath && await exists(resolveStorageFile(storagePath, candidate).absolutePath))
+    ) {
+        candidate = normalizeRelativePath(path.posix.join(dir === '.' ? '' : dir, `${stem}-${suffix}${ext}`));
+        suffix++;
+    }
+
+    usedPaths.add(candidate);
     return candidate;
 }
 
@@ -731,7 +834,7 @@ async function generateMetadata(storagePath, options = {}) {
     let copiedDeepCount = 0;
 
     for (const entry of entries) {
-        if (entry.name.startsWith('.') || entry.name === METADATA_FILE) continue;
+        if (entry.name.startsWith('.') || entry.name === LEGACY_METADATA_FILE || entry.name === METADATA_DB_FILE) continue;
         const entryPath = path.join(storagePath, entry.name);
 
         if (entry.isFile() && /\.md$/i.test(entry.name)) {
@@ -804,7 +907,7 @@ async function generateMetadata(storagePath, options = {}) {
     return {
         ok: true,
         storagePath,
-        metadataPath: path.join(storagePath, METADATA_FILE),
+        metadataPath: metadataDbPath(storagePath),
         notes: notes.length,
         workspaces: workspaces.length,
         rootMarkdownCount,
@@ -820,22 +923,30 @@ async function saveNotesToStorage(storagePath, notes) {
     const workspaces = new Map();
     workspaces.set(UNFILED_WORKSPACE_ID, { id: UNFILED_WORKSPACE_ID, name: '미지정 워크스페이스' });
     const metadataNotes = [];
-    const writtenRelativePaths = new Set();
-    const writtenAttachmentPaths = new Set();
+    const writtenStoragePaths = new Set();
+    const writtenAttachmentStoragePaths = new Set();
+    const usedStoragePaths = new Set();
 
     for (const note of notes || []) {
         const workspaceId = noteWorkspaceId(note);
         const workspaceName = noteWorkspaceName(note, workspaceId);
-        const fileName = noteFileName(note);
         const relativePath = relativePathForNote(note);
-        const { absolutePath } = resolveStorageFile(storagePath, relativePath);
+        const desiredStoragePath = desiredNoteStoragePath({ ...note, workspace: workspaceId, folder: workspaceId, workspaceName }, relativePath);
+        const storageRelativePath = await uniqueStorageRelativePath(
+            storagePath,
+            desiredStoragePath,
+            usedStoragePaths,
+            note.storagePath || relativePath
+        );
+        const fileName = path.posix.basename(storageRelativePath);
+        const { absolutePath } = resolveStorageFile(storagePath, storageRelativePath);
 
         workspaces.set(workspaceId, { id: workspaceId, name: workspaceName });
         await fs.mkdir(path.dirname(absolutePath), { recursive: true });
         await fs.writeFile(absolutePath, note.body || '', 'utf8');
-        writtenRelativePaths.add(relativePath);
+        writtenStoragePaths.add(storageRelativePath);
         const attachments = noteAttachmentsForMetadata(note, relativePath);
-        for (const attachment of attachments) writtenAttachmentPaths.add(attachment.relativePath);
+        for (const attachment of attachments) writtenAttachmentStoragePaths.add(attachment.storagePath || attachment.relativePath);
 
         metadataNotes.push({
             id: note.id,
@@ -848,6 +959,7 @@ async function saveNotesToStorage(storagePath, notes) {
             folder: workspaceId,
             fileName,
             relativePath,
+            storagePath: storageRelativePath,
             attachments,
             createdAt: note.createdAt || labelForDate(note.createdAtMs || Date.now()),
             createdAtMs: note.createdAtMs || Date.now(),
@@ -860,9 +972,9 @@ async function saveNotesToStorage(storagePath, notes) {
         version: 1,
         generatedAt: new Date().toISOString(),
         workspaces: Array.from(workspaces.values()),
-        notes: metadataNotes
-    });
-    await removeMetadataOrphans(storagePath, previousMetadata, writtenRelativePaths, writtenAttachmentPaths);
+            notes: metadataNotes
+        });
+    await removeMetadataOrphans(storagePath, previousMetadata, writtenStoragePaths, writtenAttachmentStoragePaths);
 
     return { ok: true, notes: metadataNotes.length, workspaces: workspaces.size };
 }
@@ -880,9 +992,16 @@ async function saveAttachmentToStorage(args = {}) {
 
     const fileName = safeAttachmentFileName(args.fileName || 'attachment');
     const attachmentDir = noteAttachmentDirectory(noteRelativePath, note);
-    const baseRelativePath = normalizeRelativePath(args.relativePath || path.posix.join(attachmentDir, fileName));
-    const relativePath = args.relativePath ? baseRelativePath : await uniqueAttachmentRelativePath(storagePath, baseRelativePath);
-    const { absolutePath } = resolveStorageFile(storagePath, relativePath);
+    const logicalRelativePath = args.relativePath ? normalizeRelativePath(args.relativePath) : '';
+    const baseStoragePath = normalizeRelativePath(args.attachmentStoragePath || path.posix.join(attachmentDir, fileName));
+    const storageRelativePath = await uniqueStorageRelativePath(
+        storagePath,
+        baseStoragePath,
+        new Set(),
+        args.attachmentStoragePath || ''
+    );
+    const relativePath = logicalRelativePath || storageRelativePath;
+    const { absolutePath } = resolveStorageFile(storagePath, storageRelativePath);
     const contentEncoding = args.contentEncoding || 'base64';
     const content = contentEncoding === 'base64'
         ? Buffer.from(String(args.content || ''), 'base64')
@@ -896,6 +1015,7 @@ async function saveAttachmentToStorage(args = {}) {
         id: args.id,
         fileName,
         relativePath,
+        storagePath: storageRelativePath,
         noteRelativePath,
         mimeType: args.mimeType || null,
         size: content.length,
@@ -973,7 +1093,10 @@ async function chooseAttachmentsForStorage(event, args = {}) {
 
 async function openAttachmentFromStorage(args = {}) {
     const storagePath = rememberStoragePath(args.storagePath);
-    const { relativePath, absolutePath } = resolveStorageFile(storagePath, args.relativePath);
+    const relativePath = normalizeRelativePath(args.relativePath);
+    const metadata = await readMetadata(storagePath);
+    const attachment = metadata ? findMetadataAttachment(metadata, relativePath, { relativePath }) : null;
+    const { absolutePath } = resolveStorageFile(storagePath, attachment?.storagePath || relativePath);
     if (!await exists(absolutePath)) throw new Error('첨부 파일을 찾지 못했습니다.');
     const error = await shell.openPath(absolutePath);
     if (error) throw new Error(error);
@@ -1202,10 +1325,10 @@ function metadataNoteChanged(left, right) {
     return JSON.stringify(comparableMetadataNote(left)) !== JSON.stringify(comparableMetadataNote(right));
 }
 
-async function localFileSyncInfo(storagePath, syncState, relativePath) {
+async function localFileSyncInfo(storagePath, syncState, relativePath, storageRelativePath = '') {
     const state = syncState.files?.[relativePath] || {};
     try {
-        const { absolutePath } = resolveStorageFile(storagePath, relativePath);
+        const { absolutePath } = resolveStorageFile(storagePath, storageRelativePath || relativePath);
         const content = await fs.readFile(absolutePath);
         const stat = await fs.stat(absolutePath);
         return {
@@ -1246,8 +1369,8 @@ async function reconcilePlanWithServerMetadata(storagePath, localMetadata, syncS
         const serverFile = serverFiles.get(relativePath);
         if (!serverFile || isDeletedFlag(serverFile.deleted)) continue;
 
-        const localInfo = await localFileSyncInfo(storagePath, syncState, relativePath);
         const localNote = localNotes.get(relativePath);
+        const localInfo = await localFileSyncInfo(storagePath, syncState, relativePath, localNote?.storagePath);
         const serverRevision = Number(serverFile.revision) || 0;
         const knownRevision = Number(localInfo.state?.lastKnownRevision) || 0;
         const hasSyncHistory = knownRevision > 0 || Boolean(localInfo.state?.contentHash);
@@ -1292,7 +1415,7 @@ async function reconcilePlanWithServerMetadata(storagePath, localMetadata, syncS
     for (const [relativePath, localNote] of localNotes.entries()) {
         if (planIncludesPath(plan, relativePath) || serverNotes.has(relativePath)) continue;
 
-        const localInfo = await localFileSyncInfo(storagePath, syncState, relativePath);
+        const localInfo = await localFileSyncInfo(storagePath, syncState, relativePath, localNote?.storagePath);
         const knownRevision = Number(localInfo.state?.lastKnownRevision) || 0;
         if (knownRevision <= 0) continue;
 
@@ -1336,21 +1459,26 @@ function findMetadataNote(metadata, relativePath, payloadNote) {
         workspace: noteWorkspaceId(payloadNote),
         workspaceName: noteWorkspaceName(payloadNote),
         fileName: noteFileName(payloadNote),
-        relativePath: safeRelativePath || relativePathForNote(payloadNote)
+        relativePath: safeRelativePath || relativePathForNote(payloadNote),
+        storagePath: payloadNote.storagePath || desiredNoteStoragePath(payloadNote, safeRelativePath || relativePathForNote(payloadNote))
     };
 }
 
-function notePayload(note, relativePath) {
+function notePayload(note, relativePath, storagePathOverride = '') {
     if (!note) return null;
     const workspaceId = noteWorkspaceId(note);
     const { body: _body, ...metadataNote } = note;
+    const storagePath = storagePathOverride
+        ? normalizeRelativePath(storagePathOverride)
+        : noteStoragePath(note, relativePath);
     return {
         ...metadataNote,
         workspace: workspaceId,
         folder: workspaceId,
         workspaceName: noteWorkspaceName(note, workspaceId),
-        fileName: path.posix.basename(relativePath),
-        relativePath
+        fileName: path.posix.basename(storagePath),
+        relativePath,
+        storagePath
     };
 }
 
@@ -1382,7 +1510,8 @@ function upsertMetadataNote(metadata, note) {
         ...note,
         folder: note.folder || note.workspace || UNFILED_WORKSPACE_ID,
         workspace: note.workspace || note.folder || UNFILED_WORKSPACE_ID,
-        relativePath
+        relativePath,
+        storagePath: note.storagePath ? normalizeRelativePath(note.storagePath) : noteStoragePath(note, relativePath)
     };
     const index = metadata.notes.findIndex(item => item?.relativePath && normalizeRelativePath(item.relativePath) === relativePath);
     if (index >= 0) {
@@ -1405,7 +1534,7 @@ async function buildKnownFiles(storagePath, metadata, syncState) {
         if (!note?.relativePath) continue;
         const relativePath = normalizeRelativePath(note.relativePath);
         try {
-            const { absolutePath } = resolveStorageFile(storagePath, relativePath);
+            const { absolutePath } = resolveStorageFile(storagePath, noteStoragePath(note, relativePath));
             const content = await fs.readFile(absolutePath);
             const stat = await fs.stat(absolutePath);
             const state = syncState.files?.[relativePath] || {};
@@ -1440,12 +1569,15 @@ async function buildKnownFiles(storagePath, metadata, syncState) {
 async function buildKnownAttachments(storagePath, metadata, syncState) {
     const attachments = [];
     const activePaths = new Set();
+    const storagePaths = new Map();
     for (const note of metadata.notes || []) {
         for (const attachment of note.attachments || []) {
             if (!attachment?.relativePath || isDeletedFlag(attachment.deleted)) continue;
             const relativePath = normalizeRelativePath(attachment.relativePath);
+            const storageRelativePath = normalizeRelativePath(attachment.storagePath || relativePath);
+            storagePaths.set(relativePath, storageRelativePath);
             try {
-                const { absolutePath } = resolveStorageFile(storagePath, relativePath);
+                const { absolutePath } = resolveStorageFile(storagePath, storageRelativePath);
                 const content = await fs.readFile(absolutePath);
                 const stat = await fs.stat(absolutePath);
                 const state = syncState.attachments?.[relativePath] || {};
@@ -1468,7 +1600,7 @@ async function buildKnownAttachments(storagePath, metadata, syncState) {
         const lastKnownRevision = Number(state?.lastKnownRevision) || 0;
         if (lastKnownRevision <= 0 || activePaths.has(relativePath) || isSystemRelativePath(relativePath)) continue;
         try {
-            const { absolutePath } = resolveStorageFile(storagePath, relativePath);
+            const { absolutePath } = resolveStorageFile(storagePath, storagePaths.get(relativePath) || relativePath);
             await fs.stat(absolutePath);
         } catch (error) {
             attachments.push({ relativePath, deleted: true, lastKnownRevision });
@@ -1538,7 +1670,7 @@ async function uploadLocalFile(args = {}, relativePathOverride = '') {
     }
 
     if (!deleted) {
-        const { absolutePath } = resolveStorageFile(storagePath, relativePath);
+        const { absolutePath } = resolveStorageFile(storagePath, note ? noteStoragePath(note, relativePath) : relativePath);
         const content = await fs.readFile(absolutePath);
         const stat = await fs.stat(absolutePath);
         body.content = content.toString('base64');
@@ -1620,7 +1752,7 @@ async function uploadLocalAttachment(args = {}, item = {}) {
     }
 
     if (!deleted) {
-        const { absolutePath } = resolveStorageFile(storagePath, relativePath);
+        const { absolutePath } = resolveStorageFile(storagePath, attachment?.storagePath || relativePath);
         const content = await fs.readFile(absolutePath);
         const stat = await fs.stat(absolutePath);
         body.contentHash = sha256(content);
@@ -1727,7 +1859,14 @@ async function downloadServerAttachment(args = {}, item, metadata) {
     const { storagePath, serverUrl, token } = syncConfig(args);
     const relativePath = normalizeRelativePath(item.relativePath);
     const payload = await syncRequest(serverUrl, `/api/attachments/${encodeRelativePathForUrl(relativePath)}`, { token });
-    const { absolutePath } = resolveStorageFile(storagePath, relativePath);
+    const storageRelativePath = normalizeRelativePath(
+        payload.storagePath
+        || item.serverAttachment?.storagePath
+        || item.attachment?.storagePath
+        || item.storagePath
+        || relativePath
+    );
+    const { absolutePath } = resolveStorageFile(storagePath, storageRelativePath);
 
     if (isDeletedFlag(payload.deleted)) {
         await fs.rm(absolutePath, { force: true });
@@ -1756,6 +1895,7 @@ async function downloadServerAttachment(args = {}, item, metadata) {
         id: item.attachment?.id || payload.attachmentId,
         fileName: item.attachment?.fileName || payload.fileName || path.posix.basename(relativePath),
         relativePath,
+        storagePath: storageRelativePath,
         noteRelativePath,
         mimeType: item.attachment?.mimeType || payload.mimeType || null,
         size: Number(payload.size) || content.length,
@@ -1770,7 +1910,14 @@ async function downloadServerFile(args = {}, item, metadata) {
     const { storagePath, serverUrl, token } = syncConfig(args);
     const relativePath = normalizeRelativePath(item.relativePath);
     const payload = await syncRequest(serverUrl, `/api/files/${encodeRelativePathForUrl(relativePath)}`, { token });
-    const { absolutePath } = resolveStorageFile(storagePath, relativePath);
+    const storageRelativePath = normalizeRelativePath(
+        payload.storagePath
+        || item.serverFile?.storagePath
+        || item.note?.storagePath
+        || item.storagePath
+        || desiredNoteStoragePath(item.note || { relativePath, title: payload.title || path.posix.basename(relativePath) }, relativePath)
+    );
+    const { absolutePath } = resolveStorageFile(storagePath, storageRelativePath);
 
     if (isDeletedFlag(payload.deleted)) {
         await fs.rm(absolutePath, { force: true });
@@ -1793,22 +1940,24 @@ async function downloadServerFile(args = {}, item, metadata) {
         status: 'active',
         workspace: item.workspace?.id || UNFILED_WORKSPACE_ID,
         workspaceName: item.workspace?.name,
-        fileName: path.posix.basename(relativePath),
+        fileName: path.posix.basename(storageRelativePath),
         relativePath,
+        storagePath: storageRelativePath,
         updatedAtMs: payload.clientUpdatedAtMs || Date.now()
     };
     upsertMetadataWorkspace(metadata, item.workspace || workspacePayload(metadata, note));
-    upsertMetadataNote(metadata, notePayload(note, relativePath));
+    upsertMetadataNote(metadata, notePayload(note, relativePath, storageRelativePath));
     return { relativePath, deleted: false };
 }
 
 async function deleteLocalFile(storagePath, item, metadata) {
     const relativePath = normalizeRelativePath(item.relativePath);
-    const { absolutePath } = resolveStorageFile(storagePath, relativePath);
+    const note = findMetadataNote(metadata, relativePath, item.note || null);
+    const { absolutePath } = resolveStorageFile(storagePath, note ? noteStoragePath(note, relativePath) : relativePath);
     const attachments = removeMetadataNoteAttachments(metadata, relativePath);
     for (const attachment of attachments) {
         if (!attachment?.relativePath) continue;
-        const attachmentPath = resolveStorageFile(storagePath, attachment.relativePath).absolutePath;
+        const attachmentPath = resolveStorageFile(storagePath, attachment.storagePath || attachment.relativePath).absolutePath;
         await fs.rm(attachmentPath, { force: true });
         await removeEmptyParents(path.dirname(attachmentPath), path.resolve(storagePath));
     }
@@ -1820,7 +1969,8 @@ async function deleteLocalFile(storagePath, item, metadata) {
 
 async function deleteLocalAttachment(storagePath, item, metadata) {
     const relativePath = normalizeRelativePath(item.relativePath);
-    const { absolutePath } = resolveStorageFile(storagePath, relativePath);
+    const attachment = findMetadataAttachment(metadata, relativePath, item.attachment || item);
+    const { absolutePath } = resolveStorageFile(storagePath, attachment?.storagePath || relativePath);
     await fs.rm(absolutePath, { force: true });
     await removeEmptyParents(path.dirname(absolutePath), path.resolve(storagePath));
     removeMetadataAttachment(metadata, relativePath);
@@ -1841,7 +1991,11 @@ async function readSyncConflictFile(args = {}) {
     const isAttachment = args.type === 'attachment' || relativePath.includes('/.attachments/');
     const metadata = await ensureMetadata(storagePath);
     const localNote = findMetadataNote(metadata, relativePath, null);
-    const { absolutePath } = resolveStorageFile(storagePath, relativePath);
+    const localAttachment = isAttachment ? findMetadataAttachment(metadata, relativePath, args.attachment || null) : null;
+    const localStoragePath = isAttachment
+        ? (localAttachment?.storagePath || relativePath)
+        : (localNote ? noteStoragePath(localNote, relativePath) : relativePath);
+    const { absolutePath } = resolveStorageFile(storagePath, localStoragePath);
     const result = {
         ok: true,
         relativePath,
@@ -2102,7 +2256,7 @@ function registerStorageHandlers() {
         return {
             ok: true,
             storagePath,
-            metadataPath: path.join(storagePath, METADATA_FILE),
+            metadataPath: metadataDbPath(storagePath),
             metadataExists: Boolean(metadata),
             notes: metadata?.notes?.length || 0,
             workspaces: metadata?.workspaces?.length || 0,
@@ -2295,6 +2449,7 @@ function normalizePdfExportAttachments(attachments = []) {
             normalized.push({
                 fileName: safeAttachmentFileName(attachment?.fileName || path.posix.basename(relativePath)),
                 relativePath,
+                storagePath: attachment?.storagePath ? normalizeRelativePath(attachment.storagePath) : relativePath,
                 mimeType: attachment?.mimeType || mimeTypeForFileName(relativePath),
                 size: Number.isFinite(Number(attachment?.size)) ? Number(attachment.size) : null
             });
@@ -2311,10 +2466,10 @@ async function pdfAttachmentZipEntries(storagePath, attachments = [], usedNames 
 
     for (const attachment of normalizePdfExportAttachments(attachments)) {
         try {
-            const { relativePath, absolutePath } = resolveStorageFile(storagePath, attachment.relativePath);
+            const { absolutePath } = resolveStorageFile(storagePath, attachment.storagePath || attachment.relativePath);
             const data = await fs.readFile(absolutePath);
             entries.push({
-                name: uniqueZipEntryName(usedNames, path.posix.join('attachments', relativePath)),
+                name: uniqueZipEntryName(usedNames, path.posix.join('attachments', attachment.fileName || path.posix.basename(attachment.storagePath || attachment.relativePath))),
                 data,
                 date: attachment.updatedAtMs ? new Date(Number(attachment.updatedAtMs)) : new Date()
             });
@@ -2362,15 +2517,16 @@ async function folderZipEntries(storagePath, args = {}) {
 
     for (const note of notes) {
         const relativePath = relativePathForNote(note);
+        const storageRelativePath = noteStoragePath(note, relativePath);
         try {
             let data;
             try {
-                data = await fs.readFile(resolveStorageFile(storagePath, relativePath).absolutePath);
+                data = await fs.readFile(resolveStorageFile(storagePath, storageRelativePath).absolutePath);
             } catch (error) {
                 data = Buffer.from(note.body || '', 'utf8');
             }
             entries.push({
-                name: uniqueZipEntryName(usedNames, folderExportEntryName(rootName, folderId, relativePath)),
+                name: uniqueZipEntryName(usedNames, folderExportEntryName(rootName, folderId, storageRelativePath)),
                 data,
                 date: note.updatedAtMs ? new Date(Number(note.updatedAtMs)) : new Date()
             });
@@ -2383,9 +2539,10 @@ async function folderZipEntries(storagePath, args = {}) {
 
         for (const attachment of noteAttachmentsForMetadata(note, relativePath)) {
             try {
-                const { relativePath: attachmentPath, absolutePath } = resolveStorageFile(storagePath, attachment.relativePath);
+                const attachmentStoragePath = attachment.storagePath || attachment.relativePath;
+                const { absolutePath } = resolveStorageFile(storagePath, attachmentStoragePath);
                 entries.push({
-                    name: uniqueZipEntryName(usedNames, folderExportEntryName(rootName, folderId, attachmentPath)),
+                    name: uniqueZipEntryName(usedNames, folderExportEntryName(rootName, folderId, attachmentStoragePath)),
                     data: await fs.readFile(absolutePath),
                     date: attachment.updatedAtMs ? new Date(Number(attachment.updatedAtMs)) : new Date()
                 });
@@ -2693,11 +2850,14 @@ async function registerAttachmentProtocol() {
             }
 
             const relativePath = normalizeRelativePath(rawRelativePath);
-            if (!isAttachmentRelativePath(relativePath)) {
+            const metadata = await readMetadata(storagePath);
+            const attachment = metadata ? findMetadataAttachment(metadata, relativePath, { relativePath }) : null;
+            const storageRelativePath = attachment?.storagePath || relativePath;
+            if (!isAttachmentRelativePath(relativePath) && !storageRelativePath.split('/').includes('attachments')) {
                 return new Response('첨부 파일 경로만 열 수 있습니다.', { status: 403 });
             }
 
-            const { absolutePath } = resolveStorageFile(storagePath, relativePath);
+            const { absolutePath } = resolveStorageFile(storagePath, storageRelativePath);
             const stat = await fs.stat(absolutePath);
             if (!stat.isFile()) {
                 return new Response('첨부 파일을 찾지 못했습니다.', { status: 404 });
@@ -2706,7 +2866,7 @@ async function registerAttachmentProtocol() {
             const content = await fs.readFile(absolutePath);
             return new Response(content, {
                 headers: {
-                    'Content-Type': contentTypeForFileName(relativePath),
+                    'Content-Type': contentTypeForFileName(storageRelativePath),
                     'Cache-Control': 'no-store'
                 }
             });

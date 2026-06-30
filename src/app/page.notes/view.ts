@@ -181,8 +181,8 @@ export class Component implements OnInit, OnDestroy {
     private settingsKey = 'notedown.settings.v1';
     public viewMode: ViewMode = 'split';
     public savedAt = '';
-    public notes: NoteItem[] = this.defaultNotes();
-    public activeNote: NoteItem = this.notes[0];
+    public notes: NoteItem[] = [];
+    public activeNote: NoteItem = this.emptyNote();
     public editorOptions: any = this.createEditorOptions();
     public previewBlocks: PreviewBlock[] = [];
     public previewHoveredLine: number | null = null;
@@ -281,6 +281,9 @@ export class Component implements OnInit, OnDestroy {
         const detail = (event as CustomEvent<any>).detail;
         if (detail?.source === 'page.notes') return;
         this.applyStartupSyncConflict(detail);
+        if ((detail?.ok || detail?.status === 'ok') && this.extractSyncConflicts(detail).length === 0) {
+            void this.reloadNotesAfterStartupSync();
+        }
     };
     private handleOpenSyncConflict = () => {
         this.applyStartupSyncConflict();
@@ -1526,6 +1529,7 @@ export class Component implements OnInit, OnDestroy {
     }
 
     private loadCachedNotes(selectStored: boolean) {
+        const fileBacked = this.usesFileStorage();
         try {
             const stored = localStorage.getItem(this.storageKey);
             if (stored) {
@@ -1535,19 +1539,20 @@ export class Component implements OnInit, OnDestroy {
                 }
             }
         } catch (error) {
-            // Keep the already-initialized default notes when the cache is invalid.
+            this.notes = [];
         }
 
-        if (!Array.isArray(this.notes) || this.notes.length === 0) this.notes = this.defaultNotes();
+        if (fileBacked && this.isDefaultSeedCache(this.notes)) this.notes = [];
+        if (!Array.isArray(this.notes) || this.notes.length === 0) this.notes = fileBacked ? [] : this.defaultNotes();
         if (selectStored) this.selectNoteById(localStorage.getItem(this.activeNoteKey));
     }
 
     private startDeferredStartupWork() {
+        void this.refreshNotesFromStorage(true)
+            .finally(() => { void this.runStartupSyncOrApplyStoredConflict(); });
         this.afterInitialRender(() => {
             this.monacoEditorsReady = true;
             this.requestViewUpdate();
-            void this.refreshNotesFromStorage(true)
-                .finally(() => { void this.runStartupSyncOrApplyStoredConflict(); });
         });
     }
 
@@ -1583,6 +1588,7 @@ export class Component implements OnInit, OnDestroy {
     }
 
     private async loadNotes(selectStored: boolean) {
+        const fileBacked = this.usesFileStorage();
         const fileNotes = await this.loadFileNotes();
         if (fileNotes) {
             this.notes = fileNotes;
@@ -1592,13 +1598,13 @@ export class Component implements OnInit, OnDestroy {
 
         try {
             const stored = localStorage.getItem(this.storageKey);
-            this.notes = stored ? JSON.parse(stored) : this.defaultNotes();
+            this.notes = stored ? JSON.parse(stored) : (fileBacked ? [] : this.defaultNotes());
             if (!Array.isArray(this.notes) || this.notes.length === 0) this.notes = [];
             this.notes = this.notes.map((note, index) => this.normalizeNote(note, index));
-            if (!stored) this.persist(true);
+            if (!stored && !fileBacked) this.persist(true);
         } catch (error) {
-            this.notes = this.defaultNotes();
-            this.persist(true);
+            this.notes = fileBacked ? [] : this.defaultNotes();
+            if (!fileBacked) this.persist(true);
         }
 
         if (selectStored) this.selectNoteById(localStorage.getItem(this.activeNoteKey));
@@ -1640,7 +1646,6 @@ export class Component implements OnInit, OnDestroy {
         try {
             const result = await api.loadNotes({ storagePath });
             if (!result?.ok || !Array.isArray(result.notes)) return null;
-            if (result.notes.length === 0 && localStorage.getItem(this.storageKey)) return null;
             const notes = result.notes.map((note: any, index: number) => this.normalizeNote(note, index));
             localStorage.setItem(this.storageKey, JSON.stringify(notes));
             return notes;
@@ -1803,7 +1808,7 @@ export class Component implements OnInit, OnDestroy {
 
     private isSystemSyncPath(relativePath: string) {
         const firstPart = String(relativePath || '').replace(/\\/g, '/').replace(/^\/+/g, '').split('/').filter(Boolean)[0] || '';
-        return firstPart === 'metadata.json' || firstPart === '.notedown-sync.json';
+        return firstPart === 'metadata.json' || firstPart === 'metadata.db' || firstPart === '.notedown-sync.json';
     }
 
     private compactSyncConflict(conflict: any) {
@@ -2084,10 +2089,20 @@ export class Component implements OnInit, OnDestroy {
         try {
             const settings = JSON.parse(localStorage.getItem(this.settingsKey) || '{}');
             if (this.isAndroidPlatform()) return settings.storagePath || 'android-default';
-            return settings.storagePath || '';
+            return settings.storagePath || '~/Documents/Notedown Notes';
         } catch (error) {
-            return this.isAndroidPlatform() ? 'android-default' : '';
+            return this.isAndroidPlatform() ? 'android-default' : '~/Documents/Notedown Notes';
         }
+    }
+
+    private usesFileStorage() {
+        return Boolean((window as any).notedown?.storage?.loadNotes);
+    }
+
+    private isDefaultSeedCache(notes: NoteItem[]) {
+        if (!Array.isArray(notes) || notes.length !== 2) return false;
+        const ids = new Set(notes.map(note => note?.id));
+        return ids.has('today-note') && ids.has('product-scope');
     }
 
     private createEditorOptions() {

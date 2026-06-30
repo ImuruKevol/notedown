@@ -13,7 +13,9 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
+import android.content.ContentValues;
 import android.database.Cursor;
+import android.database.sqlite.SQLiteDatabase;
 import android.graphics.Canvas;
 import android.graphics.pdf.PdfDocument;
 import android.net.Uri;
@@ -75,7 +77,9 @@ import java.util.zip.ZipOutputStream;
 )
 public class NotedownNativePlugin extends Plugin {
     private static final String APP_PREFERENCES = "notedown-app-preferences";
-    private static final String METADATA_FILE = "metadata.json";
+    private static final String LEGACY_METADATA_FILE = "metadata.json";
+    private static final String METADATA_DB_FILE = "metadata.db";
+    private static final int METADATA_SCHEMA_VERSION = 1;
     private static final String SYNC_STATE_FILE = ".notedown-sync.json";
     private static final String PDF_CACHE_DIR = "pending-pdf";
     private static final String NOTIFICATION_PERMISSION_ALIAS = "notifications";
@@ -132,7 +136,7 @@ public class NotedownNativePlugin extends Plugin {
             JSObject result = new JSObject();
             result.put("ok", true);
             result.put("storagePath", storage.getAbsolutePath());
-            result.put("metadataPath", new File(storage, METADATA_FILE).getAbsolutePath());
+            result.put("metadataPath", metadataDbFile(storage).getAbsolutePath());
             result.put("metadataExists", metadata != null);
             result.put("notes", metadata == null ? 0 : metadata.optJSONArray("notes") == null ? 0 : metadata.optJSONArray("notes").length());
             result.put("workspaces", metadata == null ? 0 : metadata.optJSONArray("workspaces") == null ? 0 : metadata.optJSONArray("workspaces").length());
@@ -164,7 +168,9 @@ public class NotedownNativePlugin extends Plugin {
                     if (note == null) continue;
                     JSONObject next = cloneObject(note);
                     String relativePath = normalizeRelativePath(note.optString("relativePath", ""));
-                    next.put("body", readText(resolveStorageFile(storage, relativePath), ""));
+                    String storageRelativePath = noteStoragePath(note, relativePath);
+                    next.put("body", readText(resolveStorageFile(storage, storageRelativePath), ""));
+                    next.put("storagePath", storageRelativePath);
                     next.put("folder", note.optString("workspace", note.optString("folder", UNFILED_WORKSPACE_ID)));
                     notes.put(next);
                 }
@@ -191,26 +197,34 @@ public class NotedownNativePlugin extends Plugin {
             Map<String, JSONObject> workspaces = new LinkedHashMap<>();
             workspaces.put(UNFILED_WORKSPACE_ID, workspacePayload(UNFILED_WORKSPACE_ID, "미지정 워크스페이스"));
             JSONArray metadataNotes = new JSONArray();
-            List<String> writtenRelativePaths = new ArrayList<>();
-            List<String> writtenAttachmentPaths = new ArrayList<>();
+            List<String> writtenStoragePaths = new ArrayList<>();
+            List<String> writtenAttachmentStoragePaths = new ArrayList<>();
+            Set<String> usedStoragePaths = new HashSet<>();
 
             for (int i = 0; i < notes.length(); i++) {
                 JSONObject note = notes.optJSONObject(i);
                 if (note == null) continue;
                 String workspaceId = noteWorkspaceId(note);
                 String workspaceName = noteWorkspaceName(note, workspaceId);
-                String fileName = noteFileName(note);
                 String relativePath = relativePathForNote(note);
-                File target = resolveStorageFile(storage, relativePath);
+                String desiredStoragePath = desiredNoteStoragePath(note, relativePath);
+                String storageRelativePath = uniqueStorageRelativePath(
+                    storage,
+                    desiredStoragePath,
+                    usedStoragePaths,
+                    note.optString("storagePath", relativePath)
+                );
+                String fileName = posixBaseName(storageRelativePath);
+                File target = resolveStorageFile(storage, storageRelativePath);
                 ensureDirectory(target.getParentFile());
                 writeBytes(target, note.optString("body", "").getBytes(StandardCharsets.UTF_8));
-                writtenRelativePaths.add(relativePath);
+                writtenStoragePaths.add(storageRelativePath);
 
                 workspaces.put(workspaceId, workspacePayload(workspaceId, workspaceName));
                 JSONArray attachments = noteAttachmentsForMetadata(note, relativePath);
                 for (int attachmentIndex = 0; attachmentIndex < attachments.length(); attachmentIndex++) {
                     JSONObject attachment = attachments.optJSONObject(attachmentIndex);
-                    if (attachment != null) writtenAttachmentPaths.add(attachment.optString("relativePath", ""));
+                    if (attachment != null) writtenAttachmentStoragePaths.add(attachment.optString("storagePath", attachment.optString("relativePath", "")));
                 }
 
                 long now = System.currentTimeMillis();
@@ -225,6 +239,7 @@ public class NotedownNativePlugin extends Plugin {
                 metadataNote.put("folder", workspaceId);
                 metadataNote.put("fileName", fileName);
                 metadataNote.put("relativePath", relativePath);
+                metadataNote.put("storagePath", storageRelativePath);
                 metadataNote.put("attachments", attachments);
                 metadataNote.put("createdAt", note.optString("createdAt", labelForDate(note.optLong("createdAtMs", now))));
                 metadataNote.put("createdAtMs", note.optLong("createdAtMs", now));
@@ -239,7 +254,7 @@ public class NotedownNativePlugin extends Plugin {
             metadata.put("workspaces", new JSONArray(workspaces.values()));
             metadata.put("notes", metadataNotes);
             writeMetadata(storage, metadata);
-            removeMetadataOrphans(storage, previousMetadata, writtenRelativePaths, writtenAttachmentPaths);
+            removeMetadataOrphans(storage, previousMetadata, writtenStoragePaths, writtenAttachmentStoragePaths);
 
             JSObject result = new JSObject();
             result.put("ok", true);
@@ -309,7 +324,9 @@ public class NotedownNativePlugin extends Plugin {
         runFileTask(call, () -> {
             File storage = storageRoot(call.getString("storagePath"));
             String relativePath = normalizeRelativePath(call.getString("relativePath", ""));
-            File target = resolveStorageFile(storage, relativePath);
+            JSONObject metadata = readMetadata(storage);
+            JSONObject attachment = metadata == null ? null : findMetadataAttachment(metadata, relativePath);
+            File target = resolveStorageFile(storage, attachment == null ? relativePath : attachment.optString("storagePath", relativePath));
             if (!target.exists()) throw new IllegalArgumentException("첨부 파일을 찾지 못했습니다.");
 
             Uri uri = FileProvider.getUriForFile(getContext(), getContext().getPackageName() + ".fileprovider", target);
@@ -334,12 +351,14 @@ public class NotedownNativePlugin extends Plugin {
         runFileTask(call, () -> {
             File storage = storageRoot(call.getString("storagePath"));
             String relativePath = normalizeRelativePath(call.getString("relativePath", ""));
-            File target = resolveStorageFile(storage, relativePath);
+            String storageRelativePath = storagePathForRead(storage, relativePath);
+            File target = resolveStorageFile(storage, storageRelativePath);
             boolean exists = target.exists();
             byte[] bytes = exists ? readBytes(target) : new byte[0];
             JSObject result = new JSObject();
             result.put("ok", exists);
             result.put("relativePath", relativePath);
+            result.put("storagePath", storageRelativePath);
             result.put("content", new String(bytes, StandardCharsets.UTF_8));
             result.put("contentBase64", Base64.getEncoder().encodeToString(bytes));
             result.put("contentEncoding", "base64");
@@ -358,7 +377,8 @@ public class NotedownNativePlugin extends Plugin {
             File storage = storageRoot(call.getString("storagePath"));
             String relativePath = normalizeRelativePath(call.getString("relativePath", ""));
             if (relativePath.isEmpty()) throw new IllegalArgumentException("파일 경로가 비어 있습니다.");
-            File target = resolveStorageFile(storage, relativePath);
+            String storageRelativePath = storagePathForRead(storage, relativePath);
+            File target = resolveStorageFile(storage, storageRelativePath);
             String encoding = call.getString("contentEncoding", "utf8");
             String content = call.getString("content", "");
             byte[] bytes = "base64".equals(encoding)
@@ -369,6 +389,7 @@ public class NotedownNativePlugin extends Plugin {
             JSObject result = new JSObject();
             result.put("ok", true);
             result.put("relativePath", relativePath);
+            result.put("storagePath", storageRelativePath);
             result.put("contentHash", sha256(bytes));
             result.put("updatedAtMs", target.lastModified());
             result.put("size", bytes.length);
@@ -381,7 +402,7 @@ public class NotedownNativePlugin extends Plugin {
         runFileTask(call, () -> {
             File storage = storageRoot(call.getString("storagePath"));
             String relativePath = normalizeRelativePath(call.getString("relativePath", ""));
-            deleteStoragePath(storage, relativePath);
+            deleteStoragePath(storage, storagePathForRead(storage, relativePath));
             JSObject result = new JSObject();
             result.put("ok", true);
             result.put("relativePath", relativePath);
@@ -641,14 +662,11 @@ public class NotedownNativePlugin extends Plugin {
         String requestedRelativePath,
         String requestedId
     ) throws Exception {
-        String baseRelativePath = normalizeRelativePath(requestedRelativePath);
-        if (baseRelativePath.isEmpty()) {
-            baseRelativePath = normalizeRelativePath(noteAttachmentDirectory(noteRelativePath, note) + "/" + fileName);
-        }
-        String relativePath = requestedRelativePath == null
-            ? uniqueAttachmentRelativePath(storage, baseRelativePath)
-            : baseRelativePath;
-        File target = resolveStorageFile(storage, relativePath);
+        String logicalRelativePath = normalizeRelativePath(requestedRelativePath);
+        String baseStoragePath = normalizeRelativePath(noteAttachmentDirectory(noteRelativePath, note) + "/" + fileName);
+        String storageRelativePath = uniqueStorageRelativePath(storage, baseStoragePath, new HashSet<>(), "");
+        String relativePath = logicalRelativePath.isEmpty() ? storageRelativePath : logicalRelativePath;
+        File target = resolveStorageFile(storage, storageRelativePath);
         writeBytes(target, bytes);
 
         long now = System.currentTimeMillis();
@@ -656,6 +674,7 @@ public class NotedownNativePlugin extends Plugin {
             .put("id", requestedId == null ? "" : requestedId)
             .put("fileName", fileName)
             .put("relativePath", relativePath)
+            .put("storagePath", storageRelativePath)
             .put("noteRelativePath", noteRelativePath)
             .put("mimeType", mimeType == null ? JSONObject.NULL.toString() : mimeType)
             .put("size", bytes.length)
@@ -905,9 +924,10 @@ public class NotedownNativePlugin extends Plugin {
                 } catch (Exception ignored) {
                     continue;
                 }
-                File file = resolveStorageFile(storage, relativePath);
+                String storageRelativePath = normalizeRelativePath(attachment.optString("storagePath", relativePath));
+                File file = resolveStorageFile(storage, storageRelativePath);
                 if (!file.exists() || !file.isFile()) continue;
-                String entryName = uniqueZipEntryName(usedNames, "attachments/" + zipEntryName(relativePath, attachment.optString("fileName", "attachment")));
+                String entryName = uniqueZipEntryName(usedNames, "attachments/" + zipEntryName(storageRelativePath, attachment.optString("fileName", "attachment")));
                 putZipEntry(zip, entryName, readBytes(file), attachment.optLong("updatedAtMs", System.currentTimeMillis()));
             }
         } finally {
@@ -1172,6 +1192,110 @@ public class NotedownNativePlugin extends Plugin {
         return target;
     }
 
+    private File metadataDbFile(File storage) {
+        return new File(storage, METADATA_DB_FILE);
+    }
+
+    private SQLiteDatabase openMetadataDatabase(File storage) throws IOException {
+        ensureDirectory(storage);
+        SQLiteDatabase db = SQLiteDatabase.openOrCreateDatabase(metadataDbFile(storage), null);
+        db.execSQL("CREATE TABLE IF NOT EXISTS metadata_document (" +
+            "id INTEGER PRIMARY KEY CHECK (id = 1), " +
+            "schema_version INTEGER NOT NULL, " +
+            "version INTEGER NOT NULL, " +
+            "generated_at TEXT, " +
+            "extra_json TEXT NOT NULL)");
+        db.execSQL("CREATE TABLE IF NOT EXISTS metadata_workspaces (" +
+            "id TEXT PRIMARY KEY, " +
+            "position INTEGER NOT NULL, " +
+            "body_json TEXT NOT NULL)");
+        db.execSQL("CREATE TABLE IF NOT EXISTS metadata_notes (" +
+            "relative_path TEXT PRIMARY KEY, " +
+            "note_id TEXT, " +
+            "workspace_id TEXT, " +
+            "title TEXT, " +
+            "updated_at_ms INTEGER, " +
+            "position INTEGER NOT NULL, " +
+            "body_json TEXT NOT NULL)");
+        db.execSQL("CREATE INDEX IF NOT EXISTS idx_metadata_notes_workspace ON metadata_notes(workspace_id)");
+        db.execSQL("CREATE INDEX IF NOT EXISTS idx_metadata_notes_updated ON metadata_notes(updated_at_ms)");
+        db.execSQL("CREATE TABLE IF NOT EXISTS metadata_attachments (" +
+            "relative_path TEXT PRIMARY KEY, " +
+            "note_relative_path TEXT NOT NULL, " +
+            "attachment_id TEXT, " +
+            "position INTEGER NOT NULL, " +
+            "body_json TEXT NOT NULL, " +
+            "FOREIGN KEY(note_relative_path) REFERENCES metadata_notes(relative_path) ON DELETE CASCADE)");
+        db.execSQL("CREATE INDEX IF NOT EXISTS idx_metadata_attachments_note ON metadata_attachments(note_relative_path)");
+        return db;
+    }
+
+    private JSONObject jsonFromString(String value) {
+        try {
+            if (value == null || value.trim().isEmpty()) return new JSONObject();
+            return new JSONObject(value);
+        } catch (Exception error) {
+            return new JSONObject();
+        }
+    }
+
+    private JSONArray readMetadataWorkspaces(SQLiteDatabase db) throws JSONException {
+        JSONArray workspaces = new JSONArray();
+        Cursor cursor = db.rawQuery("SELECT body_json FROM metadata_workspaces ORDER BY position ASC, id ASC", null);
+        try {
+            while (cursor.moveToNext()) workspaces.put(jsonFromString(cursor.getString(0)));
+        } finally {
+            cursor.close();
+        }
+        return workspaces;
+    }
+
+    private JSONArray readMetadataNotes(SQLiteDatabase db) throws JSONException {
+        Map<String, JSONArray> attachmentsByNote = new LinkedHashMap<>();
+        Cursor attachmentCursor = db.rawQuery(
+            "SELECT note_relative_path, body_json FROM metadata_attachments ORDER BY note_relative_path ASC, position ASC, relative_path ASC",
+            null
+        );
+        try {
+            while (attachmentCursor.moveToNext()) {
+                String noteRelativePath = attachmentCursor.getString(0);
+                JSONArray attachments = attachmentsByNote.get(noteRelativePath);
+                if (attachments == null) {
+                    attachments = new JSONArray();
+                    attachmentsByNote.put(noteRelativePath, attachments);
+                }
+                attachments.put(jsonFromString(attachmentCursor.getString(1)));
+            }
+        } finally {
+            attachmentCursor.close();
+        }
+
+        JSONArray notes = new JSONArray();
+        Cursor noteCursor = db.rawQuery("SELECT relative_path, body_json FROM metadata_notes ORDER BY position ASC, relative_path ASC", null);
+        try {
+            while (noteCursor.moveToNext()) {
+                String relativePath = noteCursor.getString(0);
+                JSONObject note = jsonFromString(noteCursor.getString(1));
+                note.put("attachments", attachmentsByNote.containsKey(relativePath) ? attachmentsByNote.get(relativePath) : new JSONArray());
+                notes.put(note);
+            }
+        } finally {
+            noteCursor.close();
+        }
+        return notes;
+    }
+
+    private JSONObject metadataExtraJson(JSONObject metadata) throws JSONException {
+        JSONObject extra = new JSONObject();
+        java.util.Iterator<String> keys = metadata.keys();
+        while (keys.hasNext()) {
+            String key = keys.next();
+            if ("version".equals(key) || "generatedAt".equals(key) || "workspaces".equals(key) || "notes".equals(key)) continue;
+            extra.put(key, metadata.opt(key));
+        }
+        return extra;
+    }
+
     private JSONObject ensureMetadata(File storage) throws Exception {
         JSONObject metadata = readMetadata(storage);
         if (metadata != null) return metadata;
@@ -1180,18 +1304,102 @@ public class NotedownNativePlugin extends Plugin {
     }
 
     private JSONObject readMetadata(File storage) {
-        File metadata = new File(storage, METADATA_FILE);
+        File metadata = metadataDbFile(storage);
         if (!metadata.exists()) return null;
+        SQLiteDatabase db = null;
+        Cursor cursor = null;
         try {
-            return new JSONObject(readText(metadata, ""));
+            db = openMetadataDatabase(storage);
+            cursor = db.rawQuery("SELECT version, generated_at, extra_json FROM metadata_document WHERE id = 1", null);
+            if (!cursor.moveToFirst()) return null;
+
+            JSONObject result = jsonFromString(cursor.getString(2));
+            result.put("version", cursor.getInt(0));
+            result.put("generatedAt", cursor.isNull(1) ? JSONObject.NULL : cursor.getString(1));
+            result.put("workspaces", readMetadataWorkspaces(db));
+            result.put("notes", readMetadataNotes(db));
+            return result;
         } catch (Exception error) {
             return null;
+        } finally {
+            if (cursor != null) cursor.close();
+            if (db != null) db.close();
         }
     }
 
     private void writeMetadata(File storage, JSONObject metadata) throws IOException, JSONException {
         ensureDirectory(storage);
-        writeText(new File(storage, METADATA_FILE), metadata.toString(2) + "\n");
+        SQLiteDatabase db = openMetadataDatabase(storage);
+        db.beginTransaction();
+        try {
+            db.delete("metadata_attachments", null, null);
+            db.delete("metadata_notes", null, null);
+            db.delete("metadata_workspaces", null, null);
+            db.delete("metadata_document", null, null);
+
+            ContentValues document = new ContentValues();
+            document.put("id", 1);
+            document.put("schema_version", METADATA_SCHEMA_VERSION);
+            document.put("version", metadata.optInt("version", 1));
+            if (metadata.isNull("generatedAt")) document.putNull("generated_at");
+            else document.put("generated_at", metadata.optString("generatedAt", null));
+            document.put("extra_json", metadataExtraJson(metadata).toString());
+            db.insertWithOnConflict("metadata_document", null, document, SQLiteDatabase.CONFLICT_REPLACE);
+
+            JSONArray workspaces = metadata.optJSONArray("workspaces");
+            if (workspaces != null) {
+                for (int i = 0; i < workspaces.length(); i++) {
+                    JSONObject workspace = workspaces.optJSONObject(i);
+                    if (workspace == null || workspace.optString("id", "").isEmpty()) continue;
+                    ContentValues values = new ContentValues();
+                    values.put("id", workspace.optString("id"));
+                    values.put("position", i);
+                    values.put("body_json", workspace.toString());
+                    db.insertWithOnConflict("metadata_workspaces", null, values, SQLiteDatabase.CONFLICT_REPLACE);
+                }
+            }
+
+            JSONArray notes = metadata.optJSONArray("notes");
+            if (notes != null) {
+                for (int i = 0; i < notes.length(); i++) {
+                    JSONObject note = notes.optJSONObject(i);
+                    if (note == null || normalizeRelativePath(note.optString("relativePath", "")).isEmpty()) continue;
+                    String relativePath = normalizeRelativePath(note.optString("relativePath", ""));
+                    JSONArray attachments = note.optJSONArray("attachments");
+                    JSONObject noteBody = cloneObject(note);
+                    noteBody.remove("attachments");
+
+                    ContentValues values = new ContentValues();
+                    values.put("relative_path", relativePath);
+                    values.put("note_id", note.optString("id", null));
+                    values.put("workspace_id", note.optString("workspace", note.optString("folder", null)));
+                    values.put("title", note.optString("title", null));
+                    if (note.has("updatedAtMs") && !note.isNull("updatedAtMs")) values.put("updated_at_ms", note.optLong("updatedAtMs"));
+                    else values.putNull("updated_at_ms");
+                    values.put("position", i);
+                    values.put("body_json", noteBody.toString());
+                    db.insertWithOnConflict("metadata_notes", null, values, SQLiteDatabase.CONFLICT_REPLACE);
+
+                    if (attachments == null) continue;
+                    for (int attachmentIndex = 0; attachmentIndex < attachments.length(); attachmentIndex++) {
+                        JSONObject attachment = attachments.optJSONObject(attachmentIndex);
+                        if (attachment == null || normalizeRelativePath(attachment.optString("relativePath", "")).isEmpty()) continue;
+                        ContentValues attachmentValues = new ContentValues();
+                        attachmentValues.put("relative_path", normalizeRelativePath(attachment.optString("relativePath", "")));
+                        attachmentValues.put("note_relative_path", relativePath);
+                        attachmentValues.put("attachment_id", attachment.optString("id", attachment.optString("attachmentId", null)));
+                        attachmentValues.put("position", attachmentIndex);
+                        attachmentValues.put("body_json", attachment.toString());
+                        db.insertWithOnConflict("metadata_attachments", null, attachmentValues, SQLiteDatabase.CONFLICT_REPLACE);
+                    }
+                }
+            }
+
+            db.setTransactionSuccessful();
+        } finally {
+            db.endTransaction();
+            db.close();
+        }
     }
 
     private JSObject generateMetadata(File storage, boolean importDeepMarkdown) throws Exception {
@@ -1206,7 +1414,7 @@ public class NotedownNativePlugin extends Plugin {
         File[] entries = storage.listFiles();
         if (entries != null) {
             for (File entry : entries) {
-                if (entry.getName().startsWith(".") || METADATA_FILE.equals(entry.getName())) continue;
+                if (entry.getName().startsWith(".") || LEGACY_METADATA_FILE.equals(entry.getName()) || METADATA_DB_FILE.equals(entry.getName())) continue;
                 if (entry.isFile() && entry.getName().toLowerCase(Locale.ROOT).endsWith(".md")) {
                     String relativePath = entry.getName();
                     notes.put(makeMetadataNote(relativePath, UNFILED_WORKSPACE_ID, "미지정 워크스페이스", readText(entry, ""), entry));
@@ -1266,7 +1474,7 @@ public class NotedownNativePlugin extends Plugin {
         JSObject result = new JSObject();
         result.put("ok", true);
         result.put("storagePath", storage.getAbsolutePath());
-        result.put("metadataPath", new File(storage, METADATA_FILE).getAbsolutePath());
+        result.put("metadataPath", metadataDbFile(storage).getAbsolutePath());
         result.put("notes", notes.length());
         result.put("workspaces", workspaces.length());
         result.put("rootMarkdownCount", rootMarkdownCount);
@@ -1281,7 +1489,7 @@ public class NotedownNativePlugin extends Plugin {
         File[] entries = dir.listFiles();
         if (entries == null) return files;
         for (File entry : entries) {
-            if (entry.getName().startsWith(".") || METADATA_FILE.equals(entry.getName())) continue;
+            if (entry.getName().startsWith(".") || LEGACY_METADATA_FILE.equals(entry.getName()) || METADATA_DB_FILE.equals(entry.getName())) continue;
             if (entry.isDirectory()) {
                 if (depth > 0) files.addAll(listMarkdownFiles(entry, depth - 1, root));
             } else if (entry.isFile() && entry.getName().toLowerCase(Locale.ROOT).endsWith(".md")) {
@@ -1303,6 +1511,13 @@ public class NotedownNativePlugin extends Plugin {
         String fileName = new File(relativePath).getName();
         long updatedAtMs = file.lastModified() > 0 ? file.lastModified() : System.currentTimeMillis();
         long createdAtMs = updatedAtMs;
+        JSONObject seed = new JSONObject();
+        seed.put("workspace", workspaceId);
+        seed.put("workspaceName", workspaceName);
+        seed.put("folder", workspaceId);
+        seed.put("fileName", fileName);
+        seed.put("relativePath", normalizeRelativePath(relativePath));
+        String storageRelativePath = noteStoragePath(seed, relativePath);
         JSONObject note = new JSONObject();
         note.put("id", noteIdFromRelativePath(relativePath));
         note.put("icon", "N");
@@ -1312,8 +1527,9 @@ public class NotedownNativePlugin extends Plugin {
         note.put("workspace", workspaceId);
         note.put("workspaceName", workspaceName);
         note.put("folder", workspaceId);
-        note.put("fileName", fileName);
+        note.put("fileName", posixBaseName(storageRelativePath));
         note.put("relativePath", normalizeRelativePath(relativePath));
+        note.put("storagePath", storageRelativePath);
         note.put("createdAt", labelForDate(createdAtMs));
         note.put("createdAtMs", createdAtMs);
         note.put("updatedAt", labelForDate(updatedAtMs));
@@ -1331,8 +1547,9 @@ public class NotedownNativePlugin extends Plugin {
     }
 
     private String noteWorkspaceName(JSONObject note, String workspaceId) {
-        String value = note.optString("workspaceName", note.optString("workspaceLabel", workspaceId)).trim();
-        return value.isEmpty() ? workspaceId : value;
+        String fallback = UNFILED_WORKSPACE_ID.equals(workspaceId) ? "미지정 워크스페이스" : workspaceId;
+        String value = note.optString("workspaceName", note.optString("workspaceLabel", fallback)).trim();
+        return value.isEmpty() ? fallback : value;
     }
 
     private String noteFileName(JSONObject note) {
@@ -1346,6 +1563,54 @@ public class NotedownNativePlugin extends Plugin {
         String workspaceId = noteWorkspaceId(note);
         String fileName = noteFileName(note);
         return UNFILED_WORKSPACE_ID.equals(workspaceId) ? fileName : normalizeRelativePath(workspaceId + "/" + fileName);
+    }
+
+    private String noteStoragePath(JSONObject note, String relativePath) {
+        String storagePath = normalizeRelativePath(note.optString("storagePath", ""));
+        if (!storagePath.isEmpty()) return storagePath;
+        return desiredNoteStoragePath(note, relativePath);
+    }
+
+    private String desiredNoteStoragePath(JSONObject note, String relativePath) {
+        String safeRelativePath = normalizeRelativePath(relativePath);
+        String fallbackStem = posixStem(safeRelativePath);
+        if (fallbackStem.isEmpty()) fallbackStem = "note";
+        String suffix = posixExtension(note.optString("fileName", safeRelativePath));
+        if (suffix.isEmpty()) suffix = ".md";
+        String fileName = safeStorageFileName(note.optString("title", note.optString("fileName", fallbackStem)), fallbackStem, suffix);
+        List<String> parts = storageFolderPartsForNote(note, safeRelativePath);
+        parts.add(fileName);
+        return normalizeRelativePath(String.join("/", parts));
+    }
+
+    private List<String> storageFolderPartsForNote(JSONObject note, String relativePath) {
+        List<String> rawParts = new ArrayList<>();
+        String folder = note.optString("folder", "");
+        if (folder.trim().isEmpty()) {
+            String parent = posixParent(relativePath);
+            folder = ".".equals(parent) ? "" : parent;
+        }
+        for (String part : folder.replace('\\', '/').split("/")) {
+            if (!part.isEmpty() && !".".equals(part) && !"..".equals(part)) rawParts.add(part);
+        }
+
+        String workspaceId = note.optString("workspace", note.optString("folder", ""));
+        String workspaceName = noteWorkspaceName(note, workspaceId);
+        String workspaceFirst = workspaceId.replace('\\', '/').split("/", 2)[0];
+        if (!workspaceName.isEmpty()) {
+            if (!rawParts.isEmpty()) {
+                String first = rawParts.get(0);
+                if (workspaceId.isEmpty() || first.equals(workspaceId) || first.equals(workspaceFirst) || "unfiled".equals(first) || "미지정 워크스페이스".equals(first)) {
+                    rawParts.set(0, workspaceName);
+                }
+            } else {
+                rawParts.add(workspaceName);
+            }
+        }
+
+        List<String> safeParts = new ArrayList<>();
+        for (String part : rawParts) safeParts.add(safeStorageSegment(part, "folder"));
+        return safeParts;
     }
 
     private JSONArray noteAttachmentsForMetadata(JSONObject note, String noteRelativePath) throws Exception {
@@ -1363,10 +1628,12 @@ public class NotedownNativePlugin extends Plugin {
 
     private JSONObject normalizeAttachmentMetadata(JSONObject attachment, String noteRelativePath) throws Exception {
         String relativePath = normalizeRelativePath(attachment.optString("relativePath", ""));
+        String storagePath = normalizeRelativePath(attachment.optString("storagePath", relativePath));
         JSONObject result = new JSONObject();
         result.put("id", attachment.optString("id", attachment.optString("attachmentId", "att-" + sha1(relativePath).substring(0, 16))));
         result.put("fileName", safeAttachmentFileName(attachment.optString("fileName", new File(relativePath).getName())));
         result.put("relativePath", relativePath);
+        result.put("storagePath", storagePath);
         result.put("noteRelativePath", normalizeRelativePath(attachment.optString("noteRelativePath", noteRelativePath)));
         String mimeType = attachment.optString("mimeType", "");
         result.put("mimeType", mimeType.isEmpty() || "null".equals(mimeType) ? JSONObject.NULL : mimeType);
@@ -1388,6 +1655,38 @@ public class NotedownNativePlugin extends Plugin {
         return null;
     }
 
+    private JSONObject findMetadataAttachment(JSONObject metadata, String relativePath) {
+        JSONArray notes = metadata.optJSONArray("notes");
+        if (notes == null) return null;
+        for (int i = 0; i < notes.length(); i++) {
+            JSONObject note = notes.optJSONObject(i);
+            if (note == null) continue;
+            JSONArray attachments = note.optJSONArray("attachments");
+            if (attachments == null) continue;
+            for (int j = 0; j < attachments.length(); j++) {
+                JSONObject attachment = attachments.optJSONObject(j);
+                if (attachment == null) continue;
+                if (normalizeRelativePath(attachment.optString("relativePath", "")).equals(relativePath)) return attachment;
+            }
+        }
+        return null;
+    }
+
+    private String storagePathForRead(File storage, String relativePath) {
+        String safeRelativePath = normalizeRelativePath(relativePath);
+        try {
+            JSONObject metadata = readMetadata(storage);
+            if (metadata != null) {
+                JSONObject attachment = findMetadataAttachment(metadata, safeRelativePath);
+                if (attachment != null) return normalizeRelativePath(attachment.optString("storagePath", safeRelativePath));
+                JSONObject note = findMetadataNote(metadata, safeRelativePath);
+                if (note != null) return noteStoragePath(note, safeRelativePath);
+            }
+        } catch (Exception ignored) {
+        }
+        return safeRelativePath;
+    }
+
     private void upsertMetadataNote(JSONObject metadata, JSONObject note) throws JSONException {
         JSONArray notes = metadata.optJSONArray("notes");
         if (notes == null) {
@@ -1407,11 +1706,13 @@ public class NotedownNativePlugin extends Plugin {
 
     private JSONObject notePayload(JSONObject note, String relativePath) throws Exception {
         JSONObject result = cloneObject(note);
+        String storagePath = noteStoragePath(note, relativePath);
         result.put("relativePath", relativePath);
+        result.put("storagePath", storagePath);
         result.put("workspace", noteWorkspaceId(note));
         result.put("folder", noteWorkspaceId(note));
         result.put("workspaceName", noteWorkspaceName(note, noteWorkspaceId(note)));
-        result.put("fileName", noteFileName(note));
+        result.put("fileName", posixBaseName(storagePath));
         result.put("attachments", noteAttachmentsForMetadata(note, relativePath));
         return result;
     }
@@ -1439,12 +1740,11 @@ public class NotedownNativePlugin extends Plugin {
 
     private String noteAttachmentDirectory(String noteRelativePath, JSONObject note) {
         String safeNoteRelativePath = normalizeRelativePath(noteRelativePath);
-        int slash = safeNoteRelativePath.lastIndexOf('/');
-        String noteDir = slash >= 0 ? safeNoteRelativePath.substring(0, slash) : "";
-        String noteFile = slash >= 0 ? safeNoteRelativePath.substring(slash + 1) : safeNoteRelativePath;
-        String noteName = noteFile.replaceAll("(?i)\\.md$", "");
-        String noteSegment = safePathSegment(note.optString("id", noteName));
-        return normalizeRelativePath((noteDir.isEmpty() ? "" : noteDir + "/") + ".attachments/" + noteSegment);
+        String noteRelativeStoragePath = noteStoragePath(note, safeNoteRelativePath);
+        String noteDir = posixParent(noteRelativeStoragePath);
+        String noteName = posixStem(noteRelativeStoragePath);
+        String noteSegment = safeStorageSegment(note.optString("title", noteName), "note");
+        return normalizeRelativePath((".".equals(noteDir) ? "" : noteDir + "/") + "attachments/" + noteSegment);
     }
 
     private String uniqueAttachmentRelativePath(File storage, String baseRelativePath) throws IOException {
@@ -1463,7 +1763,25 @@ public class NotedownNativePlugin extends Plugin {
         return candidate;
     }
 
-    private void removeMetadataOrphans(File storage, JSONObject previousMetadata, List<String> writtenRelativePaths, List<String> writtenAttachmentPaths) {
+    private String uniqueStorageRelativePath(File storage, String baseRelativePath, Set<String> usedPaths, String currentRelativePath) throws IOException {
+        String safeRelativePath = normalizeRelativePath(baseRelativePath);
+        String currentPath = normalizeRelativePath(currentRelativePath);
+        String extension = "";
+        int dot = safeRelativePath.lastIndexOf('.');
+        int slash = safeRelativePath.lastIndexOf('/');
+        if (dot > slash) extension = safeRelativePath.substring(dot);
+        String stem = extension.isEmpty() ? safeRelativePath : safeRelativePath.substring(0, safeRelativePath.length() - extension.length());
+        String candidate = safeRelativePath;
+        int suffix = 2;
+        while (usedPaths.contains(candidate) || (!candidate.equals(currentPath) && resolveStorageFile(storage, candidate).exists())) {
+            candidate = normalizeRelativePath(stem + "-" + suffix + extension);
+            suffix++;
+        }
+        usedPaths.add(candidate);
+        return candidate;
+    }
+
+    private void removeMetadataOrphans(File storage, JSONObject previousMetadata, List<String> writtenStoragePaths, List<String> writtenAttachmentStoragePaths) {
         if (previousMetadata == null) return;
         JSONArray notes = previousMetadata.optJSONArray("notes");
         if (notes == null) return;
@@ -1471,8 +1789,9 @@ public class NotedownNativePlugin extends Plugin {
             JSONObject note = notes.optJSONObject(i);
             if (note == null) continue;
             String relativePath = normalizeRelativePath(note.optString("relativePath", ""));
-            if (!relativePath.isEmpty() && !writtenRelativePaths.contains(relativePath)) {
-                deleteStoragePath(storage, relativePath);
+            String storageRelativePath = noteStoragePath(note, relativePath);
+            if (!storageRelativePath.isEmpty() && !writtenStoragePaths.contains(storageRelativePath)) {
+                deleteStoragePath(storage, storageRelativePath);
             }
             JSONArray attachments = note.optJSONArray("attachments");
             if (attachments == null) continue;
@@ -1480,8 +1799,9 @@ public class NotedownNativePlugin extends Plugin {
                 JSONObject attachment = attachments.optJSONObject(j);
                 if (attachment == null) continue;
                 String attachmentPath = normalizeRelativePath(attachment.optString("relativePath", ""));
-                if (!attachmentPath.isEmpty() && !writtenAttachmentPaths.contains(attachmentPath)) {
-                    deleteStoragePath(storage, attachmentPath);
+                String attachmentStoragePath = normalizeRelativePath(attachment.optString("storagePath", attachmentPath));
+                if (!attachmentStoragePath.isEmpty() && !writtenAttachmentStoragePaths.contains(attachmentStoragePath)) {
+                    deleteStoragePath(storage, attachmentStoragePath);
                 }
             }
         }
@@ -1516,7 +1836,7 @@ public class NotedownNativePlugin extends Plugin {
             safe.add(part);
         }
         if (safe.isEmpty()) return "";
-        if (METADATA_FILE.equals(safe.get(0)) || SYNC_STATE_FILE.equals(safe.get(0))) {
+        if (LEGACY_METADATA_FILE.equals(safe.get(0)) || METADATA_DB_FILE.equals(safe.get(0)) || SYNC_STATE_FILE.equals(safe.get(0))) {
             throw new IllegalArgumentException("동기화할 수 없는 시스템 파일입니다.");
         }
         return String.join("/", safe);
@@ -1532,6 +1852,57 @@ public class NotedownNativePlugin extends Plugin {
         if (base.isEmpty()) base = "note";
         if (base.length() > 120) base = base.substring(0, 120);
         return base + ".md";
+    }
+
+    private String safeStorageSegment(String value, String fallback) {
+        String text = value == null ? "" : value.trim();
+        if (text.isEmpty()) text = fallback;
+        text = text
+            .replaceAll("[\\\\/]+", " ")
+            .replaceAll("[\\x00-\\x1f\\x7f]+", " ")
+            .replaceAll("[<>:\"|?*]+", " ")
+            .replaceAll("\\s+", " ")
+            .trim()
+            .replaceAll("^[. ]+|[. ]+$", "");
+        if (text.isEmpty() || ".".equals(text) || "..".equals(text)) text = fallback;
+        if (text.length() > 120) text = text.substring(0, 120).replaceAll("[. ]+$", "");
+        return text.isEmpty() ? fallback : text;
+    }
+
+    private String safeStorageFileName(String name, String fallback, String defaultSuffix) {
+        String source = name == null ? "" : name.trim();
+        String suffix = defaultSuffix == null || defaultSuffix.isEmpty() ? ".md" : defaultSuffix;
+        String stem = source.toLowerCase(Locale.ROOT).endsWith(suffix.toLowerCase(Locale.ROOT))
+            ? source.substring(0, source.length() - suffix.length())
+            : source;
+        String safeStem = safeStorageSegment(stem.isEmpty() ? fallback : stem, fallback);
+        String safeSuffix = safeStorageSegment(suffix, suffix).replaceAll("\\s+", "");
+        if (!safeSuffix.startsWith(".")) safeSuffix = "." + safeSuffix;
+        return safeStem + safeSuffix;
+    }
+
+    private String posixBaseName(String relativePath) {
+        String safe = normalizeRelativePath(relativePath);
+        int slash = safe.lastIndexOf('/');
+        return slash >= 0 ? safe.substring(slash + 1) : safe;
+    }
+
+    private String posixParent(String relativePath) {
+        String safe = normalizeRelativePath(relativePath);
+        int slash = safe.lastIndexOf('/');
+        return slash >= 0 ? safe.substring(0, slash) : ".";
+    }
+
+    private String posixExtension(String relativePath) {
+        String base = posixBaseName(relativePath);
+        int dot = base.lastIndexOf('.');
+        return dot > 0 ? base.substring(dot) : "";
+    }
+
+    private String posixStem(String relativePath) {
+        String base = posixBaseName(relativePath);
+        String ext = posixExtension(base);
+        return ext.isEmpty() ? base : base.substring(0, base.length() - ext.length());
     }
 
     private String safeAttachmentFileName(String name) {

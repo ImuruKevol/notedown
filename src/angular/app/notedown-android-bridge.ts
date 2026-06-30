@@ -8,6 +8,7 @@ declare global {
 }
 
 const METADATA_FILE = 'metadata.json';
+const METADATA_DB_FILE = 'metadata.db';
 const SYNC_STATE_FILE = '.notedown-sync.json';
 const DEFAULT_SYNC_SERVER_URL = 'http://172.16.0.143:5500';
 const SYNC_REQUEST_TIMEOUT_MS = 15000;
@@ -40,7 +41,7 @@ function normalizeRelativePath(relativePath?: string, allowEmpty = false) {
         throw new Error('파일 경로가 비어 있습니다.');
     }
     if (parts.some(part => part === '.' || part === '..')) throw new Error('허용되지 않는 파일 경로입니다.');
-    if (parts[0] === METADATA_FILE || parts[0] === SYNC_STATE_FILE) throw new Error('동기화할 수 없는 시스템 파일입니다.');
+    if ([METADATA_FILE, METADATA_DB_FILE, SYNC_STATE_FILE].includes(parts[0])) throw new Error('동기화할 수 없는 시스템 파일입니다.');
     return parts.join('/');
 }
 
@@ -50,7 +51,7 @@ function optionalRelativePath(relativePath?: string) {
 
 function isSystemRelativePath(relativePath?: string) {
     const firstPart = String(relativePath || '').replace(/\\/g, '/').replace(/^\/+/g, '').split('/').filter(Boolean)[0] || '';
-    return firstPart === METADATA_FILE || firstPart === SYNC_STATE_FILE;
+    return [METADATA_FILE, METADATA_DB_FILE, SYNC_STATE_FILE].includes(firstPart);
 }
 
 async function syncRequest(serverUrl: string | undefined, endpoint: string, options: any = {}) {
@@ -357,7 +358,7 @@ function noteWorkspaceId(note: any = {}) {
 }
 
 function noteWorkspaceName(note: any = {}, workspaceId = noteWorkspaceId(note)) {
-    return note.workspaceName || note.workspaceLabel || workspaceId;
+    return note.workspaceName || note.workspaceLabel || (workspaceId === UNFILED_WORKSPACE_ID ? '미지정 워크스페이스' : workspaceId);
 }
 
 function safeFileName(name: string, fallback = 'note') {
@@ -412,11 +413,13 @@ function noteAttachmentDirectory(noteRelativePath: string, note: any = {}) {
 
 function normalizeAttachmentMetadata(attachment: any = {}, noteRelativePath = '') {
     const relativePath = normalizeRelativePath(attachment.relativePath);
+    const storagePath = normalizeRelativePath(attachment.storagePath || relativePath);
     const fileName = attachment.fileName || relativePath.split('/').pop() || 'attachment';
     return {
         id: attachment.id || attachment.attachmentId || `att-${relativePath.replace(/[^a-z0-9]/gi, '').slice(0, 16)}`,
         fileName,
         relativePath,
+        storagePath,
         noteRelativePath: attachment.noteRelativePath ? normalizeRelativePath(attachment.noteRelativePath) : noteRelativePath,
         mimeType: attachment.mimeType || null,
         size: Number.isFinite(Number(attachment.size)) ? Number(attachment.size) : null,
@@ -438,13 +441,15 @@ function notePayload(note: any, relativePath: string) {
     if (!note) return null;
     const workspaceId = noteWorkspaceId(note);
     const { body: _body, ...metadataNote } = note;
+    const storagePath = note.storagePath ? normalizeRelativePath(note.storagePath) : relativePath;
     return {
         ...metadataNote,
         workspace: workspaceId,
         folder: workspaceId,
         workspaceName: noteWorkspaceName(note, workspaceId),
-        fileName: relativePath.split('/').pop() || noteFileName(note),
+        fileName: storagePath.split('/').pop() || relativePath.split('/').pop() || noteFileName(note),
         relativePath,
+        storagePath,
         attachments: noteAttachmentsForMetadata(note, relativePath)
     };
 }
@@ -476,7 +481,8 @@ function findMetadataNote(metadata: any, relativePath?: string, payloadNote?: an
         workspace: noteWorkspaceId(payloadNote),
         workspaceName: noteWorkspaceName(payloadNote),
         fileName: noteFileName(payloadNote),
-        relativePath: safeRelativePath || relativePathForNote(payloadNote)
+        relativePath: safeRelativePath || relativePathForNote(payloadNote),
+        storagePath: payloadNote.storagePath ? normalizeRelativePath(payloadNote.storagePath) : (safeRelativePath || relativePathForNote(payloadNote))
     };
 }
 
@@ -528,7 +534,8 @@ function upsertNote(notes: any[], note: any) {
         folder: noteWorkspaceId(note),
         workspace: noteWorkspaceId(note),
         workspaceName: noteWorkspaceName(note),
-        fileName: relativePath.split('/').pop() || noteFileName(note)
+        storagePath: note.storagePath ? normalizeRelativePath(note.storagePath) : relativePath,
+        fileName: (note.storagePath ? normalizeRelativePath(note.storagePath).split('/').pop() : relativePath.split('/').pop()) || noteFileName(note)
     };
     const index = notes.findIndex(item => item?.relativePath && normalizeRelativePath(item.relativePath) === relativePath);
     if (index >= 0) notes[index] = { ...notes[index], ...nextNote };
@@ -808,6 +815,7 @@ async function uploadLocalAttachment(args: any = {}, item: any = {}) {
             body.attachment = normalizeAttachmentMetadata({
                 fileName: relativePath.split('/').pop() || 'attachment',
                 relativePath,
+                storagePath: file.storagePath || relativePath,
                 noteRelativePath,
                 size: Number(file.size) || 0,
                 contentHash: body.contentHash,
@@ -909,6 +917,7 @@ async function downloadServerFile(args: any = {}, item: any) {
         workspaceName: item.workspace?.name,
         fileName: relativePath.split('/').pop() || 'note.md',
         relativePath,
+        storagePath: payload.storagePath || item.serverFile?.storagePath || item.note?.storagePath || item.storagePath || relativePath,
         updatedAtMs: payload.clientUpdatedAtMs || Date.now()
     };
     const note = {
@@ -916,6 +925,7 @@ async function downloadServerFile(args: any = {}, item: any) {
         ...(item.note || fallbackNote),
         body: content,
         relativePath,
+        storagePath: payload.storagePath || item.serverFile?.storagePath || item.note?.storagePath || existing?.storagePath || item.storagePath || relativePath,
         folder: item.note?.folder || item.note?.workspace || item.workspace?.id || existing?.folder || UNFILED_WORKSPACE_ID,
         workspace: item.note?.workspace || item.note?.folder || item.workspace?.id || existing?.workspace || UNFILED_WORKSPACE_ID,
         workspaceName: item.note?.workspaceName || item.workspace?.name || existing?.workspaceName || item.workspace?.id || UNFILED_WORKSPACE_ID
@@ -956,6 +966,7 @@ async function downloadServerAttachment(args: any = {}, item: any) {
         id: item.attachment?.id || payload.attachmentId,
         fileName: item.attachment?.fileName || payload.fileName || relativePath.split('/').pop() || 'attachment',
         relativePath,
+        storagePath: payload.storagePath || item.serverAttachment?.storagePath || item.attachment?.storagePath || item.storagePath || relativePath,
         noteRelativePath,
         mimeType: item.attachment?.mimeType || payload.mimeType || null,
         size: Number(payload.size) || null,

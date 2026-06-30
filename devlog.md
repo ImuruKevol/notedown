@@ -112,3 +112,9 @@
 | 2026-06-22 | 006 | Electron 및 Android 앱 빌드 | [상세](devlog/2026-06-22/006-electron-android-build.md) |
 | 2026-06-26 | 001 | 저장 동기화 상태 표시 및 라인 넘버 기능 제거 | [상세](devlog/2026-06-26/001-sync-status-line-number-removal.md) |
 | 2026-06-26 | 002 | 서버 저장 로직 개선 후 Electron 및 Android 앱 빌드 | [상세](devlog/2026-06-26/002-electron-android-build-after-server-storage-update.md) |
+| 2026-06-29 | 001 | Electron 초기 문서 로드 및 포커스 동기화 상태 갱신 보강 | [상세](devlog/2026-06-29/001-electron-startup-focus-sync-fix.md) |
+| 2026-06-29 | 002 | 서버 이미지 및 Electron/Android 앱 빌드 | [상세](devlog/2026-06-29/002-server-electron-android-build.md) |
+| 2026-06-29 | 003 | Electron 및 Android 앱 버전 0.2.0 상향 | [상세](devlog/2026-06-29/003-app-version-0-2-0.md) |
+| 2026-06-29 | 004 | Electron 로컬 저장소를 읽기 쉬운 파일 경로와 metadata.db로 전환 | [상세](devlog/2026-06-29/004-electron-readable-storage-metadata-db.md) |
+| 2026-06-29 | 005 | Android 저장소를 읽기 쉬운 파일 경로와 metadata.db로 전환 | [상세](devlog/2026-06-29/005-android-readable-storage-folder-names.md) |
+| 2026-06-30 | 001 | README 저장소/동기화 설명 갱신 및 Electron 앱 빌드 | [상세](devlog/2026-06-30/001-readme-storage-sync-electron-build.md) |

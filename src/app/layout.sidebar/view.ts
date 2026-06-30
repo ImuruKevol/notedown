@@ -65,7 +65,13 @@ export class Component implements OnInit, OnDestroy {
     private activeWorkspaceKey = 'notedown.activeWorkspace.v1';
     private foldersKey = 'notedown.folders.v1';
     private settingsKey = 'notedown.settings.v1';
+    private startupSyncResultKey = 'notedown.sync.startup.result.v1';
     private routeSubscription?: Subscription;
+    private activationSyncBusy = false;
+    private activationSyncLastAttemptMs = Date.now();
+    private lastInactiveAtMs = Date.now();
+    private readonly activationSyncMinIntervalMs = 60 * 1000;
+    private readonly focusIdleThresholdMs = 5 * 60 * 1000;
     private handleWorkspacePanel = (event: Event) => {
         if (this.isSettingsRoute) return;
         this.workspacePanelOpen = Boolean((event as CustomEvent<boolean>).detail);
@@ -97,6 +103,19 @@ export class Component implements OnInit, OnDestroy {
         event.stopImmediatePropagation();
         this.openPalette(event.shiftKey ? '>' : '');
     };
+    private handleWindowFocus = () => {
+        this.scheduleActivationSync();
+    };
+    private handleWindowBlur = () => {
+        this.lastInactiveAtMs = Date.now();
+    };
+    private handleVisibilityChange = () => {
+        if (document.visibilityState === 'visible') {
+            this.scheduleActivationSync();
+            return;
+        }
+        this.lastInactiveAtMs = Date.now();
+    };
 
     public mobileOpen = false;
     public isSettingsRoute = false;
@@ -120,6 +139,9 @@ export class Component implements OnInit, OnDestroy {
         window.addEventListener('notedown:workspace-changed', this.handleWorkspaceChanged);
         window.addEventListener('storage', this.handleStorageChanged);
         window.addEventListener('keydown', this.handlePaletteShortcut, true);
+        window.addEventListener('focus', this.handleWindowFocus);
+        window.addEventListener('blur', this.handleWindowBlur);
+        document.addEventListener('visibilitychange', this.handleVisibilityChange);
         this.routeSubscription = this.router.events
             .pipe(filter(event => event instanceof NavigationEnd))
             .subscribe(() => this.syncRouteState());
@@ -133,6 +155,9 @@ export class Component implements OnInit, OnDestroy {
         window.removeEventListener('notedown:workspace-changed', this.handleWorkspaceChanged);
         window.removeEventListener('storage', this.handleStorageChanged);
         window.removeEventListener('keydown', this.handlePaletteShortcut, true);
+        window.removeEventListener('focus', this.handleWindowFocus);
+        window.removeEventListener('blur', this.handleWindowBlur);
+        document.removeEventListener('visibilitychange', this.handleVisibilityChange);
         this.routeSubscription?.unsubscribe();
     }
 
@@ -648,6 +673,158 @@ export class Component implements OnInit, OnDestroy {
             keepInBackgroundOnClose: settings.keepInBackgroundOnClose !== false,
             launchAtStartup: settings.launchAtStartup === true
         }).catch(() => { });
+    }
+
+    private scheduleActivationSync() {
+        window.setTimeout(() => { void this.runActivationSync(); }, 250);
+    }
+
+    private async runActivationSync() {
+        const api = (window as any).notedown?.sync;
+        const settings = this.readSettings();
+        if (!api?.runFull || !this.canRunSavedSync(settings)) return;
+
+        const now = Date.now();
+        const inactiveMs = now - this.lastInactiveAtMs;
+        const lastResult = this.readStartupSyncResult();
+        if (this.activationSyncBusy) return;
+        if (lastResult.status === 'running' && now - Number(lastResult.syncedAtMs || 0) <= 5 * 60 * 1000) return;
+        if (this.syncConflictCount(lastResult) > 0) {
+            this.broadcastSyncResult(lastResult);
+            return;
+        }
+        if (now - this.activationSyncLastAttemptMs < this.activationSyncMinIntervalMs) return;
+        if (
+            lastResult?.syncedAtMs
+            && now - Number(lastResult.syncedAtMs) < this.activationSyncMinIntervalMs
+            && inactiveMs < this.focusIdleThresholdMs
+        ) return;
+
+        this.activationSyncBusy = true;
+        this.activationSyncLastAttemptMs = now;
+        this.storeSyncResult({ ok: false, status: 'running' });
+
+        try {
+            const result = await api.runFull({
+                serverUrl: settings.syncServerUrl,
+                token: settings.syncToken,
+                clientId: settings.syncClientId,
+                storagePath: settings.storagePath
+            });
+            const payload = this.storeSyncResult(result);
+            if (payload.ok && this.syncConflictCount(payload) === 0) {
+                window.dispatchEvent(new CustomEvent('notedown:notes-changed', { detail: { source: 'layout.sidebar-sync' } }));
+                this.refreshPaletteData();
+                this.renderSoon();
+            }
+        } catch (error) {
+            this.storeSyncResult({
+                ok: false,
+                status: 'error',
+                error: error instanceof Error && error.message ? error.message : '포커스 동기화에 실패했습니다.'
+            });
+        } finally {
+            this.activationSyncBusy = false;
+            this.lastInactiveAtMs = Date.now();
+        }
+    }
+
+    private canRunSavedSync(settings: AppSettings) {
+        return Boolean(settings?.syncServerUrl && settings.syncToken && settings.storagePath && settings.syncClientId);
+    }
+
+    private storeSyncResult(result: any) {
+        const conflicts = this.extractSyncConflicts(result);
+        const rawSummary = result?.summary || {};
+        const summary = {
+            uploadFiles: Number(rawSummary.uploadFiles) || 0,
+            downloadFiles: Number(rawSummary.downloadFiles) || 0,
+            deleteServerFiles: Number(rawSummary.deleteServerFiles) || 0,
+            deleteLocalFiles: Number(rawSummary.deleteLocalFiles) || 0,
+            uploadAttachments: Number(rawSummary.uploadAttachments) || 0,
+            downloadAttachments: Number(rawSummary.downloadAttachments) || 0,
+            deleteServerAttachments: Number(rawSummary.deleteServerAttachments) || 0,
+            deleteLocalAttachments: Number(rawSummary.deleteLocalAttachments) || 0,
+            conflicts: conflicts.length
+        };
+        const status = result?.status === 'running'
+            ? 'running'
+            : conflicts.length > 0
+                ? 'conflict'
+                : result?.ok
+                    ? 'ok'
+                    : result?.status || 'error';
+        const payload = {
+            status,
+            ok: Boolean(result?.ok && conflicts.length === 0),
+            summary,
+            conflicts,
+            error: result?.error || '',
+            syncedAtMs: Date.now()
+        };
+        localStorage.setItem(this.startupSyncResultKey, JSON.stringify(payload));
+        this.broadcastSyncResult(payload);
+        return payload;
+    }
+
+    private broadcastSyncResult(result: any) {
+        window.dispatchEvent(new CustomEvent('notedown:startup-sync-status', {
+            detail: { ...result, source: 'layout.sidebar' }
+        }));
+    }
+
+    private readStartupSyncResult() {
+        try {
+            return JSON.parse(localStorage.getItem(this.startupSyncResultKey) || '{}') || {};
+        } catch (error) {
+            return {};
+        }
+    }
+
+    private syncConflictCount(result: any) {
+        return this.extractSyncConflicts(result).length;
+    }
+
+    private extractSyncConflicts(result: any) {
+        const items = [
+            ...(Array.isArray(result?.conflicts) ? result.conflicts : []),
+            ...(Array.isArray(result?.plan?.conflicts) ? result.plan.conflicts : []),
+            ...(Array.isArray(result?.operations?.conflicts) ? result.operations.conflicts : []),
+            ...(Array.isArray(result?.attachmentConflicts) ? result.attachmentConflicts : []),
+            ...(result?.file ? [result.file] : []),
+            ...(result?.attachment ? [result.attachment] : [])
+        ];
+        const conflicts = new Map<string, any>();
+        for (const rawItem of items) {
+            const item = rawItem?.file || rawItem;
+            const relativePath = item?.relativePath
+                || item?.serverFile?.relativePath
+                || item?.serverAttachment?.relativePath
+                || item?.attachment?.relativePath
+                || '';
+            if (!relativePath || this.isSystemSyncPath(relativePath)) continue;
+            conflicts.set(`${relativePath}:${item.reason || item.status || ''}`, {
+                relativePath,
+                reason: item.reason || item.status || '',
+                type: item.type || '',
+                clientRevision: item.clientRevision,
+                serverRevision: item.serverRevision,
+                serverFile: item.serverFile || null,
+                serverNote: item.serverNote || null,
+                clientNote: item.clientNote || null,
+                clientWorkspace: item.clientWorkspace || null,
+                serverWorkspace: item.serverWorkspace || null,
+                clientAttachment: item.clientAttachment || null,
+                serverAttachment: item.serverAttachment || null,
+                serverAttachmentMetadata: item.serverAttachmentMetadata || null
+            });
+        }
+        return Array.from(conflicts.values());
+    }
+
+    private isSystemSyncPath(relativePath: string) {
+        const firstPart = String(relativePath || '').replace(/\\/g, '/').replace(/^\/+/g, '').split('/').filter(Boolean)[0] || '';
+        return firstPart === 'metadata.json' || firstPart === 'metadata.db' || firstPart === '.notedown-sync.json';
     }
 
     private activeWorkspaceLabel() {

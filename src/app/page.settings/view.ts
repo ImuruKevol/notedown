@@ -58,6 +58,9 @@ interface SyncConflict {
     clientNote?: any;
     clientWorkspace?: any;
     serverWorkspace?: any;
+    clientAttachment?: any;
+    serverAttachment?: any;
+    serverAttachmentMetadata?: any;
 }
 
 interface SyncConflictDetail {
@@ -124,6 +127,13 @@ export class Component implements OnInit, OnDestroy {
         }
         void this.service.render();
     };
+    private handleStartupSyncStatus = (event: Event) => {
+        const detail = (event as CustomEvent<any>).detail;
+        if (detail?.source === 'page.settings') return;
+        this.applyStartupSyncResult(detail);
+        if (detail?.ok || detail?.status === 'ok') void this.refreshStorageInfo();
+        void this.service.render();
+    };
 
     constructor(public service: Service) { }
 
@@ -136,11 +146,13 @@ export class Component implements OnInit, OnDestroy {
         await this.refreshStorageInfo();
         this.applyTheme();
         window.addEventListener('notedown:settings-changed', this.handleExternalSettingsChanged);
+        window.addEventListener('notedown:startup-sync-status', this.handleStartupSyncStatus);
         window.addEventListener('resize', this.handleViewportResize);
     }
 
     public ngOnDestroy() {
         window.removeEventListener('notedown:settings-changed', this.handleExternalSettingsChanged);
+        window.removeEventListener('notedown:startup-sync-status', this.handleStartupSyncStatus);
         window.removeEventListener('resize', this.handleViewportResize);
     }
 
@@ -247,8 +259,8 @@ export class Component implements OnInit, OnDestroy {
                 this.settings.storagePath = result.storagePath || this.settings.storagePath;
                 this.setStorageMessage(
                     result.metadataExists
-                        ? 'metadata.json을 확인했습니다.'
-                        : 'metadata.json이 아직 없습니다. 초기화를 실행하세요.',
+                        ? 'metadata.db를 확인했습니다.'
+                        : 'metadata.db가 아직 없습니다. 초기화를 실행하세요.',
                     result.metadataExists ? 'success' : 'warning'
                 );
                 this.saveSettings();
@@ -262,24 +274,24 @@ export class Component implements OnInit, OnDestroy {
     public async initializeStorage() {
         const api = this.storageApi();
         if (!api?.initialize) {
-            this.applyStorageFallback('metadata.json 생성은 Electron 앱에서 로컬 디렉토리를 선택한 뒤 사용할 수 있습니다.', 'warning');
+            this.applyStorageFallback('metadata.db 생성은 Electron 앱에서 로컬 디렉토리를 선택한 뒤 사용할 수 있습니다.', 'warning');
             await this.service.render();
             return;
         }
 
-        await this.runStorageAction('initialize', 'metadata.json을 생성/갱신하는 중입니다...', async () => {
+        await this.runStorageAction('initialize', 'metadata.db를 생성/갱신하는 중입니다...', async () => {
             const result = await api.initialize({
                 storagePath: this.settings.storagePath,
                 importDeepMarkdown: false
             });
             if (result?.ok) {
                 this.storageInfo = { ...result, metadataExists: true };
-                this.setStorageMessage(`${result.workspaces}개 작업공간, ${result.notes}개 문서를 metadata.json으로 정리했습니다.`, 'success');
+                this.setStorageMessage(`${result.workspaces}개 작업공간, ${result.notes}개 문서를 metadata.db로 정리했습니다.`, 'success');
                 window.dispatchEvent(new CustomEvent('notedown:notes-changed'));
                 return;
             }
 
-            this.setStorageMessage('metadata.json을 생성/갱신하지 못했습니다.', 'error');
+            this.setStorageMessage('metadata.db를 생성/갱신하지 못했습니다.', 'error');
         });
     }
 
@@ -520,7 +532,9 @@ export class Component implements OnInit, OnDestroy {
         if (!this.ensureSyncReady()) return;
 
         await this.runSyncAction('run', '전체 동기화를 실행하는 중입니다...', async () => {
+            this.storeSyncResult({ ok: false, status: 'running' });
             const result = await api.runFull(this.syncPayload());
+            this.storeSyncResult(result);
             if (result?.summary) this.syncPlanSummary = this.normalizedSyncSummary(result.summary, result);
             const conflictCount = this.syncConflictCount(result);
             if (conflictCount > 0) {
@@ -754,7 +768,7 @@ export class Component implements OnInit, OnDestroy {
         const summary = this.localNoteSummary();
         this.storageInfo = {
             storagePath: this.settings.storagePath,
-            metadataPath: this.settings.storagePath ? `${this.settings.storagePath}/metadata.json` : '',
+            metadataPath: this.settings.storagePath ? `${this.settings.storagePath}/metadata.db` : '',
             metadataExists: false,
             notes: summary.notes,
             workspaces: summary.workspaces,
@@ -785,10 +799,10 @@ export class Component implements OnInit, OnDestroy {
         this.syncMessageTone = tone;
     }
 
-    private applyStartupSyncResult() {
+    private applyStartupSyncResult(result: any = null) {
         if (!this.hasSyncToken()) return;
         try {
-            const result = JSON.parse(localStorage.getItem(this.startupSyncResultKey) || '{}');
+            if (!result) result = JSON.parse(localStorage.getItem(this.startupSyncResultKey) || '{}');
             if (!result?.syncedAtMs || Date.now() - Number(result.syncedAtMs) > 30 * 60 * 1000) return;
             if (result.summary) this.syncPlanSummary = this.normalizedSyncSummary(result.summary, result);
             const conflictCount = this.syncConflictCount(result);
@@ -811,6 +825,41 @@ export class Component implements OnInit, OnDestroy {
         } catch (error) {
             // Ignore malformed startup sync status.
         }
+    }
+
+    private storeSyncResult(result: any) {
+        const conflicts = this.extractSyncConflicts(result);
+        const rawSummary = result?.summary || {};
+        const summary = {
+            uploadFiles: Number(rawSummary.uploadFiles) || 0,
+            downloadFiles: Number(rawSummary.downloadFiles) || 0,
+            deleteServerFiles: Number(rawSummary.deleteServerFiles) || 0,
+            deleteLocalFiles: Number(rawSummary.deleteLocalFiles) || 0,
+            uploadAttachments: Number(rawSummary.uploadAttachments) || 0,
+            downloadAttachments: Number(rawSummary.downloadAttachments) || 0,
+            deleteServerAttachments: Number(rawSummary.deleteServerAttachments) || 0,
+            deleteLocalAttachments: Number(rawSummary.deleteLocalAttachments) || 0,
+            conflicts: conflicts.length
+        };
+        const status = result?.status === 'running'
+            ? 'running'
+            : conflicts.length > 0
+                ? 'conflict'
+                : result?.ok
+                    ? 'ok'
+                    : result?.status || 'error';
+        const payload = {
+            status,
+            ok: Boolean(result?.ok && conflicts.length === 0),
+            summary,
+            conflicts,
+            error: result?.error || '',
+            syncedAtMs: Date.now()
+        };
+        localStorage.setItem(this.startupSyncResultKey, JSON.stringify(payload));
+        window.dispatchEvent(new CustomEvent('notedown:startup-sync-status', {
+            detail: { ...payload, source: 'page.settings' }
+        }));
     }
 
     private syncConflictCount(result: any) {
@@ -848,12 +897,19 @@ export class Component implements OnInit, OnDestroy {
         const items = [
             ...(Array.isArray(result?.conflicts) ? result.conflicts : []),
             ...(Array.isArray(result?.plan?.conflicts) ? result.plan.conflicts : []),
-            ...(Array.isArray(result?.operations?.conflicts) ? result.operations.conflicts : [])
+            ...(Array.isArray(result?.operations?.conflicts) ? result.operations.conflicts : []),
+            ...(Array.isArray(result?.attachmentConflicts) ? result.attachmentConflicts : []),
+            ...(result?.file ? [result.file] : []),
+            ...(result?.attachment ? [result.attachment] : [])
         ];
         const conflicts = new Map<string, SyncConflict>();
         for (const rawItem of items) {
             const item = rawItem?.file || rawItem;
-            const relativePath = item?.relativePath || item?.serverFile?.relativePath || '';
+            const relativePath = item?.relativePath
+                || item?.serverFile?.relativePath
+                || item?.serverAttachment?.relativePath
+                || item?.attachment?.relativePath
+                || '';
             if (!relativePath) continue;
             if (this.isSystemSyncPath(relativePath)) continue;
             const conflict: SyncConflict = {
@@ -866,7 +922,10 @@ export class Component implements OnInit, OnDestroy {
                 serverNote: item.serverNote || null,
                 clientNote: item.clientNote || null,
                 clientWorkspace: item.clientWorkspace || null,
-                serverWorkspace: item.serverWorkspace || null
+                serverWorkspace: item.serverWorkspace || null,
+                clientAttachment: item.clientAttachment || null,
+                serverAttachment: item.serverAttachment || null,
+                serverAttachmentMetadata: item.serverAttachmentMetadata || null
             };
             conflicts.set(`${relativePath}:${conflict.reason || ''}`, conflict);
         }
@@ -875,7 +934,7 @@ export class Component implements OnInit, OnDestroy {
 
     private isSystemSyncPath(relativePath: string) {
         const firstPart = String(relativePath || '').replace(/\\/g, '/').replace(/^\/+/g, '').split('/').filter(Boolean)[0] || '';
-        return firstPart === 'metadata.json' || firstPart === '.notedown-sync.json';
+        return firstPart === 'metadata.json' || firstPart === 'metadata.db' || firstPart === '.notedown-sync.json';
     }
 
     private async loadSyncConflictDetail() {

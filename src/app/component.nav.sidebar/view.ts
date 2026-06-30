@@ -728,6 +728,7 @@ export class Component implements OnInit, OnDestroy {
 
     private async loadNotes() {
         const fallback = this.defaultNotes();
+        const fileBacked = this.usesFileStorage();
         const fileNotes = await this.loadFileNotes();
         if (fileNotes) {
             this.notes = fileNotes;
@@ -738,13 +739,13 @@ export class Component implements OnInit, OnDestroy {
 
         try {
             const stored = localStorage.getItem(this.storageKey);
-            this.notes = stored ? JSON.parse(stored) : fallback;
+            this.notes = stored ? JSON.parse(stored) : (fileBacked ? [] : fallback);
             if (!Array.isArray(this.notes) || this.notes.length === 0) this.notes = [];
             this.notes = this.notes.map((note, index) => this.normalizeNote(note, index));
-            if (!stored) localStorage.setItem(this.storageKey, JSON.stringify(this.notes));
+            if (!stored && !fileBacked) localStorage.setItem(this.storageKey, JSON.stringify(this.notes));
         } catch (error) {
-            this.notes = fallback;
-            localStorage.setItem(this.storageKey, JSON.stringify(this.notes));
+            this.notes = fileBacked ? [] : fallback;
+            if (!fileBacked) localStorage.setItem(this.storageKey, JSON.stringify(this.notes));
         }
 
         this.syncFolders();
@@ -881,7 +882,6 @@ export class Component implements OnInit, OnDestroy {
         try {
             const result = await api.loadNotes({ storagePath });
             if (!result?.ok || !Array.isArray(result.notes)) return null;
-            if (result.notes.length === 0 && localStorage.getItem(this.storageKey)) return null;
             const notes = result.notes.map((note: any, index: number) => this.normalizeNote(note, index));
             localStorage.setItem(this.storageKey, JSON.stringify(notes));
             return notes;
@@ -893,23 +893,28 @@ export class Component implements OnInit, OnDestroy {
     private storagePath() {
         try {
             const settings = JSON.parse(localStorage.getItem(this.settingsKey) || '{}');
-            return settings.storagePath || '';
+            return settings.storagePath || '~/Documents/Notedown Notes';
         } catch (error) {
-            return '';
+            return '~/Documents/Notedown Notes';
         }
+    }
+
+    private usesFileStorage() {
+        return Boolean((window as any).notedown?.storage?.loadNotes);
     }
 
     private async syncNoteWithServer(note: NoteItem, deleted = false) {
         const api = (window as any).notedown?.sync;
         const settings = this.readSettings();
-        if (!api?.uploadNote || !settings.syncToken || !settings.storagePath) return;
+        const storagePath = this.storagePath();
+        if (!api?.uploadNote || !settings.syncToken || !storagePath) return;
 
         try {
             await api.uploadNote({
                 serverUrl: settings.syncServerUrl,
                 token: settings.syncToken,
                 clientId: settings.syncClientId,
-                storagePath: settings.storagePath,
+                storagePath,
                 note,
                 deleted
             });
