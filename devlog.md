@@ -118,3 +118,13 @@
 | 2026-06-29 | 004 | Electron 로컬 저장소를 읽기 쉬운 파일 경로와 metadata.db로 전환 | [상세](devlog/2026-06-29/004-electron-readable-storage-metadata-db.md) |
 | 2026-06-29 | 005 | Android 저장소를 읽기 쉬운 파일 경로와 metadata.db로 전환 | [상세](devlog/2026-06-29/005-android-readable-storage-folder-names.md) |
 | 2026-06-30 | 001 | README 저장소/동기화 설명 갱신 및 Electron 앱 빌드 | [상세](devlog/2026-06-30/001-readme-storage-sync-electron-build.md) |
+| 2026-07-01 | 001 | metadata.db 폴더 메타데이터 정리 및 preview 코드블럭 렌더 안정화 | [상세](devlog/2026-07-01/001-metadata-folder-preview-codeblock-fix.md) |
+| 2026-07-01 | 002 | 서버 이미지 push 및 Android APK 빌드 | [상세](devlog/2026-07-01/002-server-image-android-apk-build.md) |
+| 2026-07-01 | 003 | 에디터 복귀 시 커서 위치 복원 | [상세](devlog/2026-07-01/003-editor-cursor-restore.md) |
+| 2026-07-07 | 001 | Electron 첫 실행 구성 마법사 및 Windows 설치 종료 처리 보강 | [상세](devlog/2026-07-07/001-electron-first-run-installer-fix.md) |
+| 2026-07-07 | 002 | 동기화 서버 주소 기본값 제거 | [상세](devlog/2026-07-07/002-remove-default-sync-server-url.md) |
+| 2026-07-07 | 003 | 초기 구성을 앱 마법사에서 설치 단계로 이전 | [상세](devlog/2026-07-07/003-installer-initial-configuration.md) |
+| 2026-07-07 | 004 | macOS PKG 설치 중 초기 구성 입력 대화상자 추가 | [상세](devlog/2026-07-07/004-macos-pkg-preinstall-prompts.md) |
+| 2026-07-07 | 005 | macOS PKG 설치 script 중복 실행 방지 | [상세](devlog/2026-07-07/005-macos-pkg-script-dedup.md) |
+| 2026-07-16 | 001 | 첫 동기화 metadata 가상 충돌 및 디렉토리 읽기 오류 수정 | [상세](devlog/2026-07-16/001-initial-sync-metadata-conflict-fix.md) |
+| 2026-07-16 | 002 | 서버 이미지 배포 및 Notedown 0.2.1 멀티플랫폼 릴리스 | [상세](devlog/2026-07-16/002-release-0-2-1.md) |

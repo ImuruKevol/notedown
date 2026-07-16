@@ -63,12 +63,11 @@ section(class="flex h-full min-h-0 flex-col bg-[#fbfbfa] text-stone-950 dark:bg-
                                 p(class="mt-1 text-[13px] text-stone-500 dark:text-zinc-400") Markdown 파일과 metadata.db를 기준으로 로컬에 저장합니다.
                             span([class]="storageStatusClass()") {{storageInfo.metadataExists ? 'metadata 준비됨' : '초기화 필요'}}
                     div(class="grid gap-5")
-                        div(class="grid gap-2")
+                        label(class="grid gap-2")
                             span(class="text-[13px] font-medium text-stone-700 dark:text-zinc-300") 저장소 디렉토리
                             div(class="flex gap-2")
-                                div(class="flex h-10 min-w-0 flex-1 items-center rounded-md border border-stone-200 bg-white px-3 font-mono text-[13px] text-stone-700 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-200")
-                                    span(class="truncate") {{settings.storagePath || '선택된 디렉토리 없음'}}
-                                button(type="button", class="h-10 shrink-0 rounded-md border border-stone-200 bg-white px-3 text-[13px] font-semibold text-stone-700 shadow-sm transition hover:bg-stone-50 disabled:cursor-not-allowed disabled:opacity-50 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-200 dark:hover:bg-zinc-800", (click)="chooseStoragePath()", [disabled]="storageBusy") 디렉토리 선택
+                                input(type="text", [ngModel]="settings.storagePath", (ngModelChange)="setStoragePath($event)", class="h-10 min-w-0 flex-1 rounded-md border border-stone-200 bg-white px-3 font-mono text-[13px] text-stone-700 outline-none focus:border-stone-300 focus:ring-2 focus:ring-stone-200 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-200 dark:focus:border-zinc-700 dark:focus:ring-zinc-800")
+                                button(type="button", class="h-10 shrink-0 rounded-md border border-stone-200 bg-white px-3 text-[13px] font-semibold text-stone-700 shadow-sm transition hover:bg-stone-50 disabled:cursor-not-allowed disabled:opacity-50 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-200 dark:hover:bg-zinc-800", (click)="chooseStoragePath()", [disabled]="storageBusy") 선택
                         div(class="rounded-lg border border-stone-200 bg-white p-4 dark:border-zinc-800 dark:bg-zinc-900")
                             div(class="grid gap-3 sm:grid-cols-4")
                                 div
@@ -86,9 +85,10 @@ section(class="flex h-full min-h-0 flex-col bg-[#fbfbfa] text-stone-950 dark:bg-
                             div(class="mt-4 border-t border-stone-200 pt-3 dark:border-zinc-800")
                                 p(class="break-all font-mono text-[12px] text-stone-500 dark:text-zinc-400") {{storageInfo.metadataPath || settings.storagePath + '/metadata.db'}}
                                 p(*ngIf="storageMessage", [class]="storageMessageClass()", aria-live="polite") {{storageMessage}}
-                        div(class="grid gap-3 sm:grid-cols-3")
+                        div(class="grid gap-3 sm:grid-cols-4")
                             button(type="button", class="h-10 rounded-md bg-stone-900 px-3 text-[13px] font-semibold text-white shadow-sm transition hover:bg-stone-700 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-zinc-100 dark:text-zinc-950 dark:hover:bg-zinc-200", (click)="initializeStorage()", [disabled]="storageBusy", [attr.aria-busy]="storageAction === 'initialize'") {{storageAction === 'initialize' ? 'metadata 생성 중...' : 'metadata 생성/갱신'}}
                             button(type="button", class="h-10 rounded-md border border-stone-200 bg-white px-3 text-[13px] font-semibold text-stone-700 shadow-sm transition hover:bg-stone-50 disabled:cursor-not-allowed disabled:opacity-50 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-200 dark:hover:bg-zinc-800", (click)="refreshStorageInfo()", [disabled]="storageBusy", [attr.aria-busy]="storageAction === 'refresh'") {{storageAction === 'refresh' ? '상태 확인 중...' : '상태 새로고침'}}
+                            button(type="button", class="h-10 rounded-md border border-stone-200 bg-white px-3 text-[13px] font-semibold text-stone-700 shadow-sm transition hover:bg-stone-50 disabled:cursor-not-allowed disabled:opacity-50 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-200 dark:hover:bg-zinc-800", (click)="useDefaultStoragePath()", [disabled]="storageBusy") 기본 경로
                             button(type="button", class="h-10 rounded-md border border-stone-200 bg-white px-3 text-[13px] font-semibold text-stone-700 shadow-sm transition hover:bg-stone-50 disabled:cursor-not-allowed disabled:opacity-50 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-200 dark:hover:bg-zinc-800", (click)="importDeepMarkdown()", [disabled]="storageBusy", [attr.aria-busy]="storageAction === 'import'") {{storageAction === 'import' ? '가져오는 중...' : '깊은 문서 가져오기'}}
 
                 section(*ngIf="activeSection === 'sync'", class="space-y-6")

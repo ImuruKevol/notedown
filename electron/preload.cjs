@@ -8,6 +8,7 @@ contextBridge.exposeInMainWorld('notedown', {
         node: process.versions.node
     },
     app: {
+        installerSettings: () => ipcRenderer.invoke('notedown:app:installer-settings'),
         preferences: () => ipcRenderer.invoke('notedown:app:preferences'),
         setPreferences: (payload) => ipcRenderer.invoke('notedown:app:set-preferences', payload),
         showWindow: () => ipcRenderer.invoke('notedown:app:show-window')

@@ -21,6 +21,8 @@ interface AppSettings {
     syncToken: string;
     syncTokenType: string;
     syncClientId: string;
+    setupCompleted: boolean;
+    setupCompletedAt: string;
 }
 
 interface StorageInfo {
@@ -189,6 +191,45 @@ export class Component implements OnInit, OnDestroy {
         this.saveSettings();
     }
 
+    public setStoragePath(value: string) {
+        this.settings.storagePath = String(value || '').trim();
+        this.storageInfo = {
+            ...this.storageInfo,
+            storagePath: this.settings.storagePath,
+            metadataPath: this.settings.storagePath ? `${this.settings.storagePath}/metadata.db` : '',
+            metadataExists: false
+        };
+        this.saveSettings();
+    }
+
+    public async useDefaultStoragePath() {
+        const api = this.storageApi();
+        if (!api?.defaultPath) return;
+
+        if (this.storageBusy) return;
+        this.storageBusy = true;
+        this.storageAction = 'refresh';
+        this.setStorageMessage('기본 저장소 경로를 확인하는 중입니다...', 'info');
+        await this.service.render();
+        try {
+            const result = await api.defaultPath();
+            if (result?.ok && result.storagePath) {
+                this.settings.storagePath = result.storagePath;
+                this.saveSettings();
+            } else {
+                this.setStorageMessage('기본 저장소 경로를 확인하지 못했습니다.', 'error');
+            }
+        } catch (error) {
+            this.setStorageMessage(this.errorMessage(error, '기본 저장소 경로를 확인하지 못했습니다.'), 'error');
+        } finally {
+            this.storageAction = '';
+            this.storageBusy = false;
+            await this.service.render();
+        }
+
+        await this.refreshStorageInfo();
+    }
+
     public saveSettings() {
         localStorage.setItem(this.storageKey, JSON.stringify(this.settings));
         this.savedAt = this.nowLabel();
@@ -198,7 +239,11 @@ export class Component implements OnInit, OnDestroy {
 
     public resetSettings() {
         localStorage.removeItem(this.storageKey);
-        this.settings = this.defaultSettings();
+        this.settings = {
+            ...this.defaultSettings(),
+            setupCompleted: true,
+            setupCompletedAt: new Date().toISOString()
+        };
         this.syncPassword = '';
         this.syncPlanSummary = null;
         this.clearSyncConflicts();
@@ -276,15 +321,17 @@ export class Component implements OnInit, OnDestroy {
         if (!api?.initialize) {
             this.applyStorageFallback('metadata.db 생성은 Electron 앱에서 로컬 디렉토리를 선택한 뒤 사용할 수 있습니다.', 'warning');
             await this.service.render();
-            return;
+            return false;
         }
 
+        let ok = false;
         await this.runStorageAction('initialize', 'metadata.db를 생성/갱신하는 중입니다...', async () => {
             const result = await api.initialize({
                 storagePath: this.settings.storagePath,
                 importDeepMarkdown: false
             });
             if (result?.ok) {
+                ok = true;
                 this.storageInfo = { ...result, metadataExists: true };
                 this.setStorageMessage(`${result.workspaces}개 작업공간, ${result.notes}개 문서를 metadata.db로 정리했습니다.`, 'success');
                 window.dispatchEvent(new CustomEvent('notedown:notes-changed'));
@@ -293,6 +340,7 @@ export class Component implements OnInit, OnDestroy {
 
             this.setStorageMessage('metadata.db를 생성/갱신하지 못했습니다.', 'error');
         });
+        return ok;
     }
 
     public async importDeepMarkdown() {
@@ -407,6 +455,7 @@ export class Component implements OnInit, OnDestroy {
         if (reason === 'server_metadata_removed_after_local_edit') return '서버 삭제와 로컬 편집이 겹쳤습니다.';
         if (reason === 'server_file_changed') return '서버 파일이 변경되었습니다.';
         if (reason === 'server_metadata_changed') return '서버 메타데이터가 변경되었습니다.';
+        if (reason === 'same_path_without_sync_history') return '동기화 이력이 없는 같은 경로의 파일이 서버와 로컬에 모두 있습니다.';
         if (reason === 'conflict') return '서버와 로컬 버전이 충돌했습니다.';
         return reason || '충돌 상세 정보가 필요합니다.';
     }
@@ -578,19 +627,24 @@ export class Component implements OnInit, OnDestroy {
             storagePath: '~/Documents/Notedown Notes',
             theme: 'light',
             editorMode: this.canUseSplitEditorMode() ? 'split' : 'markdown',
-            keepInBackgroundOnClose: true,
+            keepInBackgroundOnClose: this.defaultKeepInBackgroundOnClose(),
             launchAtStartup: false,
             tabSize: 2,
-            syncServerUrl: 'http://172.16.0.143:5500',
+            syncServerUrl: '',
             syncUsername: '',
             syncToken: '',
             syncTokenType: '',
-            syncClientId: this.createClientId()
+            syncClientId: this.createClientId(),
+            setupCompleted: true,
+            setupCompletedAt: new Date().toISOString()
         };
     }
 
     private normalizeSettings(stored: any): AppSettings {
         const defaults = this.defaultSettings();
+        const syncUsername = typeof stored?.syncUsername === 'string' ? stored.syncUsername : defaults.syncUsername;
+        const syncToken = typeof stored?.syncToken === 'string' ? stored.syncToken : defaults.syncToken;
+        const syncServerUrl = this.normalizeStoredSyncServerUrl(stored?.syncServerUrl, syncUsername, syncToken, defaults.syncServerUrl);
         return {
             workspaceName: typeof stored?.workspaceName === 'string' ? stored.workspaceName : defaults.workspaceName,
             storagePath: typeof stored?.storagePath === 'string' ? stored.storagePath : defaults.storagePath,
@@ -599,12 +653,36 @@ export class Component implements OnInit, OnDestroy {
             keepInBackgroundOnClose: typeof stored?.keepInBackgroundOnClose === 'boolean' ? stored.keepInBackgroundOnClose : defaults.keepInBackgroundOnClose,
             launchAtStartup: typeof stored?.launchAtStartup === 'boolean' ? stored.launchAtStartup : defaults.launchAtStartup,
             tabSize: this.normalizeTabSize(stored?.tabSize),
-            syncServerUrl: typeof stored?.syncServerUrl === 'string' ? stored.syncServerUrl : defaults.syncServerUrl,
-            syncUsername: typeof stored?.syncUsername === 'string' ? stored.syncUsername : defaults.syncUsername,
-            syncToken: typeof stored?.syncToken === 'string' ? stored.syncToken : defaults.syncToken,
+            syncServerUrl,
+            syncUsername,
+            syncToken,
             syncTokenType: typeof stored?.syncTokenType === 'string' ? stored.syncTokenType : defaults.syncTokenType,
-            syncClientId: typeof stored?.syncClientId === 'string' && stored.syncClientId ? stored.syncClientId : defaults.syncClientId
+            syncClientId: typeof stored?.syncClientId === 'string' && stored.syncClientId ? stored.syncClientId : defaults.syncClientId,
+            setupCompleted: typeof stored?.setupCompleted === 'boolean' ? stored.setupCompleted : this.hadStoredSettings,
+            setupCompletedAt: typeof stored?.setupCompletedAt === 'string' ? stored.setupCompletedAt : ''
         };
+    }
+
+    private normalizeStoredSyncServerUrl(value: unknown, username: string, token: string, fallback: string) {
+        const serverUrl = typeof value === 'string' ? value : fallback;
+        if (!username.trim() && !token.trim() && this.isLegacyDefaultSyncServerUrl(serverUrl)) return '';
+        return serverUrl;
+    }
+
+    private isLegacyDefaultSyncServerUrl(value: string) {
+        try {
+            const url = new URL(String(value || '').trim());
+            return url.protocol === 'http:'
+                && url.hostname === ['172', '16', '0', '143'].join('.')
+                && url.port === '5500'
+                && url.pathname.replace(/\/+$/g, '') === '';
+        } catch (error) {
+            return false;
+        }
+    }
+
+    private defaultKeepInBackgroundOnClose() {
+        return String((window as any).notedown?.platform || '').toLowerCase() !== 'win32';
     }
 
     private normalizeTheme(value: unknown): ThemeMode {

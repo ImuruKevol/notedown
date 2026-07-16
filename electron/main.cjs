@@ -19,7 +19,9 @@ const APP_ID = 'com.notedown.app';
 const APP_ICON_PATH = path.resolve(__dirname, '..', 'build-resources', 'icon.png');
 const TRAY_ICON_PATH = path.resolve(__dirname, '..', 'build-resources', 'tray-icon.png');
 const APP_PREFERENCES_FILE = 'app-preferences.json';
+const INSTALLER_SETTINGS_FILE = 'installer-settings.ini';
 const START_HIDDEN_ARG = '--notedown-start-hidden';
+const QUIT_ARG = '--notedown-quit';
 let protocolRegistered = false;
 let attachmentProtocolRegistered = false;
 let mainWindow = null;
@@ -29,13 +31,12 @@ let currentWorkspaceRevealTimer = null;
 const activeStorageRoots = new Set();
 const deflateRaw = promisify(zlib.deflateRaw);
 let appPreferences = {
-    keepInBackgroundOnClose: true,
+    keepInBackgroundOnClose: defaultKeepInBackgroundOnClose(),
     launchAtStartup: false
 };
 
 const LEGACY_METADATA_FILE = 'metadata.json';
 const SYNC_STATE_FILE = '.notedown-sync.json';
-const DEFAULT_SYNC_SERVER_URL = 'http://172.16.0.143:5500';
 const SYNC_REQUEST_TIMEOUT_MS = 15000;
 const IMPORTED_WORKSPACE_ID = '_imported';
 const UNFILED_WORKSPACE_ID = 'unfiled';
@@ -51,11 +52,26 @@ function expandHome(filePath) {
     return filePath;
 }
 
+function defaultKeepInBackgroundOnClose() {
+    return process.platform !== 'win32';
+}
+
 function normalizeAppPreferences(preferences = {}) {
     return {
-        keepInBackgroundOnClose: preferences.keepInBackgroundOnClose !== false,
+        keepInBackgroundOnClose: typeof preferences.keepInBackgroundOnClose === 'boolean'
+            ? preferences.keepInBackgroundOnClose
+            : defaultKeepInBackgroundOnClose(),
         launchAtStartup: preferences.launchAtStartup === true
     };
+}
+
+function shouldQuitFromArgs(argv = process.argv) {
+    return argv.some(arg => {
+        const normalized = String(arg || '').toLowerCase();
+        return normalized === QUIT_ARG
+            || normalized === '--squirrel-uninstall'
+            || normalized === '--squirrel-obsolete';
+    });
 }
 
 function supportsLaunchAtStartup() {
@@ -133,6 +149,10 @@ function appPreferencesPath() {
     return path.join(app.getPath('userData'), APP_PREFERENCES_FILE);
 }
 
+function installerSettingsPath() {
+    return path.join(app.getPath('userData'), INSTALLER_SETTINGS_FILE);
+}
+
 async function readAppPreferences() {
     try {
         const stored = JSON.parse(await fs.readFile(appPreferencesPath(), 'utf8'));
@@ -171,6 +191,92 @@ function samePath(left, right) {
 function normalizeStoragePath(filePath) {
     const expanded = expandHome(filePath || defaultStoragePath());
     return samePath(expanded, legacyDefaultStoragePath()) ? defaultStoragePath() : expanded;
+}
+
+function parseInstallerSettingsIni(content) {
+    const settings = {};
+    let section = '';
+    for (const rawLine of String(content || '').split(/\r?\n/g)) {
+        const line = rawLine.trim();
+        if (!line || line.startsWith(';') || line.startsWith('#')) continue;
+        const sectionMatch = line.match(/^\[([^\]]+)]$/);
+        if (sectionMatch) {
+            section = sectionMatch[1].trim().toLowerCase();
+            continue;
+        }
+        if (section !== 'settings') continue;
+        const separatorIndex = line.indexOf('=');
+        if (separatorIndex < 0) continue;
+        const key = line.slice(0, separatorIndex).trim();
+        const value = line.slice(separatorIndex + 1).trim();
+        if (key) settings[key] = value;
+    }
+    return settings;
+}
+
+function normalizeInstallerBoolean(value, fallback = false) {
+    if (typeof value === 'boolean') return value;
+    const normalized = String(value || '').trim().toLowerCase();
+    if (['1', 'true', 'yes', 'on'].includes(normalized)) return true;
+    if (['0', 'false', 'no', 'off'].includes(normalized)) return false;
+    return fallback;
+}
+
+function normalizeInstallerTheme(value) {
+    return ['light', 'dark', 'system'].includes(value) ? value : 'light';
+}
+
+function normalizeInstallerEditorMode(value) {
+    return ['markdown', 'split', 'preview'].includes(value) ? value : 'split';
+}
+
+function normalizeInstallerTabSize(value) {
+    const tabSize = Number(value);
+    if (!Number.isFinite(tabSize)) return 2;
+    return Math.min(8, Math.max(2, Math.round(tabSize)));
+}
+
+function normalizeInstallerServerUrl(value) {
+    const rawUrl = String(value || '').trim();
+    if (!rawUrl) return '';
+    try {
+        return normalizeServerUrl(rawUrl);
+    } catch (error) {
+        return '';
+    }
+}
+
+function normalizeInstallerSettings(settings = {}) {
+    const keepInBackgroundOnClose = normalizeInstallerBoolean(settings.keepInBackgroundOnClose, defaultKeepInBackgroundOnClose());
+    const launchAtStartup = normalizeInstallerBoolean(settings.launchAtStartup, false);
+    return {
+        workspaceName: String(settings.workspaceName || 'Notedown').trim() || 'Notedown',
+        storagePath: normalizeStoragePath(settings.storagePath),
+        theme: normalizeInstallerTheme(settings.theme),
+        editorMode: normalizeInstallerEditorMode(settings.editorMode),
+        keepInBackgroundOnClose,
+        launchAtStartup,
+        tabSize: normalizeInstallerTabSize(settings.tabSize),
+        syncServerUrl: normalizeInstallerServerUrl(settings.syncServerUrl),
+        syncUsername: String(settings.syncUsername || '').trim(),
+        syncToken: '',
+        syncTokenType: '',
+        syncClientId: String(settings.syncClientId || `notedown-electron-${crypto.randomUUID()}`).trim(),
+        setupCompleted: true,
+        setupCompletedAt: String(settings.setupCompletedAt || new Date().toISOString())
+    };
+}
+
+async function readInstallerSettings() {
+    try {
+        const content = await fs.readFile(installerSettingsPath(), 'utf8');
+        const parsed = parseInstallerSettingsIni(content);
+        if (Object.keys(parsed).length === 0) return null;
+        return normalizeInstallerSettings(parsed);
+    } catch (error) {
+        if (error?.code === 'ENOENT') return null;
+        throw error;
+    }
 }
 
 function rememberStoragePath(filePath) {
@@ -314,8 +420,19 @@ function resolveStorageFile(storagePath, relativePath) {
     return { relativePath: safeRelativePath, absolutePath };
 }
 
+function workspaceIdFromRelativePath(relativePath) {
+    if (!relativePath) return '';
+    try {
+        const safeRelativePath = normalizeRelativePath(relativePath);
+        const folder = path.posix.dirname(safeRelativePath);
+        return folder && folder !== '.' ? folder : '';
+    } catch (error) {
+        return '';
+    }
+}
+
 function noteWorkspaceId(note = {}) {
-    return note.folder || note.workspace || UNFILED_WORKSPACE_ID;
+    return workspaceIdFromRelativePath(note.relativePath) || note.folder || note.workspace || UNFILED_WORKSPACE_ID;
 }
 
 function noteWorkspaceName(note = {}, workspaceId = noteWorkspaceId(note)) {
@@ -346,7 +463,7 @@ function storageFolderPartsForNote(note = {}, relativePath = '') {
         .replace(/\\/g, '/')
         .split('/')
         .filter(part => part && part !== '.' && part !== '..');
-    const workspaceId = note.workspace || note.folder || '';
+    const workspaceId = noteWorkspaceId(note);
     const workspaceName = noteWorkspaceName(note, workspaceId);
     const workspaceFirst = workspaceId ? String(workspaceId).replace(/\\/g, '/').split('/', 1)[0] : '';
 
@@ -419,6 +536,7 @@ async function listMarkdownFiles(dirPath, depth = 1, rootPath = dirPath) {
 async function readMarkdownNote(storagePath, metadataNote) {
     const relativePath = normalizeRelativePath(metadataNote.relativePath);
     const storageRelativePath = noteStoragePath(metadataNote, relativePath);
+    const workspaceId = noteWorkspaceId({ ...metadataNote, relativePath });
     const { absolutePath } = resolveStorageFile(storagePath, storageRelativePath);
     let body = '';
     try {
@@ -432,7 +550,8 @@ async function readMarkdownNote(storagePath, metadataNote) {
         relativePath,
         storagePath: storageRelativePath,
         body,
-        folder: metadataNote.workspace || metadataNote.folder || UNFILED_WORKSPACE_ID
+        folder: workspaceId,
+        workspace: workspaceId
     };
 }
 
@@ -826,9 +945,10 @@ function labelForDate(ms) {
 async function generateMetadata(storagePath, options = {}) {
     await fs.mkdir(storagePath, { recursive: true });
     const entries = await fs.readdir(storagePath, { withFileTypes: true });
-    const workspaces = [{ id: UNFILED_WORKSPACE_ID, name: '미지정 워크스페이스' }];
+    const workspaces = [];
     const notes = [];
     const knownRelativePaths = new Set();
+    let hasUnfiledWorkspace = false;
     let rootMarkdownCount = 0;
     let deepMarkdownCount = 0;
     let copiedDeepCount = 0;
@@ -841,6 +961,10 @@ async function generateMetadata(storagePath, options = {}) {
             const relativePath = entry.name;
             const body = await fs.readFile(entryPath, 'utf8');
             const stat = await fs.stat(entryPath);
+            if (!hasUnfiledWorkspace) {
+                workspaces.push({ id: UNFILED_WORKSPACE_ID, name: '미지정 워크스페이스' });
+                hasUnfiledWorkspace = true;
+            }
             notes.push(makeMetadataNote(storagePath, relativePath, UNFILED_WORKSPACE_ID, '미지정 워크스페이스', body, stat));
             knownRelativePaths.add(relativePath);
             rootMarkdownCount++;
@@ -848,7 +972,7 @@ async function generateMetadata(storagePath, options = {}) {
         }
 
         if (!entry.isDirectory()) continue;
-        const workspaceId = safeWorkspaceId(entry.name);
+        const workspaceId = entry.name;
         workspaces.push({ id: workspaceId, name: entry.name });
 
         const directFiles = await fs.readdir(entryPath, { withFileTypes: true });
@@ -921,7 +1045,6 @@ async function saveNotesToStorage(storagePath, notes) {
     await fs.mkdir(storagePath, { recursive: true });
     const previousMetadata = await readMetadata(storagePath);
     const workspaces = new Map();
-    workspaces.set(UNFILED_WORKSPACE_ID, { id: UNFILED_WORKSPACE_ID, name: '미지정 워크스페이스' });
     const metadataNotes = [];
     const writtenStoragePaths = new Set();
     const writtenAttachmentStoragePaths = new Set();
@@ -1104,7 +1227,8 @@ async function openAttachmentFromStorage(args = {}) {
 }
 
 function normalizeServerUrl(serverUrl) {
-    const rawUrl = String(serverUrl || DEFAULT_SYNC_SERVER_URL).trim();
+    const rawUrl = String(serverUrl || '').trim();
+    if (!rawUrl) throw new Error('동기화 서버 주소를 입력해야 합니다.');
     const parsed = new URL(rawUrl);
     if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error('HTTP 또는 HTTPS 동기화 서버만 사용할 수 있습니다.');
     return parsed.toString().replace(/\/+$/g, '');
@@ -1189,6 +1313,13 @@ function isSystemPlanItem(item) {
     return isSystemRelativePath(planItemRelativePath(item));
 }
 
+function isSyntheticMetadataConflict(item = {}) {
+    const relativePath = toPosixPath(planItemRelativePath(item)).replace(/^\/+|\/+$/g, '');
+    return item?.type === 'metadata'
+        && item?.reason === 'server_metadata_changed_after_client_base'
+        && relativePath === 'metadata';
+}
+
 function nonSystemPlanItems(items = []) {
     if (!Array.isArray(items)) return [];
     return items.filter(item => !isSystemPlanItem(item));
@@ -1233,6 +1364,14 @@ function filterSyncPlan(plan = {}) {
     next.deleteServerAttachments = nonSystemPlanItems(next.deleteServerAttachments);
     next.deleteLocalAttachments = nonSystemPlanItems(next.deleteLocalAttachments);
     next.conflicts = nonSystemPlanItems(next.conflicts);
+    return next;
+}
+
+function filterInitialSyntheticMetadataConflict(plan = {}, metadata = {}) {
+    const next = filterSyncPlan(plan);
+    if ((metadata.notes || []).length === 0) {
+        next.conflicts = next.conflicts.filter(item => !isSyntheticMetadataConflict(item));
+    }
     return next;
 }
 
@@ -1313,7 +1452,7 @@ function comparableMetadataNote(note) {
         title: note.title || '',
         tags: Array.isArray(note.tags) ? note.tags : [],
         status: note.status || '',
-        workspace: note.workspace || note.folder || UNFILED_WORKSPACE_ID,
+        workspace: noteWorkspaceId(note),
         workspaceName: note.workspaceName || '',
         fileName: note.fileName || '',
         relativePath: note.relativePath ? normalizeRelativePath(note.relativePath) : '',
@@ -1355,7 +1494,7 @@ function isLocalDirty(localInfo) {
 async function reconcilePlanWithServerMetadata(storagePath, localMetadata, syncState, response) {
     const serverMetadata = response.metadata?.serverMetadata;
     const metadataStatus = response.metadata?.status;
-    const plan = filterSyncPlan(response.plan);
+    const plan = filterInitialSyntheticMetadataConflict(response.plan, localMetadata);
     if (!serverMetadata || metadataStatus === 'same' || metadataStatus === 'server_empty') return plan;
 
     const serverFiles = mapManifestFiles(response.manifest);
@@ -1506,10 +1645,11 @@ function upsertMetadataNote(metadata, note) {
     if (!note?.relativePath) return;
     if (!Array.isArray(metadata.notes)) metadata.notes = [];
     const relativePath = normalizeRelativePath(note.relativePath);
+    const workspaceId = noteWorkspaceId({ ...note, relativePath });
     const nextNote = {
         ...note,
-        folder: note.folder || note.workspace || UNFILED_WORKSPACE_ID,
-        workspace: note.workspace || note.folder || UNFILED_WORKSPACE_ID,
+        folder: workspaceId,
+        workspace: workspaceId,
         relativePath,
         storagePath: note.storagePath ? normalizeRelativePath(note.storagePath) : noteStoragePath(note, relativePath)
     };
@@ -2334,7 +2474,7 @@ function registerStorageHandlers() {
 function registerSyncHandlers() {
     ipcMain.handle('notedown:sync:health', async (_event, args = {}) => {
         try {
-            return { ok: true, ...(await syncRequest(args.serverUrl || DEFAULT_SYNC_SERVER_URL, '/api/health')) };
+            return { ok: true, ...(await syncRequest(args.serverUrl, '/api/health')) };
         } catch (error) {
             return syncError(error, '동기화 서버에 연결하지 못했습니다.');
         }
@@ -2342,7 +2482,7 @@ function registerSyncHandlers() {
 
     ipcMain.handle('notedown:sync:setup-status', async (_event, args = {}) => {
         try {
-            return { ok: true, ...(await syncRequest(args.serverUrl || DEFAULT_SYNC_SERVER_URL, '/api/setup/status')) };
+            return { ok: true, ...(await syncRequest(args.serverUrl, '/api/setup/status')) };
         } catch (error) {
             return syncError(error, '동기화 서버 설정 상태를 확인하지 못했습니다.');
         }
@@ -2350,7 +2490,7 @@ function registerSyncHandlers() {
 
     ipcMain.handle('notedown:sync:setup', async (_event, args = {}) => {
         try {
-            const data = await syncRequest(args.serverUrl || DEFAULT_SYNC_SERVER_URL, '/api/setup', {
+            const data = await syncRequest(args.serverUrl, '/api/setup', {
                 body: {
                     username: args.username,
                     password: args.password
@@ -2364,7 +2504,7 @@ function registerSyncHandlers() {
 
     ipcMain.handle('notedown:sync:login', async (_event, args = {}) => {
         try {
-            const data = await syncRequest(args.serverUrl || DEFAULT_SYNC_SERVER_URL, '/api/login', {
+            const data = await syncRequest(args.serverUrl, '/api/login', {
                 body: {
                     username: args.username,
                     password: args.password
@@ -2767,6 +2907,15 @@ async function showMainWindow(options = {}) {
 }
 
 function registerAppHandlers() {
+    ipcMain.handle('notedown:app:installer-settings', async () => {
+        const settings = await readInstallerSettings();
+        if (!settings) return { ok: true, settings: null };
+        await writeAppPreferences({
+            keepInBackgroundOnClose: settings.keepInBackgroundOnClose,
+            launchAtStartup: settings.launchAtStartup
+        });
+        return { ok: true, settings };
+    });
     ipcMain.handle('notedown:app:preferences', async () => ({ ok: true, ...appPreferences, ...launchAtStartupState() }));
     ipcMain.handle('notedown:app:set-preferences', async (_event, args = {}) => {
         const nextPreferences = await writeAppPreferences(args);
@@ -2913,6 +3062,14 @@ async function createWindow(options = {}) {
         hideMainWindow(win);
     });
 
+    win.on('query-session-end', () => {
+        isQuitting = true;
+    });
+
+    win.on('session-end', () => {
+        isQuitting = true;
+    });
+
     win.on('closed', () => {
         if (mainWindow === win) mainWindow = null;
     });
@@ -2929,26 +3086,45 @@ async function createWindow(options = {}) {
 app.setName(APP_NAME);
 if (process.platform === 'win32') app.setAppUserModelId(APP_ID);
 
-app.whenReady().then(async () => {
-    await readAppPreferences();
-    syncTrayState();
-    registerAppHandlers();
-    registerStorageHandlers();
-    registerSyncHandlers();
-    registerPdfHandlers();
-    const startHidden = appPreferences.keepInBackgroundOnClose && appPreferences.launchAtStartup && launchedAsHiddenLoginItem();
-    await createWindow({ show: !startHidden });
-    if (startHidden && process.platform === 'darwin' && app.dock) app.dock.hide();
+const hasSingleInstanceLock = app.requestSingleInstanceLock();
 
-    app.on('activate', async () => {
-        await showMainWindow();
+if (!hasSingleInstanceLock) {
+    app.quit();
+} else {
+    app.on('second-instance', (_event, argv = []) => {
+        if (shouldQuitFromArgs(argv)) {
+            quitApplication();
+            return;
+        }
+        void showMainWindow();
     });
-});
 
-app.on('before-quit', () => {
-    isQuitting = true;
-});
+    app.whenReady().then(async () => {
+        if (shouldQuitFromArgs(process.argv)) {
+            quitApplication();
+            return;
+        }
 
-app.on('window-all-closed', () => {
-    if (!appPreferences.keepInBackgroundOnClose) app.quit();
-});
+        await readAppPreferences();
+        syncTrayState();
+        registerAppHandlers();
+        registerStorageHandlers();
+        registerSyncHandlers();
+        registerPdfHandlers();
+        const startHidden = appPreferences.keepInBackgroundOnClose && appPreferences.launchAtStartup && launchedAsHiddenLoginItem();
+        await createWindow({ show: !startHidden });
+        if (startHidden && process.platform === 'darwin' && app.dock) app.dock.hide();
+
+        app.on('activate', async () => {
+            await showMainWindow();
+        });
+    });
+
+    app.on('before-quit', () => {
+        isQuitting = true;
+    });
+
+    app.on('window-all-closed', () => {
+        if (!appPreferences.keepInBackgroundOnClose) app.quit();
+    });
+}

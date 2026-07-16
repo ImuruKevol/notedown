@@ -761,20 +761,41 @@ export class Component implements OnInit, OnDestroy {
     }
 
     private syncFolders() {
+        const noteFolders = this.noteFolderMap();
+        const noteFolderByLabel = new Map<string, string>();
+        for (const [id, label] of noteFolders) {
+            const normalizedLabel = this.normalizeFolderLabel(label);
+            if (normalizedLabel && !noteFolderByLabel.has(normalizedLabel)) noteFolderByLabel.set(normalizedLabel, id);
+        }
+
         const folders = new Map<string, string>();
         folders.set('all', '모든 노트');
 
         for (const folder of this.readStoredFolders()) {
+            const noteFolderId = noteFolderByLabel.get(this.normalizeFolderLabel(folder.label));
+            if (noteFolderId && noteFolderId !== folder.id) continue;
             if (folder.id !== 'all') folders.set(folder.id, folder.label);
         }
 
+        for (const [folder, label] of noteFolders) {
+            folders.set(folder, label);
+        }
+
+        this.folders = Array.from(folders.entries()).map(([id, label]) => ({ id, label }));
+        this.saveStoredFolders(this.folders.filter(folder => folder.id !== 'all'));
+        if (!this.folders.some(folder => folder.id === this.activeFolder)) {
+            this.activeFolder = 'all';
+            localStorage.setItem(this.activeWorkspaceKey, this.activeFolder);
+        }
+    }
+
+    private noteFolderMap() {
+        const folders = new Map<string, string>();
         for (const note of this.notes) {
             const folder = note.folder || 'memo';
             if (!folders.has(folder)) folders.set(folder, note.workspaceName || this.defaultFolderLabel(folder));
         }
-
-        this.folders = Array.from(folders.entries()).map(([id, label]) => ({ id, label }));
-        if (!this.folders.some(folder => folder.id === this.activeFolder)) this.activeFolder = 'all';
+        return folders;
     }
 
     private readStoredFolders(): FolderItem[] {

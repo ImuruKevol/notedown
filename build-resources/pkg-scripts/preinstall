@@ -1,0 +1,135 @@
+#!/bin/sh
+set -u
+
+log_message() {
+  logger -t NotedownInstaller "$*" 2>/dev/null || true
+}
+
+escape_applescript_string() {
+  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+CONSOLE_USER="$(stat -f '%Su' /dev/console 2>/dev/null || true)"
+if [ -z "$CONSOLE_USER" ] || [ "$CONSOLE_USER" = "root" ]; then
+  exit 0
+fi
+
+CONSOLE_UID="$(id -u "$CONSOLE_USER" 2>/dev/null || true)"
+USER_HOME="$(dscl . -read "/Users/$CONSOLE_USER" NFSHomeDirectory 2>/dev/null | awk '{print $2}')"
+if [ -z "$CONSOLE_UID" ] || [ -z "$USER_HOME" ] || [ ! -d "$USER_HOME" ]; then
+  exit 0
+fi
+
+CONFIG_DIR="$USER_HOME/Library/Application Support/Notedown"
+CONFIG_FILE="$CONFIG_DIR/installer-settings.ini"
+DEFAULT_STORAGE_DIR="$USER_HOME/Documents/Notedown Notes"
+DOCUMENTS_DIR="$USER_HOME/Documents"
+TMP_DIR="/tmp/notedown-installer.$$"
+
+if [ -f "$CONFIG_FILE" ]; then
+  log_message "Installer settings already exist at $CONFIG_FILE; skipping initial configuration prompts."
+  exit 0
+fi
+
+mkdir -p "$TMP_DIR"
+trap 'rm -rf "$TMP_DIR"' EXIT HUP INT TERM
+
+run_user_osascript() {
+  script_file="$1"
+  if command -v launchctl >/dev/null 2>&1 && command -v sudo >/dev/null 2>&1; then
+    launchctl asuser "$CONSOLE_UID" sudo -u "$CONSOLE_USER" osascript "$script_file" 2>/dev/null
+    return $?
+  fi
+  osascript "$script_file" 2>/dev/null
+}
+
+prompt_storage_path() {
+  script_file="$TMP_DIR/storage.scpt"
+  escaped_documents="$(escape_applescript_string "$DOCUMENTS_DIR")"
+  cat > "$script_file" <<EOF
+try
+  set selectedFolder to choose folder with prompt "Notedown 문서와 metadata.db를 저장할 디렉토리를 선택하세요." default location (POSIX file "$escaped_documents")
+  return POSIX path of selectedFolder
+on error
+  return ""
+end try
+EOF
+  run_user_osascript "$script_file" || true
+}
+
+prompt_text() {
+  prompt="$1"
+  script_name="$2"
+  script_file="$TMP_DIR/$script_name.scpt"
+  escaped_prompt="$(escape_applescript_string "$prompt")"
+  cat > "$script_file" <<EOF
+try
+  set dialogResult to display dialog "$escaped_prompt" default answer "" buttons {"건너뛰기", "저장"} default button "저장" cancel button "건너뛰기"
+  return text returned of dialogResult
+on error
+  return ""
+end try
+EOF
+  run_user_osascript "$script_file" || true
+}
+
+prompt_boolean() {
+  prompt="$1"
+  default_button="$2"
+  script_name="$3"
+  script_file="$TMP_DIR/$script_name.scpt"
+  escaped_prompt="$(escape_applescript_string "$prompt")"
+  escaped_default="$(escape_applescript_string "$default_button")"
+  cat > "$script_file" <<EOF
+try
+  set dialogResult to display dialog "$escaped_prompt" buttons {"아니오", "예"} default button "$escaped_default"
+  if button returned of dialogResult is "예" then
+    return "true"
+  end if
+  return "false"
+on error
+  return ""
+end try
+EOF
+  run_user_osascript "$script_file" || true
+}
+
+STORAGE_DIR="$(prompt_storage_path | tail -n 1)"
+if [ -z "$STORAGE_DIR" ]; then
+  STORAGE_DIR="$DEFAULT_STORAGE_DIR"
+fi
+STORAGE_DIR="${STORAGE_DIR%/}"
+
+SYNC_SERVER_URL="$(prompt_text "동기화 서버 URL을 입력하세요. 지금 등록하지 않으려면 건너뛰기를 누르세요." "sync-url" | tail -n 1)"
+SYNC_USERNAME=""
+if [ -n "$SYNC_SERVER_URL" ]; then
+  SYNC_USERNAME="$(prompt_text "동기화 사용자 이름을 입력하세요. 비밀번호와 로그인은 앱 설정에서 진행합니다." "sync-username" | tail -n 1)"
+fi
+
+KEEP_BACKGROUND="$(prompt_boolean "Notedown 창을 닫을 때 백그라운드에서 유지할까요?" "예" "keep-background" | tail -n 1)"
+if [ "$KEEP_BACKGROUND" != "true" ] && [ "$KEEP_BACKGROUND" != "false" ]; then
+  KEEP_BACKGROUND="true"
+fi
+
+LAUNCH_AT_STARTUP="$(prompt_boolean "macOS 로그인 시 Notedown을 자동으로 시작할까요?" "아니오" "launch-at-startup" | tail -n 1)"
+if [ "$LAUNCH_AT_STARTUP" != "true" ] && [ "$LAUNCH_AT_STARTUP" != "false" ]; then
+  LAUNCH_AT_STARTUP="false"
+fi
+
+mkdir -p "$CONFIG_DIR" "$STORAGE_DIR"
+cat > "$CONFIG_FILE" <<EOF
+[settings]
+workspaceName=Notedown
+storagePath=$STORAGE_DIR
+theme=light
+editorMode=split
+keepInBackgroundOnClose=$KEEP_BACKGROUND
+launchAtStartup=$LAUNCH_AT_STARTUP
+syncServerUrl=$SYNC_SERVER_URL
+syncUsername=$SYNC_USERNAME
+tabSize=2
+EOF
+
+chown -R "$CONSOLE_USER":staff "$CONFIG_DIR" "$STORAGE_DIR" 2>/dev/null || true
+log_message "Wrote installer settings to $CONFIG_FILE"
+exit 0

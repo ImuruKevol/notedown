@@ -10,7 +10,6 @@ declare global {
 const METADATA_FILE = 'metadata.json';
 const METADATA_DB_FILE = 'metadata.db';
 const SYNC_STATE_FILE = '.notedown-sync.json';
-const DEFAULT_SYNC_SERVER_URL = 'http://172.16.0.143:5500';
 const SYNC_REQUEST_TIMEOUT_MS = 15000;
 const IMPORTED_WORKSPACE_ID = '_imported';
 const UNFILED_WORKSPACE_ID = 'unfiled';
@@ -28,7 +27,9 @@ function capacitorHttp(): any {
 }
 
 function normalizeServerUrl(serverUrl?: string) {
-    const url = new URL(String(serverUrl || DEFAULT_SYNC_SERVER_URL).trim());
+    const rawUrl = String(serverUrl || '').trim();
+    if (!rawUrl) throw new Error('동기화 서버 주소를 입력해야 합니다.');
+    const url = new URL(rawUrl);
     if (!['http:', 'https:'].includes(url.protocol)) throw new Error('HTTP 또는 HTTPS 동기화 서버만 사용할 수 있습니다.');
     return url.toString().replace(/\/+$/g, '');
 }
@@ -150,6 +151,15 @@ function isSystemPlanItem(item: any) {
     return isSystemRelativePath(planItemRelativePath(item));
 }
 
+function isSyntheticMetadataConflict(item: any = {}) {
+    const relativePath = String(planItemRelativePath(item) || '')
+        .replace(/\\/g, '/')
+        .replace(/^\/+|\/+$/g, '');
+    return item?.type === 'metadata'
+        && item?.reason === 'server_metadata_changed_after_client_base'
+        && relativePath === 'metadata';
+}
+
 function nonSystemPlanItems(items: any[] = []) {
     if (!Array.isArray(items)) return [];
     return items.filter(item => !isSystemPlanItem(item));
@@ -200,6 +210,14 @@ function filterSyncPlan(plan: any = {}) {
     next.deleteServerAttachments = nonSystemPlanItems(next.deleteServerAttachments);
     next.deleteLocalAttachments = nonSystemPlanItems(next.deleteLocalAttachments);
     next.conflicts = nonSystemPlanItems(next.conflicts);
+    return next;
+}
+
+function filterInitialSyntheticMetadataConflict(plan: any = {}, metadata: any = {}) {
+    const next = filterSyncPlan(plan);
+    if ((metadata.notes || []).length === 0) {
+        next.conflicts = next.conflicts.filter((item: any) => !isSyntheticMetadataConflict(item));
+    }
     return next;
 }
 
@@ -648,7 +666,7 @@ async function buildKnownAttachments(native: NativeBridge, storagePath: string, 
 async function reconcilePlanWithServerMetadata(native: NativeBridge, storagePath: string, localMetadata: any, syncState: any, response: any) {
     const serverMetadata = response.metadata?.serverMetadata;
     const metadataStatus = response.metadata?.status;
-    const plan = filterSyncPlan(response.plan);
+    const plan = filterInitialSyntheticMetadataConflict(response.plan, localMetadata);
     if (!serverMetadata || metadataStatus === 'same' || metadataStatus === 'server_empty') return plan;
 
     const serverFiles = mapManifestFiles(response.manifest);

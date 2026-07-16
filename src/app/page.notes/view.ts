@@ -28,6 +28,8 @@ interface PreviewBlock {
     html?: SafeHtml;
     language?: string;
     code?: string;
+    editorOptions?: any;
+    editorHeight?: string;
     sectionStyle?: string;
     sectionClassName?: string;
     sectionHasTextStyle?: boolean;
@@ -84,6 +86,29 @@ interface EditorCursorPosition {
     visualLeft?: number;
     visualTop?: number;
     visualHeight?: number;
+}
+
+interface EditorSelectionSnapshot {
+    selectionStartLineNumber?: number;
+    selectionStartColumn?: number;
+    positionLineNumber?: number;
+    positionColumn?: number;
+    startLineNumber?: number;
+    startColumn?: number;
+    endLineNumber?: number;
+    endColumn?: number;
+}
+
+interface EditorSelectionState {
+    noteId: string;
+    body: string;
+    wasFocused: boolean;
+    plainSelectionStart?: number;
+    plainSelectionEnd?: number;
+    selection?: EditorSelectionSnapshot;
+    position?: { lineNumber: number; column: number };
+    scrollTop?: number;
+    scrollLeft?: number;
 }
 
 interface SyncConflict {
@@ -165,6 +190,11 @@ export class Component implements OnInit, OnDestroy {
     private foldingDisposable: any;
     private editorMouseMoveDisposable: any;
     private editorMouseLeaveDisposable: any;
+    private editorSelectionDisposables: any[] = [];
+    private lastEditorSelectionState: EditorSelectionState | null = null;
+    private pendingEditorSelectionState: EditorSelectionState | null = null;
+    private pendingEditorRestoreFocus = false;
+    private editorRestoreTimeout: number | null = null;
     private attachmentCommandId = '';
     private attachmentInputMode: AttachmentPickerMode = 'file';
     private attachmentUploadFromPicker = false;
@@ -177,6 +207,7 @@ export class Component implements OnInit, OnDestroy {
     private readonly androidSplitMinWidth = 840;
     private autoFoldedStyleNoteId = '';
     private hoveredLineDecorationIds: string[] = [];
+    private previewCodeOptionsCache = new Map<string, any>();
 
     private settingsKey = 'notedown.settings.v1';
     public viewMode: ViewMode = 'split';
@@ -253,6 +284,7 @@ export class Component implements OnInit, OnDestroy {
         const source = (event as CustomEvent<{ source?: string }>).detail?.source;
         if (source === 'page.notes') return;
 
+        const editorState = this.captureEditorSelectionState();
         const activeId = this.activeNote?.id;
         const unsavedNote = this.hasUnsavedChanges && activeId ? { ...this.activeNote } : null;
         await this.loadNotes(false);
@@ -261,11 +293,12 @@ export class Component implements OnInit, OnDestroy {
             if (index >= 0) this.notes[index] = unsavedNote;
             else this.notes = [unsavedNote, ...this.notes];
         }
-        this.selectNoteById(localStorage.getItem(this.activeNoteKey) || activeId);
+        this.selectNoteById(localStorage.getItem(this.activeNoteKey) || activeId, { restoreEditorState: editorState });
         if (unsavedNote?.id && this.activeNote?.id === unsavedNote.id) this.hasUnsavedChanges = true;
         this.requestViewUpdate();
     };
     private handleSettingsChanged = () => {
+        const editorState = this.captureEditorSelectionState();
         this.viewMode = this.settingsViewMode();
         this.refreshEditorOptions();
         if (this.showSyncConflictViewer()) {
@@ -276,6 +309,7 @@ export class Component implements OnInit, OnDestroy {
         this.refreshPreview();
         this.requestViewUpdate();
         this.focusEditorSoon();
+        this.restoreEditorSelectionSoon(editorState, true);
     };
     private handleStartupSyncStatus = (event: Event) => {
         const detail = (event as CustomEvent<any>).detail;
@@ -324,6 +358,19 @@ export class Component implements OnInit, OnDestroy {
         if (this.attachmentPickerOpen) this.updateAttachmentPickerPosition();
         if (viewModeChanged || this.attachmentPickerOpen) this.requestViewUpdate();
     };
+    private handleEditorWindowBlur = () => {
+        this.captureEditorSelectionState();
+    };
+    private handleEditorWindowFocus = () => {
+        this.restoreEditorSelectionSoon(this.lastEditorSelectionState, true);
+    };
+    private handleEditorVisibilityChange = () => {
+        if (document.visibilityState === 'visible') {
+            this.restoreEditorSelectionSoon(this.lastEditorSelectionState, true);
+            return;
+        }
+        this.captureEditorSelectionState();
+    };
 
     constructor(
         private sanitizer: DomSanitizer,
@@ -342,6 +389,9 @@ export class Component implements OnInit, OnDestroy {
         window.addEventListener('keydown', this.handleSaveShortcut, true);
         window.addEventListener('keydown', this.handleAttachmentPickerKeydown, true);
         window.addEventListener('resize', this.handleAttachmentPickerReposition);
+        window.addEventListener('blur', this.handleEditorWindowBlur);
+        window.addEventListener('focus', this.handleEditorWindowFocus);
+        document.addEventListener('visibilitychange', this.handleEditorVisibilityChange);
         this.startDeferredStartupWork();
     }
 
@@ -354,8 +404,13 @@ export class Component implements OnInit, OnDestroy {
         window.removeEventListener('keydown', this.handleSaveShortcut, true);
         window.removeEventListener('keydown', this.handleAttachmentPickerKeydown, true);
         window.removeEventListener('resize', this.handleAttachmentPickerReposition);
+        window.removeEventListener('blur', this.handleEditorWindowBlur);
+        window.removeEventListener('focus', this.handleEditorWindowFocus);
+        document.removeEventListener('visibilitychange', this.handleEditorVisibilityChange);
         if (this.completionDisposable) this.completionDisposable.dispose();
         if (this.foldingDisposable) this.foldingDisposable.dispose();
+        this.clearScheduledEditorRestore();
+        this.disposeEditorSelectionTracking();
         this.clearScheduledStyleFold();
         this.clearScheduledSyncUpload();
         this.disposeEditorHoverHandlers();
@@ -402,6 +457,7 @@ export class Component implements OnInit, OnDestroy {
     public handlePlainTextInput(event: Event) {
         const target = event.target as HTMLTextAreaElement | null;
         this.handleBodyChange(target?.value || '');
+        this.captureEditorSelectionState();
     }
 
     public touchNote(saveImmediately = false) {
@@ -466,12 +522,14 @@ export class Component implements OnInit, OnDestroy {
     }
 
     public setMode(mode: ViewMode) {
+        const editorState = this.captureEditorSelectionState();
         this.viewMode = this.normalizeViewModeForPlatform(mode);
         if (this.showSyncConflictViewer()) {
             this.renderSyncConflictDiffSoon();
             return;
         }
         if (!this.isAndroidPlatform()) this.focusEditorSoon();
+        if (this.viewMode !== 'preview') this.restoreEditorSelectionSoon(editorState || this.lastEditorSelectionState, true);
     }
 
     public createdAtLabel() {
@@ -617,6 +675,7 @@ export class Component implements OnInit, OnDestroy {
         if (event.type !== 'init' && event.type !== 're-init') return;
         this.editor = event.editor;
         this.configureMarkdownEditor();
+        this.restoreEditorSelectionSoon(this.pendingEditorSelectionState || this.lastEditorSelectionState, true);
     }
 
     public modeButtonClass(mode: ViewMode) {
@@ -673,9 +732,11 @@ export class Component implements OnInit, OnDestroy {
 
     public toggleAndroidPreviewMode() {
         if (!this.isAndroidPlatform()) return;
+        const editorState = this.captureEditorSelectionState();
         this.headingMenuOpen = false;
         this.viewMode = this.viewMode === 'preview' ? 'write' : 'preview';
         this.requestViewUpdate();
+        if (this.viewMode !== 'preview') this.restoreEditorSelectionSoon(editorState || this.lastEditorSelectionState, true);
     }
 
     public markdownToolbarButtonClass(actionId: MarkdownToolbarActionId) {
@@ -1276,6 +1337,7 @@ export class Component implements OnInit, OnDestroy {
         if (reason === 'server_metadata_removed_after_local_edit') return '서버 삭제와 로컬 편집이 겹쳤습니다.';
         if (reason === 'server_file_changed') return '서버 파일이 변경되었습니다.';
         if (reason === 'server_metadata_changed') return '서버 메타데이터가 변경되었습니다.';
+        if (reason === 'same_path_without_sync_history') return '동기화 이력이 없는 같은 경로의 파일이 서버와 로컬에 모두 있습니다.';
         if (reason === 'conflict') return '서버와 로컬 버전이 충돌했습니다.';
         return reason || '서버와 로컬 버전을 수동으로 비교해야 합니다.';
     }
@@ -1386,9 +1448,31 @@ export class Component implements OnInit, OnDestroy {
     }
 
     public codePreviewOptions(block: PreviewBlock) {
+        if (block.editorOptions) return block.editorOptions;
+        return this.getCodePreviewOptions(block.language);
+    }
+
+    public trackPreviewBlock(_index: number, block: PreviewBlock) {
+        return [
+            block.type,
+            block.lineIndex,
+            block.lineEnd ?? block.lineIndex,
+            block.variant || '',
+            block.language || '',
+            block.sectionClassName || ''
+        ].join(':');
+    }
+
+    private getCodePreviewOptions(language?: string) {
+        const normalizedLanguage = language || 'plaintext';
         const dark = document.documentElement.classList.contains('dark');
-        return {
-            language: block.language || 'plaintext',
+        const tabSize = this.editorTabSize();
+        const cacheKey = `${normalizedLanguage}:${dark ? 'dark' : 'light'}:${tabSize}`;
+        const cached = this.previewCodeOptionsCache.get(cacheKey);
+        if (cached) return cached;
+
+        const options = {
+            language: normalizedLanguage,
             theme: dark ? 'vs-dark' : 'vs',
             readOnly: true,
             domReadOnly: true,
@@ -1397,7 +1481,7 @@ export class Component implements OnInit, OnDestroy {
             fontSize: 13,
             lineHeight: 20,
             minimap: { enabled: false },
-            tabSize: this.editorTabSize(),
+            tabSize,
             insertSpaces: true,
             detectIndentation: false,
             lineNumbers: 'off',
@@ -1417,6 +1501,8 @@ export class Component implements OnInit, OnDestroy {
                 horizontalScrollbarSize: 8
             }
         };
+        this.previewCodeOptionsCache.set(cacheKey, options);
+        return options;
     }
 
     public codePreviewHeight(code?: string) {
@@ -1493,7 +1579,7 @@ export class Component implements OnInit, OnDestroy {
         this.activeNote.status = 'active';
     }
 
-    private selectNoteById(id?: string | null) {
+    private selectNoteById(id?: string | null, options: { restoreEditorState?: EditorSelectionState | null } = {}) {
         const note = id === '' ? null : (id ? this.notes.find(item => item.id === id) || this.notes[0] : this.notes[0]);
         if (!note) {
             this.activeNote = this.emptyNote();
@@ -1506,24 +1592,28 @@ export class Component implements OnInit, OnDestroy {
             localStorage.removeItem(this.activeNoteKey);
             this.clearSyncedLineHover();
             this.disposeEditorHoverHandlers();
+            this.disposeEditorSelectionTracking();
             this.editor = null;
             this.autoFoldedStyleNoteId = '';
             this.refreshPreview();
             return;
         }
+        const isSameNote = Boolean(this.activeNote?.id && this.activeNote.id === note.id);
+        const restoreEditorState = options.restoreEditorState || (isSameNote ? this.captureEditorSelectionState() : null);
         this.activeNote = note;
         this.editingTitle = false;
         this.titleDraft = note.title || '';
         this.attachmentPanelOpen = false;
         this.closeAttachmentPicker();
         this.autoFoldedStyleNoteId = '';
-        if (this.isAndroidPlatform()) this.viewMode = 'preview';
+        if (this.isAndroidPlatform() && !isSameNote) this.viewMode = 'preview';
         localStorage.setItem(this.activeNoteKey, note.id);
         this.refreshPreview();
         if (this.showSyncConflictViewer()) {
             this.renderSyncConflictDiffSoon();
         } else {
-            this.focusEditorSoon(this.shouldFocusFirstLineEnd(note) ? 'first-line-end' : 'default');
+            if (restoreEditorState) this.restoreEditorSelectionSoon(restoreEditorState, true);
+            else this.focusEditorSoon(this.shouldFocusFirstLineEnd(note) ? 'first-line-end' : 'default');
             this.scheduleFoldStyleBlocks();
         }
     }
@@ -1897,16 +1987,18 @@ export class Component implements OnInit, OnDestroy {
 
     private async reloadNotesAfterStartupSync() {
         const activeId = localStorage.getItem(this.activeNoteKey) || this.activeNote?.id || '';
+        const editorState = this.captureEditorSelectionState();
         await this.loadNotes(false);
-        this.selectNoteById(activeId);
+        this.selectNoteById(activeId, { restoreEditorState: editorState });
         this.emitNotesChanged();
         this.requestViewUpdate();
     }
 
     private async reloadNotesAfterSyncResolution() {
         const activeId = localStorage.getItem(this.activeNoteKey) || this.activeNote?.id || '';
+        const editorState = this.captureEditorSelectionState();
         await this.loadNotes(false);
-        this.selectNoteById(activeId);
+        this.selectNoteById(activeId, { restoreEditorState: editorState });
         this.emitNotesChanged();
     }
 
@@ -2331,6 +2423,185 @@ export class Component implements OnInit, OnDestroy {
         this.focusEditorSoon();
     }
 
+    private captureEditorSelectionState(): EditorSelectionState | null {
+        if (!this.hasSelectedNote) return null;
+
+        const noteId = this.activeNote.id;
+        const body = this.activeNote.body || '';
+        const textarea = this.plainTextEditorElement();
+        let state: EditorSelectionState | null = null;
+
+        if (textarea) {
+            state = {
+                noteId,
+                body,
+                wasFocused: document.activeElement === textarea,
+                plainSelectionStart: textarea.selectionStart ?? textarea.value.length,
+                plainSelectionEnd: textarea.selectionEnd ?? textarea.selectionStart ?? textarea.value.length,
+                scrollTop: textarea.scrollTop,
+                scrollLeft: textarea.scrollLeft
+            };
+        } else if (this.editor?.getModel?.()) {
+            const selection = this.editor.getSelection?.();
+            const position = this.editor.getPosition?.();
+            state = {
+                noteId,
+                body,
+                wasFocused: this.isEditorFocused(),
+                selection: selection ? this.toEditorSelectionSnapshot(selection) : undefined,
+                position: position ? { lineNumber: position.lineNumber, column: position.column } : undefined,
+                scrollTop: this.editor.getScrollTop?.(),
+                scrollLeft: this.editor.getScrollLeft?.()
+            };
+        }
+
+        if (state) this.lastEditorSelectionState = state;
+        return state;
+    }
+
+    private toEditorSelectionSnapshot(selection: any): EditorSelectionSnapshot {
+        return {
+            selectionStartLineNumber: selection.selectionStartLineNumber,
+            selectionStartColumn: selection.selectionStartColumn,
+            positionLineNumber: selection.positionLineNumber,
+            positionColumn: selection.positionColumn,
+            startLineNumber: selection.startLineNumber,
+            startColumn: selection.startColumn,
+            endLineNumber: selection.endLineNumber,
+            endColumn: selection.endColumn
+        };
+    }
+
+    private restoreEditorSelectionSoon(state = this.pendingEditorSelectionState || this.lastEditorSelectionState, focus = false) {
+        if (!state) return;
+        this.pendingEditorSelectionState = state;
+        this.pendingEditorRestoreFocus = this.pendingEditorRestoreFocus || focus;
+        this.clearScheduledEditorRestore();
+        this.editorRestoreTimeout = window.setTimeout(() => {
+            const pendingState = this.pendingEditorSelectionState;
+            const shouldFocus = this.pendingEditorRestoreFocus;
+            this.editorRestoreTimeout = null;
+            this.pendingEditorRestoreFocus = false;
+            if (pendingState && this.restoreEditorSelection(pendingState, shouldFocus)) {
+                this.pendingEditorSelectionState = null;
+            }
+        }, 0);
+    }
+
+    private restoreEditorSelection(state: EditorSelectionState, focus: boolean) {
+        if (!this.canRestoreEditorSelection(state)) return false;
+
+        const textarea = this.plainTextEditorElement();
+        if (textarea) return this.restorePlainEditorSelection(textarea, state, focus);
+        if (this.editor && this.viewMode !== 'preview') return this.restoreMonacoEditorSelection(state, focus);
+        return false;
+    }
+
+    private canRestoreEditorSelection(state: EditorSelectionState) {
+        if (!state?.noteId || state.noteId !== this.activeNote?.id) return false;
+        return state.body === (this.activeNote?.body || '');
+    }
+
+    private restorePlainEditorSelection(textarea: HTMLTextAreaElement, state: EditorSelectionState, focus: boolean) {
+        const valueLength = textarea.value.length;
+        const selectionStart = this.clampNumber(state.plainSelectionStart, 0, valueLength);
+        const selectionEnd = this.clampNumber(state.plainSelectionEnd ?? selectionStart, 0, valueLength);
+        textarea.setSelectionRange(selectionStart, selectionEnd);
+        if (typeof state.scrollTop === 'number') textarea.scrollTop = state.scrollTop;
+        if (typeof state.scrollLeft === 'number') textarea.scrollLeft = state.scrollLeft;
+        if (focus && state.wasFocused) textarea.focus({ preventScroll: true });
+        return true;
+    }
+
+    private restoreMonacoEditorSelection(state: EditorSelectionState, focus: boolean) {
+        const model = this.editor?.getModel?.();
+        if (!model) return false;
+
+        const selection = this.validMonacoSelection(model, state.selection);
+        if (selection) this.editor.setSelection?.(selection);
+        else if (state.position) this.editor.setPosition?.(this.validMonacoPosition(model, state.position));
+
+        if (typeof state.scrollTop === 'number') this.editor.setScrollTop?.(state.scrollTop);
+        if (typeof state.scrollLeft === 'number') this.editor.setScrollLeft?.(state.scrollLeft);
+        if (focus && state.wasFocused) this.editor.focus?.();
+        return true;
+    }
+
+    private validMonacoSelection(model: any, selection?: EditorSelectionSnapshot) {
+        if (!selection) return null;
+
+        const anchor = this.validMonacoPosition(model, {
+            lineNumber: selection.selectionStartLineNumber ?? selection.startLineNumber ?? 1,
+            column: selection.selectionStartColumn ?? selection.startColumn ?? 1
+        });
+        const position = this.validMonacoPosition(model, {
+            lineNumber: selection.positionLineNumber ?? selection.endLineNumber ?? anchor.lineNumber,
+            column: selection.positionColumn ?? selection.endColumn ?? anchor.column
+        });
+        return {
+            selectionStartLineNumber: anchor.lineNumber,
+            selectionStartColumn: anchor.column,
+            positionLineNumber: position.lineNumber,
+            positionColumn: position.column
+        };
+    }
+
+    private validMonacoPosition(model: any, position: { lineNumber: number; column: number }) {
+        if (model?.validatePosition) return model.validatePosition(position);
+        return {
+            lineNumber: Math.max(1, Number(position.lineNumber) || 1),
+            column: Math.max(1, Number(position.column) || 1)
+        };
+    }
+
+    private clampNumber(value: number | undefined, min: number, max: number) {
+        const numeric = Number(value);
+        if (!Number.isFinite(numeric)) return min;
+        return Math.min(max, Math.max(min, Math.round(numeric)));
+    }
+
+    private isEditorFocused() {
+        const activeElement = document.activeElement as HTMLElement | null;
+        if (this.editor?.hasTextFocus?.()) return true;
+        if (!activeElement) return false;
+        return Boolean(
+            activeElement.closest('[data-plain-markdown-editor="true"]')
+            || activeElement.closest('.monaco-editor')
+        );
+    }
+
+    private configureEditorSelectionTracking() {
+        this.disposeEditorSelectionTracking();
+        if (!this.editor) return;
+
+        const remember = () => this.captureEditorSelectionState();
+        const restore = () => this.restoreEditorSelectionSoon(this.lastEditorSelectionState, true);
+        const selectionDisposable = this.editor.onDidChangeCursorSelection?.(remember);
+        const scrollDisposable = this.editor.onDidScrollChange?.(remember);
+        const blurDisposable = this.editor.onDidBlurEditorText?.(remember);
+        const focusDisposable = this.editor.onDidFocusEditorText?.(restore);
+        this.editorSelectionDisposables = [
+            selectionDisposable,
+            scrollDisposable,
+            blurDisposable,
+            focusDisposable
+        ].filter(Boolean);
+        this.captureEditorSelectionState();
+    }
+
+    private disposeEditorSelectionTracking() {
+        for (const disposable of this.editorSelectionDisposables) {
+            disposable?.dispose?.();
+        }
+        this.editorSelectionDisposables = [];
+    }
+
+    private clearScheduledEditorRestore() {
+        if (this.editorRestoreTimeout == null) return;
+        window.clearTimeout(this.editorRestoreTimeout);
+        this.editorRestoreTimeout = null;
+    }
+
     private configureMarkdownEditor() {
         const monaco = (window as any).monaco;
         if (!monaco || !this.editor) return;
@@ -2338,6 +2609,7 @@ export class Component implements OnInit, OnDestroy {
         this.editor.updateOptions(this.createEditorOptions());
         this.configureEditorLineHover(monaco);
         this.configureMarkdownFolding(monaco);
+        this.configureEditorSelectionTracking();
         this.scheduleFoldStyleBlocks();
         this.editor.addAction({
             id: 'notedown-open-slash-blocks',
@@ -2936,12 +3208,15 @@ ${documentCss}
                 codeLines.push(lines[index].text);
                 index++;
             }
+            const code = codeLines.join('\n');
             blocks.push(this.withSectionStyle({
                 type: 'code',
                 lineIndex: codeStartLine,
                 lineEnd: lines[index]?.lineIndex ?? codeStartLine,
                 language,
-                code: codeLines.join('\n')
+                code,
+                editorOptions: this.getCodePreviewOptions(language),
+                editorHeight: this.codePreviewHeight(code)
             }, sourceLine.section));
         }
 

@@ -1,7 +1,7 @@
 {
   "name": "notedown",
   "productName": "Notedown",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Notedown desktop Markdown notes app",
   "author": "Taewook Kwon (ImuruKevol) <kwon3286@season.co.kr>",
   "license": "MIT",
@@ -52,12 +52,13 @@
       "icon": "build-resources/icon.icns",
       "identity": "-",
       "target": [
-        "dmg",
+        "pkg",
         "zip"
       ]
     },
-    "dmg": {
-      "backgroundColor": "#fbfbfa"
+    "pkg": {
+      "installLocation": "/Applications",
+      "scripts": "pkg-scripts"
     },
     "win": {
       "icon": "build-resources/icon.ico",
@@ -70,7 +71,8 @@
       "perMachine": false,
       "allowToChangeInstallationDirectory": true,
       "shortcutName": "Notedown",
-      "uninstallDisplayName": "Notedown"
+      "uninstallDisplayName": "Notedown",
+      "include": "build-resources/installer.nsh"
     }
   },
   "dependencies": {

@@ -39,6 +39,8 @@ interface AppSettings {
     syncToken: string;
     syncTokenType: string;
     syncClientId: string;
+    setupCompleted: boolean;
+    setupCompletedAt: string;
 }
 
 interface PaletteCommand {
@@ -386,25 +388,43 @@ export class Component implements OnInit, OnDestroy {
     }
 
     private buildWorkspaces(notes: NoteItem[]): WorkspaceItem[] {
-        const folders = new Map<string, WorkspaceItem>();
-        folders.set('all', { id: 'all', label: '모든 노트', count: notes.length });
-
-        for (const folder of this.readStoredFolders()) {
-            folders.set(folder.id, { id: folder.id, label: folder.label, count: 0 });
+        const noteWorkspaces = this.noteWorkspaceMap(notes);
+        const noteWorkspaceByLabel = new Map<string, string>();
+        for (const [id, workspace] of noteWorkspaces) {
+            const normalizedLabel = this.normalizeWorkspaceLabel(workspace.label);
+            if (normalizedLabel && !noteWorkspaceByLabel.has(normalizedLabel)) noteWorkspaceByLabel.set(normalizedLabel, id);
         }
 
+        const workspaces = new Map<string, WorkspaceItem>();
+        workspaces.set('all', { id: 'all', label: '모든 노트', count: notes.length });
+
+        for (const folder of this.readStoredFolders()) {
+            const noteWorkspaceId = noteWorkspaceByLabel.get(this.normalizeWorkspaceLabel(folder.label));
+            if (noteWorkspaceId && noteWorkspaceId !== folder.id) continue;
+            workspaces.set(folder.id, { id: folder.id, label: folder.label, count: 0 });
+        }
+
+        for (const [id, workspace] of noteWorkspaces) {
+            workspaces.set(id, workspace);
+        }
+
+        return Array.from(workspaces.values());
+    }
+
+    private noteWorkspaceMap(notes: NoteItem[]) {
+        const workspaces = new Map<string, WorkspaceItem>();
         for (const note of notes) {
             const id = note.folder || 'memo';
-            const current = folders.get(id);
+            const current = workspaces.get(id);
             if (current) {
                 current.count += 1;
                 if (!current.label && note.workspaceName) current.label = note.workspaceName;
                 continue;
             }
-            folders.set(id, { id, label: note.workspaceName || this.defaultWorkspaceLabel(id), count: 1 });
+            workspaces.set(id, { id, label: note.workspaceName || this.defaultWorkspaceLabel(id), count: 1 });
         }
 
-        return Array.from(folders.values());
+        return workspaces;
     }
 
     private readStoredFolders(): WorkspaceItem[] {
@@ -414,7 +434,7 @@ export class Component implements OnInit, OnDestroy {
             const folders = stored
                 .map(folder => ({
                     id: String(folder?.id || '').trim(),
-                    label: String(folder?.label || '').replace(/\s+/g, ' ').trim(),
+                    label: this.normalizeWorkspaceLabel(folder?.label),
                     count: 0
                 }))
                 .filter(folder => folder.id && folder.id !== 'all' && folder.label);
@@ -431,6 +451,10 @@ export class Component implements OnInit, OnDestroy {
             map.set(workspace.id, workspace);
         }
         return Array.from(map.values());
+    }
+
+    private normalizeWorkspaceLabel(value: unknown) {
+        return String(value || '').replace(/\s+/g, ' ').trim();
     }
 
     private workspaceIdForActiveNote() {
@@ -617,11 +641,25 @@ export class Component implements OnInit, OnDestroy {
     }
 
     private readSettings(): AppSettings {
+        const storedSettings = localStorage.getItem(this.settingsKey);
         try {
-            return { ...this.defaultSettings(), ...JSON.parse(localStorage.getItem(this.settingsKey) || '{}') };
+            const stored = JSON.parse(storedSettings || '{}') || {};
+            return this.migrateLegacySettings({
+                ...this.defaultSettings(),
+                ...stored,
+                setupCompleted: typeof stored.setupCompleted === 'boolean' ? stored.setupCompleted : Boolean(storedSettings),
+                setupCompletedAt: typeof stored.setupCompletedAt === 'string' ? stored.setupCompletedAt : ''
+            });
         } catch (error) {
             return this.defaultSettings();
         }
+    }
+
+    private migrateLegacySettings(settings: AppSettings): AppSettings {
+        if (!settings.syncUsername.trim() && !settings.syncToken.trim() && this.isLegacyDefaultSyncServerUrl(settings.syncServerUrl)) {
+            return { ...settings, syncServerUrl: '' };
+        }
+        return settings;
     }
 
     private defaultSettings(): AppSettings {
@@ -630,15 +668,33 @@ export class Component implements OnInit, OnDestroy {
             storagePath: '~/Documents/Notedown Notes',
             theme: 'light',
             editorMode: 'split',
-            keepInBackgroundOnClose: true,
+            keepInBackgroundOnClose: this.defaultKeepInBackgroundOnClose(),
             launchAtStartup: false,
             tabSize: 2,
-            syncServerUrl: 'http://172.16.0.143:5500',
+            syncServerUrl: '',
             syncUsername: '',
             syncToken: '',
             syncTokenType: '',
-            syncClientId: ''
+            syncClientId: '',
+            setupCompleted: true,
+            setupCompletedAt: new Date().toISOString()
         };
+    }
+
+    private defaultKeepInBackgroundOnClose() {
+        return String((window as any).notedown?.platform || '').toLowerCase() !== 'win32';
+    }
+
+    private isLegacyDefaultSyncServerUrl(value: string) {
+        try {
+            const url = new URL(String(value || '').trim());
+            return url.protocol === 'http:'
+                && url.hostname === ['172', '16', '0', '143'].join('.')
+                && url.port === '5500'
+                && url.pathname.replace(/\/+$/g, '') === '';
+        } catch (error) {
+            return false;
+        }
     }
 
     private normalizeTheme(value: unknown): ThemeMode {
