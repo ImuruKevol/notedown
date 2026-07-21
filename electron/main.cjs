@@ -11,6 +11,13 @@ const {
     readMetadata,
     writeMetadata
 } = require('./metadata-store.cjs');
+const { createKeyedQueue } = require('./keyed-queue.cjs');
+const {
+    indexPreviousAttachmentIdentities,
+    indexPreviousNoteIdentities,
+    prepareNoteStorageIdentities,
+    selectMissingPreviousNotes
+} = require('./storage-identity.cjs');
 
 const DEV_URL = process.env.NOTEDOWN_DEV_URL;
 const DIST_DIR = path.resolve(__dirname, '..', 'bundle', 'www');
@@ -29,6 +36,9 @@ let tray = null;
 let isQuitting = false;
 let currentWorkspaceRevealTimer = null;
 const activeStorageRoots = new Set();
+const storageOperationQueue = createKeyedQueue();
+const syncOperationQueue = createKeyedQueue();
+const storageMutationGenerations = new Map();
 const deflateRaw = promisify(zlib.deflateRaw);
 let appPreferences = {
     keepInBackgroundOnClose: defaultKeepInBackgroundOnClose(),
@@ -37,7 +47,8 @@ let appPreferences = {
 
 const LEGACY_METADATA_FILE = 'metadata.json';
 const SYNC_STATE_FILE = '.notedown-sync.json';
-const SYNC_REQUEST_TIMEOUT_MS = 15000;
+const SYNC_REQUEST_TIMEOUT_MS = 60000;
+const RETRYABLE_SYNC_ENDPOINTS = new Set(['/api/sync/plan', '/api/sync/file', '/api/sync/attachment']);
 const IMPORTED_WORKSPACE_ID = '_imported';
 const UNFILED_WORKSPACE_ID = 'unfiled';
 
@@ -283,6 +294,42 @@ function rememberStoragePath(filePath) {
     const storagePath = normalizeStoragePath(filePath);
     activeStorageRoots.add(path.resolve(storagePath));
     return storagePath;
+}
+
+function storageOperationKey(storagePath) {
+    return path.resolve(rememberStoragePath(storagePath));
+}
+
+function runStorageOperation(storagePath, task) {
+    return storageOperationQueue.run(storageOperationKey(storagePath), task);
+}
+
+function storageMutationGeneration(storagePath) {
+    return storageMutationGenerations.get(storageOperationKey(storagePath)) || 0;
+}
+
+function bumpStorageMutationGeneration(storagePath) {
+    const key = storageOperationKey(storagePath);
+    const generation = (storageMutationGenerations.get(key) || 0) + 1;
+    storageMutationGenerations.set(key, generation);
+    return generation;
+}
+
+function runStorageMutation(storagePath, task) {
+    const key = storageOperationKey(storagePath);
+    return storageOperationQueue.run(key, () => {
+        bumpStorageMutationGeneration(storagePath);
+        return task();
+    });
+}
+
+function runSyncOperation(args, task, useStorageQueue = false) {
+    const config = syncConfig(args);
+    const syncKey = path.resolve(config.storagePath);
+    return syncOperationQueue.run(syncKey, () => {
+        if (!useStorageQueue) return task();
+        return runStorageOperation(config.storagePath, task);
+    });
 }
 
 function safeWorkspaceId(name) {
@@ -587,11 +634,25 @@ async function readSyncState(storagePath) {
 
 async function writeSyncState(storagePath, state) {
     await fs.mkdir(storagePath, { recursive: true });
-    await fs.writeFile(syncStatePath(storagePath), `${JSON.stringify(state, null, 2)}\n`, 'utf8');
+    const targetPath = syncStatePath(storagePath);
+    const temporaryPath = `${targetPath}.${process.pid}.${crypto.randomUUID()}.tmp`;
+    try {
+        await fs.writeFile(temporaryPath, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
+        await fs.rename(temporaryPath, targetPath);
+    } finally {
+        await fs.rm(temporaryPath, { force: true }).catch(() => undefined);
+    }
 }
 
 async function writeSyncStateFromManifest(storagePath, manifest, previousState = {}) {
     if (!manifest) return previousState;
+    const currentState = await readSyncState(storagePath);
+    const currentRevision = Number(currentState.serverRevision) || 0;
+    const manifestRevision = Number(manifest.serverRevision) || 0;
+    if (manifestRevision > 0 && manifestRevision < currentRevision) return currentState;
+    previousState = currentRevision >= (Number(previousState.serverRevision) || 0)
+        ? currentState
+        : previousState;
 
     const files = {};
     for (const file of manifest.files || []) {
@@ -844,6 +905,67 @@ function normalizeAttachmentMetadata(attachment = {}, noteRelativePath = '') {
     };
 }
 
+function validateMetadataStorageIdentities(metadata = {}) {
+    const notes = Array.isArray(metadata?.notes) ? metadata.notes : [];
+    const noteIdentities = indexPreviousNoteIdentities(notes, normalizeRelativePath);
+    const attachmentIdentities = indexPreviousAttachmentIdentities(notes, normalizeRelativePath);
+    for (const storagePath of attachmentIdentities.byStoragePath.keys()) {
+        if (noteIdentities.byStoragePath.has(storagePath)) {
+            throw new Error(`첨부 실제 저장 경로가 노트 파일과 충돌합니다: ${storagePath}`);
+        }
+    }
+    return { notes: noteIdentities, attachments: attachmentIdentities };
+}
+
+function resolveAttachmentStorageIdentity(metadata, attachment = {}, noteRelativePath = '') {
+    const safeNoteRelativePath = normalizeRelativePath(noteRelativePath);
+    const identities = validateMetadataStorageIdentities(metadata);
+    const previous = identities.attachments;
+    const requestedId = String(attachment.id || attachment.attachmentId || '').trim();
+    const requestedRelativePath = attachment.relativePath
+        ? normalizeRelativePath(attachment.relativePath)
+        : '';
+    const requestedStoragePath = attachment.storagePath
+        ? normalizeRelativePath(attachment.storagePath)
+        : '';
+    const existingById = requestedId ? previous.byId.get(requestedId) || null : null;
+    const existingByRelativePath = requestedRelativePath
+        ? previous.byRelativePath.get(requestedRelativePath) || null
+        : null;
+
+    if (existingById && existingByRelativePath && existingById !== existingByRelativePath) {
+        throw new Error(`첨부 ID와 경로가 서로 다른 기존 첨부를 가리킵니다: ${requestedRelativePath}`);
+    }
+    const existing = existingById || existingByRelativePath;
+    if (existing && existing.noteRelativePath !== safeNoteRelativePath) {
+        throw new Error(`첨부가 다른 노트에 연결되어 있습니다: ${requestedRelativePath || requestedId}`);
+    }
+    if (existingById && requestedRelativePath && existingById.relativePath !== requestedRelativePath) {
+        throw new Error(`첨부 ID가 다른 경로에 연결되어 있습니다: ${requestedId}`);
+    }
+    if (existingByRelativePath && requestedId && existingByRelativePath.id && existingByRelativePath.id !== requestedId) {
+        throw new Error(`첨부 경로가 다른 ID에 연결되어 있습니다: ${requestedRelativePath}`);
+    }
+    if (existing && requestedStoragePath && existing.storagePath && existing.storagePath !== requestedStoragePath) {
+        throw new Error(`첨부 실제 저장 경로가 기존 메타데이터와 다릅니다: ${requestedRelativePath}`);
+    }
+
+    const storagePath = existing?.storagePath || requestedStoragePath;
+    const storageOwner = storagePath ? previous.byStoragePath.get(storagePath) || null : null;
+    if (storageOwner && storageOwner !== existing) {
+        throw new Error(`첨부 실제 저장 경로가 다른 첨부에 연결되어 있습니다: ${storagePath}`);
+    }
+    if (storagePath && identities.notes.byStoragePath.has(storagePath)) {
+        throw new Error(`첨부 실제 저장 경로가 노트 파일과 충돌합니다: ${storagePath}`);
+    }
+    return {
+        existing,
+        id: requestedId || existing?.id || '',
+        relativePath: requestedRelativePath || existing?.relativePath || '',
+        storagePath
+    };
+}
+
 function noteAttachmentDirectory(noteRelativePath, note = {}) {
     const safeNoteRelativePath = normalizeRelativePath(noteRelativePath);
     const noteRelativeStoragePath = noteStoragePath(note, safeNoteRelativePath);
@@ -892,12 +1014,17 @@ function upsertMetadataAttachment(metadata, noteRelativePath, attachment) {
     const safeNoteRelativePath = normalizeRelativePath(noteRelativePath);
     const note = (metadata.notes || []).find(item => item?.relativePath && normalizeRelativePath(item.relativePath) === safeNoteRelativePath);
     if (!note) return;
-    const nextAttachment = normalizeAttachmentMetadata(attachment, safeNoteRelativePath);
+    const identity = resolveAttachmentStorageIdentity(metadata, attachment, safeNoteRelativePath);
+    const nextAttachment = normalizeAttachmentMetadata({
+        ...attachment,
+        ...(identity.id ? { id: identity.id } : {}),
+        relativePath: identity.relativePath || attachment.relativePath,
+        storagePath: identity.storagePath || attachment.storagePath
+    }, safeNoteRelativePath);
     if (!Array.isArray(note.attachments)) note.attachments = [];
-    const index = note.attachments.findIndex(item => {
-        if (!item?.relativePath) return false;
-        return normalizeRelativePath(item.relativePath) === nextAttachment.relativePath || (nextAttachment.id && item.id === nextAttachment.id);
-    });
+    const index = identity.existing
+        ? note.attachments.indexOf(identity.existing.attachment)
+        : -1;
     if (index >= 0) {
         note.attachments[index] = { ...note.attachments[index], ...nextAttachment };
     } else {
@@ -1041,25 +1168,55 @@ async function generateMetadata(storagePath, options = {}) {
     };
 }
 
-async function saveNotesToStorage(storagePath, notes) {
+async function mergeIncomingNotesWithStoredNotes(storagePath, notes, previousMetadata, deletedNoteIds = []) {
+    const merged = [...(notes || [])];
+    const missingPreviousNotes = selectMissingPreviousNotes(
+        merged,
+        previousMetadata?.notes || [],
+        deletedNoteIds,
+        normalizeRelativePath
+    );
+    for (const previousNote of missingPreviousNotes) {
+        merged.push(await readMarkdownNote(storagePath, previousNote));
+    }
+    return merged;
+}
+
+async function saveNotesToStorage(storagePath, notes, options = {}) {
     await fs.mkdir(storagePath, { recursive: true });
     const previousMetadata = await readMetadata(storagePath);
+    const mergedNotes = await mergeIncomingNotesWithStoredNotes(
+        storagePath,
+        notes || [],
+        previousMetadata,
+        options.deletedNoteIds || []
+    );
+    const preparedNotes = prepareNoteStorageIdentities(
+        mergedNotes,
+        previousMetadata?.notes || [],
+        {
+            normalizeRelativePath,
+            relativePathForNote,
+            deletedAttachmentIds: options.deletedAttachmentIds || []
+        }
+    );
     const workspaces = new Map();
     const metadataNotes = [];
     const writtenStoragePaths = new Set();
     const writtenAttachmentStoragePaths = new Set();
     const usedStoragePaths = new Set();
 
-    for (const note of notes || []) {
+    for (const prepared of preparedNotes) {
+        const note = prepared.note;
         const workspaceId = noteWorkspaceId(note);
         const workspaceName = noteWorkspaceName(note, workspaceId);
-        const relativePath = relativePathForNote(note);
+        const relativePath = prepared.relativePath;
         const desiredStoragePath = desiredNoteStoragePath({ ...note, workspace: workspaceId, folder: workspaceId, workspaceName }, relativePath);
         const storageRelativePath = await uniqueStorageRelativePath(
             storagePath,
             desiredStoragePath,
             usedStoragePaths,
-            note.storagePath || relativePath
+            prepared.currentStoragePath
         );
         const fileName = path.posix.basename(storageRelativePath);
         const { absolutePath } = resolveStorageFile(storagePath, storageRelativePath);
@@ -1099,12 +1256,18 @@ async function saveNotesToStorage(storagePath, notes) {
         });
     await removeMetadataOrphans(storagePath, previousMetadata, writtenStoragePaths, writtenAttachmentStoragePaths);
 
-    return { ok: true, notes: metadataNotes.length, workspaces: workspaces.size };
+    return {
+        ok: true,
+        notes: metadataNotes.length,
+        workspaces: workspaces.size,
+        savedNotes: metadataNotes
+    };
 }
 
 async function saveAttachmentToStorage(args = {}) {
     const storagePath = rememberStoragePath(args.storagePath);
     const metadata = await ensureMetadata(storagePath);
+    validateMetadataStorageIdentities(metadata);
     const payloadNote = args.note || null;
     const noteRelativePath = normalizeRelativePath(args.noteRelativePath || payloadNote?.relativePath || relativePathForNote(payloadNote));
     const note = findMetadataNote(metadata, noteRelativePath, payloadNote);
@@ -1116,14 +1279,20 @@ async function saveAttachmentToStorage(args = {}) {
     const fileName = safeAttachmentFileName(args.fileName || 'attachment');
     const attachmentDir = noteAttachmentDirectory(noteRelativePath, note);
     const logicalRelativePath = args.relativePath ? normalizeRelativePath(args.relativePath) : '';
-    const baseStoragePath = normalizeRelativePath(args.attachmentStoragePath || path.posix.join(attachmentDir, fileName));
+    const requestedIdentity = resolveAttachmentStorageIdentity(metadata, {
+        id: args.id,
+        relativePath: logicalRelativePath,
+        storagePath: args.attachmentStoragePath || ''
+    }, noteRelativePath);
+    const baseStoragePath = requestedIdentity.storagePath
+        || normalizeRelativePath(path.posix.join(attachmentDir, fileName));
     const storageRelativePath = await uniqueStorageRelativePath(
         storagePath,
         baseStoragePath,
         new Set(),
-        args.attachmentStoragePath || ''
+        requestedIdentity.existing ? requestedIdentity.storagePath : ''
     );
-    const relativePath = logicalRelativePath || storageRelativePath;
+    const relativePath = requestedIdentity.relativePath || logicalRelativePath || storageRelativePath;
     const { absolutePath } = resolveStorageFile(storagePath, storageRelativePath);
     const contentEncoding = args.contentEncoding || 'base64';
     const content = contentEncoding === 'base64'
@@ -1135,7 +1304,7 @@ async function saveAttachmentToStorage(args = {}) {
     await fs.writeFile(absolutePath, content);
 
     const attachment = normalizeAttachmentMetadata({
-        id: args.id,
+        id: requestedIdentity.id || `att-${crypto.randomUUID()}`,
         fileName,
         relativePath,
         storagePath: storageRelativePath,
@@ -1243,7 +1412,7 @@ function syncConfig(args = {}, requireToken = true) {
     return { storagePath, serverUrl, token, clientId };
 }
 
-async function syncRequest(serverUrl, endpoint, options = {}) {
+async function syncRequestOnce(serverUrl, endpoint, options = {}) {
     const url = new URL(endpoint, `${normalizeServerUrl(serverUrl)}/`).toString();
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), options.timeoutMs || SYNC_REQUEST_TIMEOUT_MS);
@@ -1289,6 +1458,29 @@ async function syncRequest(serverUrl, endpoint, options = {}) {
     }
 
     return data;
+}
+
+function canRetrySyncRequest(endpoint, options, error) {
+    const method = String(options.method || (options.body == null ? 'GET' : 'POST')).toUpperCase();
+    const endpointPath = new URL(endpoint, 'http://notedown.local').pathname;
+    const safeEndpoint = method === 'GET' || method === 'HEAD' || RETRYABLE_SYNC_ENDPOINTS.has(endpointPath);
+    if (!safeEndpoint) return false;
+    const status = Number(error?.status) || 0;
+    return !status || status === 408 || status === 429 || status >= 500 || error?.name === 'AbortError';
+}
+
+async function syncRequest(serverUrl, endpoint, options = {}) {
+    let lastError;
+    for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+            return await syncRequestOnce(serverUrl, endpoint, options);
+        } catch (error) {
+            lastError = error;
+            if (attempt > 0 || !canRetrySyncRequest(endpoint, options, error)) throw error;
+            await new Promise(resolve => setTimeout(resolve, 300));
+        }
+    }
+    throw lastError;
 }
 
 function syncError(error, fallback = '동기화 작업 중 오류가 발생했습니다.') {
@@ -1644,16 +1836,38 @@ function upsertMetadataWorkspace(metadata, workspace) {
 function upsertMetadataNote(metadata, note) {
     if (!note?.relativePath) return;
     if (!Array.isArray(metadata.notes)) metadata.notes = [];
-    const relativePath = normalizeRelativePath(note.relativePath);
+    const previous = indexPreviousNoteIdentities(metadata.notes, normalizeRelativePath);
+    indexPreviousAttachmentIdentities(metadata.notes, normalizeRelativePath);
+    const requestedId = String(note.id || '').trim();
+    const requestedRelativePath = normalizeRelativePath(note.relativePath);
+    const existingById = requestedId ? previous.byId.get(requestedId) || null : null;
+    const existingByRelativePath = previous.byRelativePath.get(requestedRelativePath) || null;
+    if (existingById && existingByRelativePath && existingById !== existingByRelativePath) {
+        throw new Error(`노트 ID와 경로가 서로 다른 기존 노트를 가리킵니다: ${requestedRelativePath}`);
+    }
+    if (existingByRelativePath && requestedId && String(existingByRelativePath.id || '').trim() !== requestedId) {
+        throw new Error(`노트 경로가 다른 ID에 연결되어 있습니다: ${requestedRelativePath}`);
+    }
+    const existing = existingById || existingByRelativePath;
+    const relativePath = existing?.relativePath
+        ? normalizeRelativePath(existing.relativePath)
+        : requestedRelativePath;
     const workspaceId = noteWorkspaceId({ ...note, relativePath });
     const nextNote = {
+        ...(existing || {}),
         ...note,
+        id: requestedId || existing?.id || note.id,
         folder: workspaceId,
         workspace: workspaceId,
         relativePath,
-        storagePath: note.storagePath ? normalizeRelativePath(note.storagePath) : noteStoragePath(note, relativePath)
+        storagePath: existing?.storagePath
+            ? normalizeRelativePath(existing.storagePath)
+            : (note.storagePath ? normalizeRelativePath(note.storagePath) : noteStoragePath(note, relativePath)),
+        ...(existing && Array.isArray(existing.attachments)
+            ? { attachments: existing.attachments }
+            : {})
     };
-    const index = metadata.notes.findIndex(item => item?.relativePath && normalizeRelativePath(item.relativePath) === relativePath);
+    const index = existing ? metadata.notes.indexOf(existing) : -1;
     if (index >= 0) {
         metadata.notes[index] = { ...metadata.notes[index], ...nextNote };
     } else {
@@ -1783,7 +1997,7 @@ async function createSyncPlan(args = {}) {
     };
 }
 
-async function uploadLocalFile(args = {}, relativePathOverride = '') {
+async function prepareLocalFileUpload(args = {}, relativePathOverride = '') {
     const { storagePath, serverUrl, token, clientId } = syncConfig(args);
     const metadata = await ensureMetadata(storagePath);
     const syncState = await readSyncState(storagePath);
@@ -1819,15 +2033,28 @@ async function uploadLocalFile(args = {}, relativePathOverride = '') {
         body.updatedAtMs = Number(note?.updatedAtMs) || Math.round(stat.mtimeMs);
     }
 
-    const response = await syncRequest(serverUrl, '/api/sync/file', { token, body });
-    if (response.manifest) {
-        await writeSyncStateFromManifest(storagePath, response.manifest, syncState);
-    }
+    return { storagePath, serverUrl, token, syncState, body };
+}
 
+async function sendPreparedSyncUpload(prepared, endpoint, writeState = true) {
+    const response = await syncRequest(prepared.serverUrl, endpoint, {
+        token: prepared.token,
+        body: prepared.body
+    });
+    if (writeState && response.manifest) {
+        await writeSyncStateFromManifest(prepared.storagePath, response.manifest, prepared.syncState);
+    }
     return {
         ok: response.status === 'ok',
         ...response
     };
+}
+
+async function uploadLocalFile(args = {}, relativePathOverride = '') {
+    return sendPreparedSyncUpload(
+        await prepareLocalFileUpload(args, relativePathOverride),
+        '/api/sync/file'
+    );
 }
 
 function findMetadataAttachment(metadata, relativePath, fallback = null) {
@@ -1858,7 +2085,7 @@ function findMetadataNoteByAttachment(metadata, attachment = {}) {
     })) || null;
 }
 
-async function uploadLocalAttachment(args = {}, item = {}) {
+async function prepareLocalAttachmentUpload(args = {}, item = {}) {
     const { storagePath, serverUrl, token, clientId } = syncConfig(args);
     const metadata = await ensureMetadata(storagePath);
     const syncState = await readSyncState(storagePath);
@@ -1920,49 +2147,74 @@ async function uploadLocalAttachment(args = {}, item = {}) {
         }
     }
 
-    const response = await syncRequest(serverUrl, '/api/sync/attachment', { token, body });
-    if (response.manifest) {
-        await writeSyncStateFromManifest(storagePath, response.manifest, syncState);
-    }
+    return { storagePath, serverUrl, token, syncState, body };
+}
 
-    return {
-        ok: response.status === 'ok',
-        ...response
-    };
+async function uploadLocalAttachment(args = {}, item = {}) {
+    return sendPreparedSyncUpload(
+        await prepareLocalAttachmentUpload(args, item),
+        '/api/sync/attachment'
+    );
 }
 
 async function uploadLocalNoteWithAttachments(args = {}) {
-    const noteResult = await uploadLocalFile(args);
-    const note = args.note || null;
-    const attachments = Array.isArray(note?.attachments) ? note.attachments : [];
-    const deleting = isDeletedFlag(args.deleted);
-    const uploadedAttachments = [];
-    const attachmentConflicts = [];
+    const { storagePath } = syncConfig(args);
+    const snapshot = await runStorageOperation(storagePath, async () => {
+        const storageGeneration = storageMutationGeneration(storagePath);
+        const noteUpload = await prepareLocalFileUpload(args);
+        const note = noteUpload.body.note || args.note || null;
+        const attachments = Array.isArray(note?.attachments)
+            ? note.attachments.map(attachment => ({ ...attachment }))
+            : [];
+        const deleting = isDeletedFlag(args.deleted);
+        const attachmentUploads = [];
 
-    if (!deleting && noteResult.status !== 'conflict') {
-        for (const attachment of attachments) {
-            if (!attachment?.relativePath || isDeletedFlag(attachment.deleted)) continue;
-            const result = await uploadLocalAttachment(args, {
-                ...attachment,
-                attachment,
-                noteRelativePath: attachment.noteRelativePath || note.relativePath || relativePathForNote(note)
-            });
-            if (result.status === 'conflict') {
-                attachmentConflicts.push(result.attachment || result.file);
-            } else {
-                uploadedAttachments.push(result.attachment);
-            }
-        }
-    }
-
-    if (deleting) {
         for (const attachment of attachments) {
             if (!attachment?.relativePath) continue;
-            const result = await uploadLocalAttachment({ ...args, deleted: true }, {
-                ...attachment,
-                attachment,
-                noteRelativePath: attachment.noteRelativePath || note.relativePath || relativePathForNote(note)
-            });
+            if (!deleting && isDeletedFlag(attachment.deleted)) continue;
+            attachmentUploads.push(await prepareLocalAttachmentUpload(
+                deleting ? { ...args, deleted: true } : args,
+                {
+                    ...attachment,
+                    attachment,
+                    noteRelativePath: attachment.noteRelativePath
+                        || note?.relativePath
+                        || relativePathForNote(note)
+                }
+            ));
+        }
+        if (storageMutationGeneration(storagePath) !== storageGeneration) {
+            return { storageChanged: true, storageGeneration };
+        }
+        return { storageGeneration, noteUpload, attachmentUploads, deleting };
+    });
+
+    if (
+        snapshot.storageChanged
+        || storageMutationGeneration(storagePath) !== snapshot.storageGeneration
+    ) {
+        return localStorageChangedDuringSyncResult({ plan: {} }, null, false);
+    }
+
+    const uploadedAttachments = [];
+    const attachmentConflicts = [];
+    let latestManifest = null;
+    let didSend = false;
+    const sendSnapshot = async (prepared, endpoint) => {
+        if (latestManifest?.serverRevision != null) {
+            prepared.body.baseRevision = Number(latestManifest.serverRevision) || prepared.body.baseRevision;
+        }
+        didSend = true;
+        const result = await sendPreparedSyncUpload(prepared, endpoint, false);
+        if (result.manifest) latestManifest = result.manifest;
+        return result;
+    };
+
+    const noteResult = await sendSnapshot(snapshot.noteUpload, '/api/sync/file');
+
+    if (!snapshot.deleting && noteResult.status !== 'conflict') {
+        for (const prepared of snapshot.attachmentUploads) {
+            const result = await sendSnapshot(prepared, '/api/sync/attachment');
             if (result.status === 'conflict') {
                 attachmentConflicts.push(result.attachment || result.file);
             } else {
@@ -1971,12 +2223,45 @@ async function uploadLocalNoteWithAttachments(args = {}) {
         }
     }
 
-    return {
+    if (snapshot.deleting && noteResult.status !== 'conflict' && noteResult.ok) {
+        for (const prepared of snapshot.attachmentUploads) {
+            const result = await sendSnapshot(prepared, '/api/sync/attachment');
+            if (result.status === 'conflict') {
+                attachmentConflicts.push(result.attachment || result.file);
+            } else {
+                uploadedAttachments.push(result.attachment);
+            }
+        }
+    } else if (snapshot.deleting && noteResult.status === 'conflict') {
+        attachmentConflicts.push(noteResult.file);
+    }
+
+    const uploadResult = {
         ...noteResult,
         ok: Boolean(noteResult.ok && attachmentConflicts.length === 0),
         uploadedAttachments,
         attachmentConflicts
     };
+    const stateApplied = await runStorageOperation(storagePath, async () => {
+        if (storageMutationGeneration(storagePath) !== snapshot.storageGeneration) return false;
+        if (latestManifest) {
+            await writeSyncStateFromManifest(
+                storagePath,
+                latestManifest,
+                snapshot.noteUpload.syncState
+            );
+        }
+        return true;
+    });
+    if (!stateApplied) {
+        return {
+            ...uploadResult,
+            ...localStorageChangedDuringSyncResult({ plan: {} }, null, didSend),
+            uploadedAttachments,
+            attachmentConflicts
+        };
+    }
+    return uploadResult;
 }
 
 function encodeRelativePathForUrl(relativePath) {
@@ -1995,17 +2280,33 @@ function decodeBinaryPayloadContent(payload = {}) {
     return Buffer.from(String(payload.content || ''), 'utf8');
 }
 
-async function downloadServerAttachment(args = {}, item, metadata) {
+async function downloadServerAttachment(args = {}, item, metadata, payloadOverride) {
     const { storagePath, serverUrl, token } = syncConfig(args);
     const relativePath = normalizeRelativePath(item.relativePath);
-    const payload = await syncRequest(serverUrl, `/api/attachments/${encodeRelativePathForUrl(relativePath)}`, { token });
-    const storageRelativePath = normalizeRelativePath(
+    const payload = payloadOverride === undefined
+        ? await syncRequest(serverUrl, `/api/attachments/${encodeRelativePathForUrl(relativePath)}`, { token })
+        : payloadOverride;
+    validateMetadataStorageIdentities(metadata);
+    const noteRelativePath = normalizeRelativePath(
+        item.noteRelativePath
+        || item.attachment?.noteRelativePath
+        || payload.noteRelativePath
+        || payload.attachment?.noteRelativePath
+    );
+    const existingAttachment = findMetadataAttachment(metadata, relativePath);
+    const requestedStoragePath = normalizeRelativePath(
         payload.storagePath
         || item.serverAttachment?.storagePath
         || item.attachment?.storagePath
         || item.storagePath
         || relativePath
     );
+    const identity = resolveAttachmentStorageIdentity(metadata, {
+        id: item.attachment?.id || payload.attachmentId || existingAttachment?.id,
+        relativePath,
+        storagePath: existingAttachment?.storagePath || requestedStoragePath
+    }, noteRelativePath || existingAttachment?.noteRelativePath || '');
+    const storageRelativePath = identity.storagePath || requestedStoragePath;
     const { absolutePath } = resolveStorageFile(storagePath, storageRelativePath);
 
     if (isDeletedFlag(payload.deleted)) {
@@ -2015,24 +2316,23 @@ async function downloadServerAttachment(args = {}, item, metadata) {
         return { relativePath, deleted: true };
     }
 
-    const content = decodeBinaryPayloadContent(payload);
-    await fs.mkdir(path.dirname(absolutePath), { recursive: true });
-    await fs.writeFile(absolutePath, content);
-
-    const noteRelativePath = normalizeRelativePath(
-        item.noteRelativePath
-        || item.attachment?.noteRelativePath
-        || payload.noteRelativePath
-        || payload.attachment?.noteRelativePath
-    );
     if (item.note) {
         upsertMetadataWorkspace(metadata, item.workspace || workspacePayload(metadata, item.note));
         upsertMetadataNote(metadata, notePayload(item.note, noteRelativePath));
     }
+    if (!findMetadataNote(metadata, noteRelativePath, null)) {
+        throw new Error(`첨부 파일을 연결할 노트를 찾지 못했습니다: ${noteRelativePath}`);
+    }
+    const content = decodeBinaryPayloadContent(payload);
+    await fs.mkdir(path.dirname(absolutePath), { recursive: true });
+    await fs.writeFile(absolutePath, content);
 
     const attachment = normalizeAttachmentMetadata({
         ...(item.attachment || {}),
-        id: item.attachment?.id || payload.attachmentId,
+        id: identity.id
+            || item.attachment?.id
+            || payload.attachmentId
+            || normalizeAttachmentMetadata({ relativePath }, noteRelativePath).id,
         fileName: item.attachment?.fileName || payload.fileName || path.posix.basename(relativePath),
         relativePath,
         storagePath: storageRelativePath,
@@ -2046,17 +2346,24 @@ async function downloadServerAttachment(args = {}, item, metadata) {
     return { relativePath, deleted: false, attachment };
 }
 
-async function downloadServerFile(args = {}, item, metadata) {
+async function downloadServerFile(args = {}, item, metadata, payloadOverride) {
     const { storagePath, serverUrl, token } = syncConfig(args);
     const relativePath = normalizeRelativePath(item.relativePath);
-    const payload = await syncRequest(serverUrl, `/api/files/${encodeRelativePathForUrl(relativePath)}`, { token });
-    const storageRelativePath = normalizeRelativePath(
+    const payload = payloadOverride === undefined
+        ? await syncRequest(serverUrl, `/api/files/${encodeRelativePathForUrl(relativePath)}`, { token })
+        : payloadOverride;
+    validateMetadataStorageIdentities(metadata);
+    const existingNote = findMetadataNote(metadata, relativePath, null);
+    const requestedStoragePath = normalizeRelativePath(
         payload.storagePath
         || item.serverFile?.storagePath
         || item.note?.storagePath
         || item.storagePath
         || desiredNoteStoragePath(item.note || { relativePath, title: payload.title || path.posix.basename(relativePath) }, relativePath)
     );
+    const storageRelativePath = existingNote
+        ? noteStoragePath(existingNote, relativePath)
+        : requestedStoragePath;
     const { absolutePath } = resolveStorageFile(storagePath, storageRelativePath);
 
     if (isDeletedFlag(payload.deleted)) {
@@ -2069,9 +2376,6 @@ async function downloadServerFile(args = {}, item, metadata) {
     const content = payload.contentEncoding === 'base64'
         ? Buffer.from(payload.content || '', 'base64')
         : Buffer.from(String(payload.content || ''), 'utf8');
-    await fs.mkdir(path.dirname(absolutePath), { recursive: true });
-    await fs.writeFile(absolutePath, content);
-
     const note = item.note || {
         id: noteIdFromRelativePath(relativePath),
         icon: 'N',
@@ -2087,6 +2391,8 @@ async function downloadServerFile(args = {}, item, metadata) {
     };
     upsertMetadataWorkspace(metadata, item.workspace || workspacePayload(metadata, note));
     upsertMetadataNote(metadata, notePayload(note, relativePath, storageRelativePath));
+    await fs.mkdir(path.dirname(absolutePath), { recursive: true });
+    await fs.writeFile(absolutePath, content);
     return { relativePath, deleted: false };
 }
 
@@ -2183,37 +2489,71 @@ async function resolveSyncConflict(args = {}) {
     if (!['server', 'local'].includes(resolution)) {
         throw new Error('적용할 충돌 버전을 선택하세요.');
     }
+    const initialStorageGeneration = await runStorageOperation(
+        storagePath,
+        () => storageMutationGeneration(storagePath)
+    );
 
     if (resolution === 'server') {
-        const metadata = await ensureMetadata(storagePath);
         const previousState = await readSyncState(storagePath);
-        const file = isAttachment
-            ? await downloadServerAttachment(args, {
+        const endpoint = isAttachment
+            ? `/api/attachments/${encodeRelativePathForUrl(relativePath)}`
+            : `/api/files/${encodeRelativePathForUrl(relativePath)}`;
+        const payload = await syncRequest(serverUrl, endpoint, { token });
+        const applyResult = await runStorageOperation(storagePath, async () => {
+            if (storageMutationGeneration(storagePath) !== initialStorageGeneration) {
+                return { storageChanged: true };
+            }
+            const metadata = await ensureMetadata(storagePath);
+            validateMetadataStorageIdentities(metadata);
+            const appliedStorageGeneration = bumpStorageMutationGeneration(storagePath);
+            const file = isAttachment
+                ? await downloadServerAttachment(args, {
                 relativePath,
                 serverAttachment: args.serverAttachment || args.serverFile || null,
                 attachment: args.serverAttachmentMetadata || args.serverAttachment || null,
                 noteRelativePath: args.noteRelativePath || args.serverAttachmentMetadata?.noteRelativePath || null,
                 note: args.serverNote || null,
                 workspace: args.serverWorkspace || null
-            }, metadata)
-            : await downloadServerFile(args, {
+                }, metadata, payload)
+                : await downloadServerFile(args, {
                 relativePath,
                 serverFile: args.serverFile || null,
                 note: args.serverNote || null,
                 workspace: args.serverWorkspace || null
-            }, metadata);
-        metadata.generatedAt = new Date().toISOString();
-        await writeMetadata(storagePath, metadata);
+                }, metadata, payload);
+            metadata.generatedAt = new Date().toISOString();
+            await writeMetadata(storagePath, metadata);
+            return { storageChanged: false, file, storageGeneration: appliedStorageGeneration };
+        });
+        if (applyResult.storageChanged) {
+            return {
+                ...localStorageChangedDuringSyncResult({ plan: {} }, null, false),
+                resolution,
+                resolvedPath: relativePath
+            };
+        }
 
         const manifest = await syncRequest(serverUrl, '/api/manifest', { token });
-        await writeSyncStateFromManifest(storagePath, manifest, previousState);
+        const wroteState = await runStorageOperation(storagePath, async () => {
+            if (storageMutationGeneration(storagePath) !== applyResult.storageGeneration) return false;
+            await writeSyncStateFromManifest(storagePath, manifest, previousState);
+            return true;
+        });
+        if (!wroteState) {
+            return {
+                ...localStorageChangedDuringSyncResult({ plan: {} }, null, true),
+                resolution,
+                resolvedPath: relativePath
+            };
+        }
         const planResponse = await createSyncPlan(args);
         return {
             ok: true,
             didApply: true,
             resolution,
             resolvedPath: relativePath,
-            file,
+            file: applyResult.file,
             ...planResponse,
             summary: summarizePlan(planResponse.plan || {})
         };
@@ -2226,13 +2566,49 @@ async function resolveSyncConflict(args = {}) {
         lastKnownRevision = Number(serverFile.revision) || 0;
     }
 
-    const uploadResult = isAttachment
-        ? await uploadLocalAttachment({ ...args, lastKnownRevision }, {
-            relativePath,
-            attachment: args.clientAttachment || args.attachment || null,
-            noteRelativePath: args.noteRelativePath || args.clientAttachment?.noteRelativePath || null
-        })
-        : await uploadLocalFile({ ...args, lastKnownRevision }, relativePath);
+    const preparedUpload = await runStorageOperation(storagePath, async () => {
+        if (storageMutationGeneration(storagePath) !== initialStorageGeneration) {
+            return { storageChanged: true };
+        }
+        const prepared = isAttachment
+            ? await prepareLocalAttachmentUpload({ ...args, lastKnownRevision }, {
+                relativePath,
+                attachment: args.clientAttachment || args.attachment || null,
+                noteRelativePath: args.noteRelativePath || args.clientAttachment?.noteRelativePath || null
+            })
+            : await prepareLocalFileUpload({ ...args, lastKnownRevision }, relativePath);
+        return { storageChanged: false, prepared };
+    });
+    if (preparedUpload.storageChanged) {
+        return {
+            ...localStorageChangedDuringSyncResult({ plan: {} }, null, false),
+            resolution,
+            resolvedPath: relativePath
+        };
+    }
+    const uploadResult = await sendPreparedSyncUpload(
+        preparedUpload.prepared,
+        isAttachment ? '/api/sync/attachment' : '/api/sync/file',
+        false
+    );
+    const appliedResponse = await runStorageOperation(storagePath, async () => {
+        if (storageMutationGeneration(storagePath) !== initialStorageGeneration) return false;
+        if (uploadResult.manifest) {
+            await writeSyncStateFromManifest(
+                storagePath,
+                uploadResult.manifest,
+                preparedUpload.prepared.syncState
+            );
+        }
+        return true;
+    });
+    if (!appliedResponse) {
+        return {
+            ...localStorageChangedDuringSyncResult({ plan: {} }, null, true),
+            resolution,
+            resolvedPath: relativePath
+        };
+    }
     if (uploadResult.status === 'conflict') {
         return {
             ok: false,
@@ -2259,18 +2635,59 @@ async function resolveSyncConflict(args = {}) {
     };
 }
 
+function localStorageChangedDuringSyncResult(planResponse, operations = null, didApply = false) {
+    const conflict = {
+        type: 'local_storage_changed_during_sync',
+        reason: 'local_storage_changed_during_sync',
+        message: '동기화 중 로컬 저장소가 변경되어 적용을 중단했습니다. 다시 동기화해 주세요.'
+    };
+    const plan = {
+        ...(planResponse.plan || {}),
+        conflicts: [...(planResponse.plan?.conflicts || []), conflict]
+    };
+    if (operations) operations.conflicts.push(conflict);
+    return {
+        ...planResponse,
+        ok: false,
+        status: 'conflict',
+        didApply,
+        reason: conflict.reason,
+        conflicts: [conflict],
+        plan,
+        summary: summarizePlan(plan),
+        ...(operations ? { operations } : {})
+    };
+}
+
+function syncOperationsDidApply(operations = {}) {
+    return [
+        'uploaded',
+        'downloaded',
+        'deletedServer',
+        'deletedLocal',
+        'uploadedAttachments',
+        'downloadedAttachments',
+        'deletedServerAttachments',
+        'deletedLocalAttachments'
+    ].some(key => Array.isArray(operations[key]) && operations[key].length > 0);
+}
+
 async function runFullSync(args = {}) {
-    const { storagePath } = syncConfig(args);
+    const { storagePath, serverUrl, token } = syncConfig(args);
+    const initialStorageGeneration = await runStorageOperation(
+        storagePath,
+        () => storageMutationGeneration(storagePath)
+    );
     const syncState = await readSyncState(storagePath);
     const planResponse = await createSyncPlan(args);
     const plan = planResponse.plan || {};
 
     if ((plan.conflicts || []).length > 0) {
         return {
+            ...planResponse,
             ok: false,
             status: 'conflict',
-            didApply: false,
-            ...planResponse
+            didApply: false
         };
     }
 
@@ -2285,37 +2702,113 @@ async function runFullSync(args = {}) {
         deletedLocalAttachments: [],
         conflicts: []
     };
-    const metadata = await ensureMetadata(storagePath);
-    let metadataChanged = false;
     let latestManifest = planResponse.manifest;
 
+    try {
+    const pendingFileDownloads = [];
     for (const item of plan.downloadFiles || []) {
-        operations.downloaded.push(await downloadServerFile(args, item, metadata));
-        metadataChanged = true;
+        const relativePath = normalizeRelativePath(item.relativePath);
+        const payload = await syncRequest(
+            serverUrl,
+            `/api/files/${encodeRelativePathForUrl(relativePath)}`,
+            { token }
+        );
+        pendingFileDownloads.push({ item, payload });
     }
 
+    const pendingAttachmentDownloads = [];
     for (const item of plan.downloadAttachments || []) {
-        operations.downloadedAttachments.push(await downloadServerAttachment(args, item, metadata));
-        metadataChanged = true;
+        const relativePath = normalizeRelativePath(item.relativePath);
+        const payload = await syncRequest(
+            serverUrl,
+            `/api/attachments/${encodeRelativePathForUrl(relativePath)}`,
+            { token }
+        );
+        pendingAttachmentDownloads.push({ item, payload });
     }
 
-    for (const item of plan.deleteLocalFiles || []) {
-        operations.deletedLocal.push(await deleteLocalFile(storagePath, item, metadata));
-        metadataChanged = true;
+    const localApply = await runStorageOperation(storagePath, async () => {
+        if (storageMutationGeneration(storagePath) !== initialStorageGeneration) {
+            return { storageChanged: true };
+        }
+
+        const metadata = await ensureMetadata(storagePath);
+        validateMetadataStorageIdentities(metadata);
+        let metadataChanged = false;
+        const hasLocalMutations = pendingFileDownloads.length > 0
+            || pendingAttachmentDownloads.length > 0
+            || (plan.deleteLocalFiles || []).length > 0
+            || (plan.deleteLocalAttachments || []).length > 0;
+        const appliedStorageGeneration = hasLocalMutations
+            ? bumpStorageMutationGeneration(storagePath)
+            : initialStorageGeneration;
+        for (const pending of pendingFileDownloads) {
+            operations.downloaded.push(
+                await downloadServerFile(args, pending.item, metadata, pending.payload)
+            );
+            metadataChanged = true;
+        }
+        for (const pending of pendingAttachmentDownloads) {
+            operations.downloadedAttachments.push(
+                await downloadServerAttachment(args, pending.item, metadata, pending.payload)
+            );
+            metadataChanged = true;
+        }
+        for (const item of plan.deleteLocalFiles || []) {
+            operations.deletedLocal.push(await deleteLocalFile(storagePath, item, metadata));
+            metadataChanged = true;
+        }
+        for (const item of plan.deleteLocalAttachments || []) {
+            operations.deletedLocalAttachments.push(await deleteLocalAttachment(storagePath, item, metadata));
+            metadataChanged = true;
+        }
+        if (metadataChanged) {
+            metadata.generatedAt = new Date().toISOString();
+            await writeMetadata(storagePath, metadata);
+        }
+        return { storageChanged: false, storageGeneration: appliedStorageGeneration };
+    });
+
+    if (localApply.storageChanged) {
+        return localStorageChangedDuringSyncResult(planResponse, operations, false);
     }
 
-    for (const item of plan.deleteLocalAttachments || []) {
-        operations.deletedLocalAttachments.push(await deleteLocalAttachment(storagePath, item, metadata));
-        metadataChanged = true;
-    }
-
-    if (metadataChanged) {
-        metadata.generatedAt = new Date().toISOString();
-        await writeMetadata(storagePath, metadata);
-    }
+    const expectedStorageGeneration = localApply.storageGeneration;
+    const storageChanged = () => runStorageOperation(
+        storagePath,
+        () => storageMutationGeneration(storagePath) !== expectedStorageGeneration
+    );
+    const changedResult = () => localStorageChangedDuringSyncResult(
+        planResponse,
+        operations,
+        syncOperationsDidApply(operations)
+    );
+    const guardedUpload = async (prepare, endpoint) => {
+        const staged = await runStorageOperation(storagePath, async () => {
+            if (storageMutationGeneration(storagePath) !== expectedStorageGeneration) {
+                return { storageChanged: true };
+            }
+            return { storageChanged: false, prepared: await prepare() };
+        });
+        if (staged.storageChanged) return staged;
+        const result = await sendPreparedSyncUpload(staged.prepared, endpoint, false);
+        const stateApplied = await runStorageOperation(storagePath, async () => {
+            if (storageMutationGeneration(storagePath) !== expectedStorageGeneration) return false;
+            if (result.manifest) {
+                await writeSyncStateFromManifest(storagePath, result.manifest, staged.prepared.syncState);
+            }
+            return true;
+        });
+        return stateApplied ? { storageChanged: false, result } : { storageChanged: true, result };
+    };
 
     for (const item of plan.uploadFiles || []) {
-        const result = await uploadLocalFile(args, item.relativePath);
+        const upload = await guardedUpload(
+            () => prepareLocalFileUpload(args, item.relativePath),
+            '/api/sync/file'
+        );
+        if (upload.storageChanged) return changedResult();
+        const result = upload.result;
         latestManifest = result.manifest || latestManifest;
         if (result.status === 'conflict') {
             operations.conflicts.push(result.file);
@@ -2325,7 +2818,12 @@ async function runFullSync(args = {}) {
     }
 
     for (const item of plan.uploadAttachments || []) {
-        const result = await uploadLocalAttachment(args, item);
+        const upload = await guardedUpload(
+            () => prepareLocalAttachmentUpload(args, item),
+            '/api/sync/attachment'
+        );
+        if (upload.storageChanged) return changedResult();
+        const result = upload.result;
         latestManifest = result.manifest || latestManifest;
         if (result.status === 'conflict') {
             operations.conflicts.push(result.attachment || result.file);
@@ -2335,9 +2833,15 @@ async function runFullSync(args = {}) {
     }
 
     for (const item of plan.deleteServerFiles || []) {
+        if (await storageChanged()) return changedResult();
         const lastKnownRevision = serverDeleteLastKnownRevision(syncState, item, false);
         if (lastKnownRevision <= 0) continue;
-        const result = await uploadLocalFile({ ...args, deleted: true, lastKnownRevision }, item.relativePath);
+        const upload = await guardedUpload(
+            () => prepareLocalFileUpload({ ...args, deleted: true, lastKnownRevision }, item.relativePath),
+            '/api/sync/file'
+        );
+        if (upload.storageChanged) return changedResult();
+        const result = upload.result;
         latestManifest = result.manifest || latestManifest;
         if (result.status === 'conflict') {
             operations.conflicts.push(result.file);
@@ -2347,9 +2851,15 @@ async function runFullSync(args = {}) {
     }
 
     for (const item of plan.deleteServerAttachments || []) {
+        if (await storageChanged()) return changedResult();
         const lastKnownRevision = serverDeleteLastKnownRevision(syncState, item, true);
         if (lastKnownRevision <= 0) continue;
-        const result = await uploadLocalAttachment({ ...args, deleted: true, lastKnownRevision }, item);
+        const upload = await guardedUpload(
+            () => prepareLocalAttachmentUpload({ ...args, deleted: true, lastKnownRevision }, item),
+            '/api/sync/attachment'
+        );
+        if (upload.storageChanged) return changedResult();
+        const result = upload.result;
         latestManifest = result.manifest || latestManifest;
         if (result.status === 'conflict') {
             operations.conflicts.push(result.attachment || result.file);
@@ -2359,18 +2869,36 @@ async function runFullSync(args = {}) {
     }
 
     if (operations.conflicts.length === 0 && latestManifest) {
-        const previousState = await readSyncState(storagePath);
-        await writeSyncStateFromManifest(storagePath, latestManifest, previousState);
+        const wroteState = await runStorageOperation(storagePath, async () => {
+            if (storageMutationGeneration(storagePath) !== expectedStorageGeneration) return false;
+            const previousState = await readSyncState(storagePath);
+            await writeSyncStateFromManifest(storagePath, latestManifest, previousState);
+            return true;
+        });
+        if (!wroteState) return changedResult();
     }
 
     return {
+        ...planResponse,
         ok: operations.conflicts.length === 0,
         status: operations.conflicts.length > 0 ? 'conflict' : 'ok',
         didApply: true,
-        ...planResponse,
         manifest: latestManifest || planResponse.manifest,
         operations
     };
+    } catch (error) {
+        return {
+            ...planResponse,
+            ok: false,
+            status: 'error',
+            didApply: syncOperationsDidApply(operations),
+            error: error instanceof Error
+                ? error.message
+                : '전체 동기화 작업 중 오류가 발생했습니다.',
+            manifest: latestManifest || planResponse.manifest,
+            operations
+        };
+    }
 }
 
 function registerStorageHandlers() {
@@ -2407,23 +2935,35 @@ function registerStorageHandlers() {
 
     ipcMain.handle('notedown:storage:initialize', async (_event, args = {}) => {
         const storagePath = rememberStoragePath(args.storagePath);
-        return generateMetadata(storagePath, { importDeepMarkdown: Boolean(args.importDeepMarkdown) });
+        return runStorageMutation(storagePath, () => generateMetadata(
+            storagePath,
+            { importDeepMarkdown: Boolean(args.importDeepMarkdown) }
+        ));
     });
 
     ipcMain.handle('notedown:storage:load-notes', async (_event, args = {}) => {
         const storagePath = rememberStoragePath(args.storagePath);
-        let metadata = await readMetadata(storagePath);
-        if (!metadata) {
-            const generated = await generateMetadata(storagePath, { importDeepMarkdown: false });
-            metadata = generated.metadata;
-        }
-        const notes = await Promise.all((metadata.notes || []).map(note => readMarkdownNote(storagePath, note)));
-        return { ok: true, notes, metadata };
+        return runStorageOperation(storagePath, async () => {
+            let metadata = await readMetadata(storagePath);
+            if (!metadata) {
+                const generated = await generateMetadata(storagePath, { importDeepMarkdown: false });
+                metadata = generated.metadata;
+            }
+            const notes = await Promise.all((metadata.notes || []).map(note => readMarkdownNote(storagePath, note)));
+            return { ok: true, notes, metadata };
+        });
     });
 
     ipcMain.handle('notedown:storage:save-notes', async (_event, args = {}) => {
         const storagePath = rememberStoragePath(args.storagePath);
-        return saveNotesToStorage(storagePath, args.notes || []);
+        return runStorageMutation(storagePath, () => saveNotesToStorage(
+            storagePath,
+            args.notes || [],
+            {
+                deletedNoteIds: args.deletedNoteIds || [],
+                deletedAttachmentIds: args.deletedAttachmentIds || []
+            }
+        ));
     });
 
     ipcMain.handle('notedown:storage:export-folder-zip', async (event, args = {}) => {
@@ -2439,7 +2979,8 @@ function registerStorageHandlers() {
 
     ipcMain.handle('notedown:storage:save-attachment', async (_event, args = {}) => {
         try {
-            return await saveAttachmentToStorage(args);
+            const storagePath = rememberStoragePath(args.storagePath);
+            return await runStorageMutation(storagePath, () => saveAttachmentToStorage(args));
         } catch (error) {
             return {
                 ok: false,
@@ -2450,7 +2991,8 @@ function registerStorageHandlers() {
 
     ipcMain.handle('notedown:storage:choose-attachments', async (event, args = {}) => {
         try {
-            return await chooseAttachmentsForStorage(event, args);
+            const storagePath = rememberStoragePath(args.storagePath);
+            return await runStorageMutation(storagePath, () => chooseAttachmentsForStorage(event, args));
         } catch (error) {
             return {
                 ok: false,
@@ -2518,7 +3060,7 @@ function registerSyncHandlers() {
 
     ipcMain.handle('notedown:sync:plan', async (_event, args = {}) => {
         try {
-            return await createSyncPlan(args);
+            return await runSyncOperation(args, () => createSyncPlan(args));
         } catch (error) {
             return syncError(error, '동기화 계획을 만들지 못했습니다.');
         }
@@ -2526,7 +3068,7 @@ function registerSyncHandlers() {
 
     ipcMain.handle('notedown:sync:run-full', async (_event, args = {}) => {
         try {
-            return await runFullSync(args);
+            return await runSyncOperation(args, () => runFullSync(args));
         } catch (error) {
             return syncError(error, '전체 동기화에 실패했습니다.');
         }
@@ -2534,7 +3076,7 @@ function registerSyncHandlers() {
 
     ipcMain.handle('notedown:sync:upload-note', async (_event, args = {}) => {
         try {
-            return await uploadLocalNoteWithAttachments(args);
+            return await runSyncOperation(args, () => uploadLocalNoteWithAttachments(args));
         } catch (error) {
             return syncError(error, '문서 동기화에 실패했습니다.');
         }
@@ -2542,7 +3084,7 @@ function registerSyncHandlers() {
 
     ipcMain.handle('notedown:sync:read-file', async (_event, args = {}) => {
         try {
-            return await readSyncConflictFile(args);
+            return await runSyncOperation(args, () => readSyncConflictFile(args));
         } catch (error) {
             return syncError(error, '충돌 파일을 읽지 못했습니다.');
         }
@@ -2550,7 +3092,7 @@ function registerSyncHandlers() {
 
     ipcMain.handle('notedown:sync:resolve-conflict', async (_event, args = {}) => {
         try {
-            return await resolveSyncConflict(args);
+            return await runSyncOperation(args, () => resolveSyncConflict(args));
         } catch (error) {
             return syncError(error, '충돌을 적용하지 못했습니다.');
         }

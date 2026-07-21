@@ -1,6 +1,7 @@
 package com.notedown.app;
 
 import android.Manifest;
+import android.annotation.SuppressLint;
 import android.app.Activity;
 import android.app.Notification;
 import android.app.NotificationChannel;
@@ -22,6 +23,7 @@ import android.net.Uri;
 import android.os.Build;
 import android.os.Environment;
 import android.provider.OpenableColumns;
+import android.util.Base64;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.FrameLayout;
@@ -30,6 +32,7 @@ import android.webkit.WebView;
 import android.webkit.WebViewClient;
 
 import androidx.activity.result.ActivityResult;
+import androidx.annotation.RequiresApi;
 import androidx.core.content.FileProvider;
 
 import com.getcapacitor.JSArray;
@@ -50,15 +53,17 @@ import org.json.JSONObject;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
+import java.io.FileOutputStream;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
+import java.nio.file.StandardCopyOption;
 import java.security.MessageDigest;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
-import java.util.Base64;
 import java.util.Date;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -66,6 +71,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.HashSet;
 import java.util.Set;
+import java.util.UUID;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
 
@@ -86,6 +92,7 @@ public class NotedownNativePlugin extends Plugin {
     private static final String PDF_NOTIFICATION_CHANNEL_ID = "pdf_exports";
     private static final String IMPORTED_WORKSPACE_ID = "_imported";
     private static final String UNFILED_WORKSPACE_ID = "unfiled";
+    private final Object fileTaskLock = new Object();
 
     @PluginMethod
     public void preferences(PluginCall call) {
@@ -191,8 +198,22 @@ public class NotedownNativePlugin extends Plugin {
             File storage = storageRoot(call.getString("storagePath"));
             ensureDirectory(storage);
             JSONObject previousMetadata = readMetadata(storage);
-            JSONArray notes = call.getData().optJSONArray("notes");
-            if (notes == null) notes = new JSONArray();
+            validateMetadataIdentities(previousMetadata);
+            JSONArray requestedNotes = call.getData().optJSONArray("notes");
+            if (requestedNotes == null) requestedNotes = new JSONArray();
+            JSONArray deletedNoteIds = call.getData().optJSONArray("deletedNoteIds");
+            JSONArray deletedAttachmentIds = call.getData().optJSONArray("deletedAttachmentIds");
+            JSONArray mergedNotes = mergeIncomingNotesWithStoredNotes(
+                storage,
+                requestedNotes,
+                previousMetadata,
+                deletedNoteIds
+            );
+            JSONArray notes = prepareNotesForSave(
+                mergedNotes,
+                previousMetadata,
+                deletedAttachmentIds
+            );
 
             Map<String, JSONObject> workspaces = new LinkedHashMap<>();
             workspaces.put(UNFILED_WORKSPACE_ID, workspacePayload(UNFILED_WORKSPACE_ID, "미지정 워크스페이스"));
@@ -207,12 +228,13 @@ public class NotedownNativePlugin extends Plugin {
                 String workspaceId = noteWorkspaceId(note);
                 String workspaceName = noteWorkspaceName(note, workspaceId);
                 String relativePath = relativePathForNote(note);
+                String currentStoragePath = normalizeRelativePath(note.optString("storagePath", ""));
                 String desiredStoragePath = desiredNoteStoragePath(note, relativePath);
                 String storageRelativePath = uniqueStorageRelativePath(
                     storage,
                     desiredStoragePath,
                     usedStoragePaths,
-                    note.optString("storagePath", relativePath)
+                    currentStoragePath
                 );
                 String fileName = posixBaseName(storageRelativePath);
                 File target = resolveStorageFile(storage, storageRelativePath);
@@ -261,6 +283,7 @@ public class NotedownNativePlugin extends Plugin {
             result.put("storagePath", storage.getAbsolutePath());
             result.put("notes", metadataNotes.length());
             result.put("workspaces", workspaces.size());
+            result.put("savedNotes", metadataNotes);
             return result;
         });
     }
@@ -270,6 +293,7 @@ public class NotedownNativePlugin extends Plugin {
         runFileTask(call, () -> {
             File storage = storageRoot(call.getString("storagePath"));
             JSONObject metadata = ensureMetadata(storage);
+            validateMetadataIdentities(metadata);
             JSONObject payloadNote = call.getObject("note");
             String noteRelativePath = normalizeRelativePath(call.getString("noteRelativePath", ""));
             if (noteRelativePath.isEmpty() && payloadNote != null) noteRelativePath = relativePathForNote(payloadNote);
@@ -286,7 +310,7 @@ public class NotedownNativePlugin extends Plugin {
             String content = call.getString("content", "");
             String encoding = call.getString("contentEncoding", "base64");
             byte[] bytes = "base64".equals(encoding)
-                ? Base64.getDecoder().decode(content)
+                ? Base64.decode(content, Base64.DEFAULT)
                 : content.getBytes(StandardCharsets.UTF_8);
             JSONObject attachment = saveAttachmentBytes(
                 storage,
@@ -297,7 +321,8 @@ public class NotedownNativePlugin extends Plugin {
                 call.getString("mimeType", JSONObject.NULL.toString()),
                 bytes,
                 call.getString("relativePath"),
-                call.getString("id", "")
+                call.getString("id", ""),
+                call.getString("attachmentStoragePath", "")
             );
 
             JSObject result = new JSObject();
@@ -360,7 +385,7 @@ public class NotedownNativePlugin extends Plugin {
             result.put("relativePath", relativePath);
             result.put("storagePath", storageRelativePath);
             result.put("content", new String(bytes, StandardCharsets.UTF_8));
-            result.put("contentBase64", Base64.getEncoder().encodeToString(bytes));
+            result.put("contentBase64", Base64.encodeToString(bytes, Base64.NO_WRAP));
             result.put("contentEncoding", "base64");
             result.put("contentHash", exists ? sha256(bytes) : JSONObject.NULL);
             result.put("updatedAtMs", exists ? target.lastModified() : JSONObject.NULL);
@@ -382,7 +407,7 @@ public class NotedownNativePlugin extends Plugin {
             String encoding = call.getString("contentEncoding", "utf8");
             String content = call.getString("content", "");
             byte[] bytes = "base64".equals(encoding)
-                ? Base64.getDecoder().decode(content)
+                ? Base64.decode(content, Base64.DEFAULT)
                 : content.getBytes(StandardCharsets.UTF_8);
             writeBytes(target, bytes);
 
@@ -489,6 +514,7 @@ public class NotedownNativePlugin extends Plugin {
     }
 
     @ActivityCallback
+    @SuppressLint("WrongConstant")
     private void chooseDirectoryResult(PluginCall call, ActivityResult result) {
         if (call == null) return;
         if (result.getResultCode() != Activity.RESULT_OK || result.getData() == null || result.getData().getData() == null) {
@@ -500,7 +526,8 @@ public class NotedownNativePlugin extends Plugin {
         }
 
         Uri uri = result.getData().getData();
-        int flags = result.getData().getFlags() & (Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+        int flags = result.getData().getFlags()
+            & (Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
         try {
             getContext().getContentResolver().takePersistableUriPermission(uri, flags);
         } catch (Exception ignored) {
@@ -530,45 +557,49 @@ public class NotedownNativePlugin extends Plugin {
 
         execute(() -> {
             try {
-                File storage = storageRoot(call.getString("storagePath"));
-                JSONObject metadata = ensureMetadata(storage);
-                JSONObject payloadNote = call.getObject("note");
-                String noteRelativePath = normalizeRelativePath(call.getString("noteRelativePath", ""));
-                if (noteRelativePath.isEmpty() && payloadNote != null) noteRelativePath = relativePathForNote(payloadNote);
-                if (noteRelativePath.isEmpty()) throw new IllegalArgumentException("첨부할 노트를 찾지 못했습니다.");
+                JSObject response;
+                synchronized (fileTaskLock) {
+                    File storage = storageRoot(call.getString("storagePath"));
+                    JSONObject metadata = ensureMetadata(storage);
+                    validateMetadataIdentities(metadata);
+                    JSONObject payloadNote = call.getObject("note");
+                    String noteRelativePath = normalizeRelativePath(call.getString("noteRelativePath", ""));
+                    if (noteRelativePath.isEmpty() && payloadNote != null) noteRelativePath = relativePathForNote(payloadNote);
+                    if (noteRelativePath.isEmpty()) throw new IllegalArgumentException("첨부할 노트를 찾지 못했습니다.");
 
-                JSONObject note = findMetadataNote(metadata, noteRelativePath);
-                if (note == null && payloadNote != null) {
-                    note = notePayload(payloadNote, noteRelativePath);
-                    upsertMetadataNote(metadata, note);
-                }
-                if (note == null) throw new IllegalArgumentException("첨부할 노트를 찾지 못했습니다.");
+                    JSONObject note = findMetadataNote(metadata, noteRelativePath);
+                    if (note == null && payloadNote != null) {
+                        note = notePayload(payloadNote, noteRelativePath);
+                        upsertMetadataNote(metadata, note);
+                    }
+                    if (note == null) throw new IllegalArgumentException("첨부할 노트를 찾지 못했습니다.");
 
-                List<Uri> uris = selectedUris(result.getData());
-                JSONArray attachments = new JSONArray();
-                int skipped = 0;
-                String mode = call.getString("mode", "file");
-                for (Uri uri : uris) {
-                    String fileName = safeAttachmentFileName(displayNameForUri(uri));
-                    String mimeType = mimeTypeForUri(uri, fileName);
-                    if ("image".equals(mode) && !isImageMimeOrName(mimeType, fileName)) {
-                        skipped++;
-                        continue;
+                    List<Uri> uris = selectedUris(result.getData());
+                    JSONArray attachments = new JSONArray();
+                    int skipped = 0;
+                    String mode = call.getString("mode", "file");
+                    for (Uri uri : uris) {
+                        String fileName = safeAttachmentFileName(displayNameForUri(uri));
+                        String mimeType = mimeTypeForUri(uri, fileName);
+                        if ("image".equals(mode) && !isImageMimeOrName(mimeType, fileName)) {
+                            skipped++;
+                            continue;
+                        }
+
+                        byte[] bytes = readUriBytes(uri);
+                        JSONObject attachment = saveAttachmentBytes(storage, metadata, note, noteRelativePath, fileName, mimeType, bytes, null, "", "");
+                        attachments.put(attachment);
                     }
 
-                    byte[] bytes = readUriBytes(uri);
-                    JSONObject attachment = saveAttachmentBytes(storage, metadata, note, noteRelativePath, fileName, mimeType, bytes, null, "");
-                    attachments.put(attachment);
-                }
-
-                JSObject response = new JSObject();
-                response.put("ok", attachments.length() > 0);
-                response.put("storagePath", storage.getAbsolutePath());
-                response.put("attachments", attachments);
-                response.put("attachment", attachments.length() > 0 ? attachments.getJSONObject(0) : JSONObject.NULL);
-                response.put("skipped", skipped);
-                if (attachments.length() == 0) {
-                    response.put("error", "image".equals(mode) ? "선택한 이미지가 없습니다." : "저장한 첨부 파일이 없습니다.");
+                    response = new JSObject();
+                    response.put("ok", attachments.length() > 0);
+                    response.put("storagePath", storage.getAbsolutePath());
+                    response.put("attachments", attachments);
+                    response.put("attachment", attachments.length() > 0 ? attachments.getJSONObject(0) : JSONObject.NULL);
+                    response.put("skipped", skipped);
+                    if (attachments.length() == 0) {
+                        response.put("error", "image".equals(mode) ? "선택한 이미지가 없습니다." : "저장한 첨부 파일이 없습니다.");
+                    }
                 }
                 call.resolve(response);
             } catch (Exception error) {
@@ -644,7 +675,11 @@ public class NotedownNativePlugin extends Plugin {
     private void runFileTask(PluginCall call, FileTask task) {
         execute(() -> {
             try {
-                call.resolve(task.run());
+                JSObject result;
+                synchronized (fileTaskLock) {
+                    result = task.run();
+                }
+                call.resolve(result);
             } catch (Exception error) {
                 call.reject(error.getMessage() == null ? "Android 저장소 작업에 실패했습니다." : error.getMessage(), error);
             }
@@ -660,18 +695,118 @@ public class NotedownNativePlugin extends Plugin {
         String mimeType,
         byte[] bytes,
         String requestedRelativePath,
-        String requestedId
+        String requestedId,
+        String requestedStoragePath
     ) throws Exception {
+        validateMetadataIdentities(metadata);
         String logicalRelativePath = normalizeRelativePath(requestedRelativePath);
-        String baseStoragePath = normalizeRelativePath(noteAttachmentDirectory(noteRelativePath, note) + "/" + fileName);
-        String storageRelativePath = uniqueStorageRelativePath(storage, baseStoragePath, new HashSet<>(), "");
-        String relativePath = logicalRelativePath.isEmpty() ? storageRelativePath : logicalRelativePath;
+        String attachmentId = requestedId == null ? "" : requestedId.trim();
+        JSONObject existingById = null;
+        JSONObject existingByRelativePath = null;
+        String existingOwnerPath = "";
+        JSONArray notes = metadata.optJSONArray("notes");
+        if (notes != null) {
+            for (int noteIndex = 0; noteIndex < notes.length(); noteIndex++) {
+                JSONObject owner = notes.optJSONObject(noteIndex);
+                if (owner == null) continue;
+                String ownerPath = normalizeRelativePath(owner.optString("relativePath", ""));
+                JSONArray attachments = owner.optJSONArray("attachments");
+                if (attachments == null) continue;
+                for (int index = 0; index < attachments.length(); index++) {
+                    JSONObject candidate = attachments.optJSONObject(index);
+                    if (candidate == null) continue;
+                    String candidateId = candidate.optString("id", candidate.optString("attachmentId", "")).trim();
+                    String candidatePath = normalizeRelativePath(candidate.optString("relativePath", ""));
+                    if (!attachmentId.isEmpty() && attachmentId.equals(candidateId)) {
+                        existingById = candidate;
+                        existingOwnerPath = ownerPath;
+                    }
+                    if (!logicalRelativePath.isEmpty() && logicalRelativePath.equals(candidatePath)) {
+                        existingByRelativePath = candidate;
+                        existingOwnerPath = ownerPath;
+                    }
+                }
+            }
+        }
+        if (existingById != null && existingByRelativePath != null && existingById != existingByRelativePath) {
+            throw new IllegalArgumentException("첨부 ID와 경로가 서로 다른 기존 첨부를 가리킵니다: " + logicalRelativePath);
+        }
+        JSONObject existing = existingById != null ? existingById : existingByRelativePath;
+        if (existing != null && !normalizeRelativePath(noteRelativePath).equals(existingOwnerPath)) {
+            throw new IllegalArgumentException("첨부가 다른 노트에 연결되어 있습니다: " + logicalRelativePath);
+        }
+        if (existingById != null && !logicalRelativePath.isEmpty()) {
+            String existingPath = normalizeRelativePath(existingById.optString("relativePath", ""));
+            if (!logicalRelativePath.equals(existingPath)) {
+                throw new IllegalArgumentException("첨부 ID가 다른 경로에 연결되어 있습니다: " + attachmentId);
+            }
+        }
+        if (existingByRelativePath != null && !attachmentId.isEmpty()) {
+            String existingId = existingByRelativePath.optString(
+                "id",
+                existingByRelativePath.optString("attachmentId", "")
+            ).trim();
+            if (!existingId.isEmpty() && !attachmentId.equals(existingId)) {
+                throw new IllegalArgumentException("첨부 경로가 다른 ID에 연결되어 있습니다: " + logicalRelativePath);
+            }
+        }
+
+        String existingStoragePath = existing == null
+            ? ""
+            : normalizeRelativePath(existing.optString("storagePath", existing.optString("relativePath", "")));
+        String requestedPhysicalPath = normalizeRelativePath(requestedStoragePath);
+        String baseStoragePath = !existingStoragePath.isEmpty()
+            ? existingStoragePath
+            : (!requestedPhysicalPath.isEmpty()
+                ? requestedPhysicalPath
+                : normalizeRelativePath(noteAttachmentDirectory(noteRelativePath, note) + "/" + fileName));
+        String storageRelativePath = uniqueStorageRelativePath(
+            storage,
+            baseStoragePath,
+            new HashSet<>(),
+            existingStoragePath
+        );
+        String relativePath = existing == null
+            ? (logicalRelativePath.isEmpty() ? storageRelativePath : logicalRelativePath)
+            : normalizeRelativePath(existing.optString("relativePath", logicalRelativePath));
+        if (attachmentId.isEmpty() && existing != null) {
+            attachmentId = existing.optString("id", existing.optString("attachmentId", "")).trim();
+        }
+        if (attachmentId.isEmpty()) attachmentId = "att-" + UUID.randomUUID();
+        if (notes != null) {
+            for (int noteIndex = 0; noteIndex < notes.length(); noteIndex++) {
+                JSONObject owner = notes.optJSONObject(noteIndex);
+                if (owner == null) continue;
+                String ownerRelativePath = normalizeRelativePath(owner.optString("relativePath", ""));
+                String ownerStoragePath = noteStoragePath(owner, ownerRelativePath);
+                if (storageRelativePath.equals(ownerStoragePath)) {
+                    throw new IllegalArgumentException(
+                        "첨부 실제 저장 경로가 노트에서 사용 중입니다: " + storageRelativePath
+                    );
+                }
+                JSONArray attachments = owner.optJSONArray("attachments");
+                if (attachments == null) continue;
+                for (int index = 0; index < attachments.length(); index++) {
+                    JSONObject candidate = attachments.optJSONObject(index);
+                    if (candidate == null || candidate == existing) continue;
+                    String candidatePath = normalizeRelativePath(candidate.optString("relativePath", ""));
+                    String candidateStoragePath = normalizeRelativePath(
+                        candidate.optString("storagePath", candidatePath)
+                    );
+                    if (storageRelativePath.equals(candidateStoragePath)) {
+                        throw new IllegalArgumentException(
+                            "첨부 실제 저장 경로가 다른 첨부에 연결되어 있습니다: " + storageRelativePath
+                        );
+                    }
+                }
+            }
+        }
         File target = resolveStorageFile(storage, storageRelativePath);
         writeBytes(target, bytes);
 
         long now = System.currentTimeMillis();
         JSONObject attachment = normalizeAttachmentMetadata(new JSONObject()
-            .put("id", requestedId == null ? "" : requestedId)
+            .put("id", attachmentId)
             .put("fileName", fileName)
             .put("relativePath", relativePath)
             .put("storagePath", storageRelativePath)
@@ -1541,6 +1676,506 @@ public class NotedownNativePlugin extends Plugin {
         return new JSONObject().put("id", id).put("name", name);
     }
 
+    private JSONArray mergeIncomingNotesWithStoredNotes(
+        File storage,
+        JSONArray incomingNotes,
+        JSONObject previousMetadata,
+        JSONArray deletedNoteIds
+    ) throws Exception {
+        JSONArray merged = new JSONArray();
+        Set<String> incomingIds = new HashSet<>();
+        Set<String> incomingRelativePaths = new HashSet<>();
+        Set<String> deletedIds = new HashSet<>();
+
+        if (deletedNoteIds != null) {
+            for (int i = 0; i < deletedNoteIds.length(); i++) {
+                String id = deletedNoteIds.optString(i, "").trim();
+                if (!id.isEmpty()) deletedIds.add(id);
+            }
+        }
+        for (int i = 0; i < incomingNotes.length(); i++) {
+            JSONObject note = incomingNotes.optJSONObject(i);
+            if (note == null) continue;
+            merged.put(note);
+            String id = note.optString("id", "").trim();
+            if (!id.isEmpty()) incomingIds.add(id);
+            String relativePath = relativePathForNote(note);
+            if (!relativePath.isEmpty()) incomingRelativePaths.add(relativePath);
+        }
+
+        JSONArray previousNotes = previousMetadata == null ? null : previousMetadata.optJSONArray("notes");
+        if (previousNotes == null) return merged;
+        for (int i = 0; i < previousNotes.length(); i++) {
+            JSONObject previousNote = previousNotes.optJSONObject(i);
+            if (previousNote == null) continue;
+            String id = previousNote.optString("id", "").trim();
+            if (!id.isEmpty() && (deletedIds.contains(id) || incomingIds.contains(id))) continue;
+            String relativePath = normalizeRelativePath(previousNote.optString("relativePath", ""));
+            if (!relativePath.isEmpty() && incomingRelativePaths.contains(relativePath)) continue;
+
+            JSONObject restored = cloneObject(previousNote);
+            String storagePath = noteStoragePath(previousNote, relativePath);
+            restored.put("body", readText(resolveStorageFile(storage, storagePath), ""));
+            restored.put("storagePath", storagePath);
+            merged.put(restored);
+        }
+        return merged;
+    }
+
+    private void validateMetadataIdentities(JSONObject metadata) {
+        if (metadata == null) return;
+        Map<String, JSONObject> noteById = new LinkedHashMap<>();
+        Map<String, JSONObject> noteByRelativePath = new LinkedHashMap<>();
+        Map<String, JSONObject> noteByStoragePath = new LinkedHashMap<>();
+        Map<String, JSONObject> attachmentById = new LinkedHashMap<>();
+        Map<String, JSONObject> attachmentByRelativePath = new LinkedHashMap<>();
+        Map<String, JSONObject> attachmentByStoragePath = new LinkedHashMap<>();
+        JSONArray notes = metadata.optJSONArray("notes");
+        if (notes == null) return;
+
+        for (int noteIndex = 0; noteIndex < notes.length(); noteIndex++) {
+            JSONObject note = notes.optJSONObject(noteIndex);
+            if (note == null) continue;
+            String noteId = note.optString("id", "").trim();
+            String noteRelativePath = normalizeRelativePath(note.optString("relativePath", ""));
+            String noteStoragePath = noteStoragePath(note, noteRelativePath);
+            putPreviousAttachmentIdentity(noteById, noteId, note, "노트 ID");
+            putPreviousAttachmentIdentity(noteByRelativePath, noteRelativePath, note, "노트 경로");
+            putPreviousAttachmentIdentity(noteByStoragePath, noteStoragePath, note, "실제 노트 경로");
+
+            JSONArray attachments = note.optJSONArray("attachments");
+            if (attachments == null) continue;
+            for (int attachmentIndex = 0; attachmentIndex < attachments.length(); attachmentIndex++) {
+                JSONObject attachment = attachments.optJSONObject(attachmentIndex);
+                if (attachment == null) continue;
+                String attachmentId = attachment.optString(
+                    "id",
+                    attachment.optString("attachmentId", "")
+                ).trim();
+                String attachmentRelativePath = normalizeRelativePath(attachment.optString("relativePath", ""));
+                if (attachmentRelativePath.isEmpty()) continue;
+                String attachmentStoragePath = normalizeRelativePath(
+                    attachment.optString("storagePath", attachmentRelativePath)
+                );
+                String declaredOwner = normalizeRelativePath(
+                    attachment.optString("noteRelativePath", noteRelativePath)
+                );
+                if (!declaredOwner.isEmpty() && !declaredOwner.equals(noteRelativePath)) {
+                    throw new IllegalArgumentException(
+                        "기존 첨부가 다른 노트 경로에 연결되어 있습니다: " + attachmentRelativePath
+                    );
+                }
+                putPreviousAttachmentIdentity(attachmentById, attachmentId, attachment, "첨부 ID");
+                putPreviousAttachmentIdentity(
+                    attachmentByRelativePath,
+                    attachmentRelativePath,
+                    attachment,
+                    "첨부 경로"
+                );
+                putPreviousAttachmentIdentity(
+                    attachmentByStoragePath,
+                    attachmentStoragePath,
+                    attachment,
+                    "실제 첨부 경로"
+                );
+            }
+        }
+
+        for (String storagePath : attachmentByStoragePath.keySet()) {
+            if (noteByStoragePath.containsKey(storagePath)) {
+                throw new IllegalArgumentException(
+                    "첨부 실제 저장 경로가 노트 파일과 충돌합니다: " + storagePath
+                );
+            }
+        }
+    }
+
+    private JSONArray prepareNotesForSave(
+        JSONArray notes,
+        JSONObject previousMetadata,
+        JSONArray deletedAttachmentIds
+    ) throws Exception {
+        Map<String, JSONObject> previousById = new LinkedHashMap<>();
+        Map<String, JSONObject> previousByRelativePath = new LinkedHashMap<>();
+        Map<String, JSONObject> previousByStoragePath = new LinkedHashMap<>();
+        Map<String, JSONObject> previousAttachmentById = new LinkedHashMap<>();
+        Map<String, JSONObject> previousAttachmentByRelativePath = new LinkedHashMap<>();
+        Map<String, JSONObject> previousAttachmentByStoragePath = new LinkedHashMap<>();
+        Map<JSONObject, String> previousAttachmentNoteRelativePath = new LinkedHashMap<>();
+        JSONArray previousNotes = previousMetadata == null ? null : previousMetadata.optJSONArray("notes");
+        if (previousNotes != null) {
+            for (int i = 0; i < previousNotes.length(); i++) {
+                JSONObject previousNote = previousNotes.optJSONObject(i);
+                if (previousNote == null) continue;
+                String previousId = previousNote.optString("id", "").trim();
+                String previousRelativePath = normalizeRelativePath(previousNote.optString("relativePath", ""));
+                String previousStoragePath = noteStoragePath(previousNote, previousRelativePath);
+                putPreviousAttachmentIdentity(previousById, previousId, previousNote, "노트 ID");
+                putPreviousAttachmentIdentity(previousByRelativePath, previousRelativePath, previousNote, "노트 경로");
+                putPreviousAttachmentIdentity(previousByStoragePath, previousStoragePath, previousNote, "실제 노트 경로");
+
+                JSONArray previousAttachments = previousNote.optJSONArray("attachments");
+                if (previousAttachments == null) continue;
+                for (int attachmentIndex = 0; attachmentIndex < previousAttachments.length(); attachmentIndex++) {
+                    JSONObject previousAttachment = previousAttachments.optJSONObject(attachmentIndex);
+                    if (previousAttachment == null) continue;
+                    String attachmentRelativePath = normalizeRelativePath(previousAttachment.optString("relativePath", ""));
+                    if (attachmentRelativePath.isEmpty()) continue;
+                    String attachmentId = previousAttachment.optString(
+                        "id",
+                        previousAttachment.optString("attachmentId", "")
+                    ).trim();
+                    String attachmentStoragePath = normalizeRelativePath(
+                        previousAttachment.optString("storagePath", attachmentRelativePath)
+                    );
+                    String attachmentNoteRelativePath = normalizeRelativePath(
+                        previousAttachment.optString("noteRelativePath", previousRelativePath)
+                    );
+                    putPreviousAttachmentIdentity(previousAttachmentById, attachmentId, previousAttachment, "첨부 ID");
+                    putPreviousAttachmentIdentity(
+                        previousAttachmentByRelativePath,
+                        attachmentRelativePath,
+                        previousAttachment,
+                        "첨부 경로"
+                    );
+                    putPreviousAttachmentIdentity(
+                        previousAttachmentByStoragePath,
+                        attachmentStoragePath,
+                        previousAttachment,
+                        "실제 첨부 경로"
+                    );
+                    previousAttachmentNoteRelativePath.put(previousAttachment, attachmentNoteRelativePath);
+                }
+            }
+        }
+
+        Set<JSONObject> deletedAttachments = resolveDeletedAttachments(
+            deletedAttachmentIds,
+            previousAttachmentById,
+            previousAttachmentByRelativePath
+        );
+        Set<JSONObject> consumedDeletedAttachments = new HashSet<>();
+        Set<String> usedIds = new HashSet<>();
+        Set<String> usedRelativePaths = new HashSet<>();
+        Set<String> usedExplicitStoragePaths = new HashSet<>();
+        Set<String> usedAttachmentIds = new HashSet<>();
+        Set<String> usedAttachmentRelativePaths = new HashSet<>();
+        Set<String> usedAttachmentStoragePaths = new HashSet<>();
+        JSONArray preparedNotes = new JSONArray();
+
+        for (int i = 0; i < notes.length(); i++) {
+            JSONObject incoming = notes.optJSONObject(i);
+            if (incoming == null) continue;
+
+            String incomingRelativePath = relativePathForNote(incoming);
+            String requestedId = incoming.optString("id", "").trim();
+            JSONObject previousByRequestedId = requestedId.isEmpty() ? null : previousById.get(requestedId);
+            JSONObject previousByRequestedPath = previousByRelativePath.get(incomingRelativePath);
+            if (previousByRequestedId != null && previousByRequestedPath != null && previousByRequestedId != previousByRequestedPath) {
+                throw new IllegalArgumentException("노트 ID와 경로가 서로 다른 기존 노트를 가리킵니다: " + requestedId);
+            }
+
+            JSONObject previousNote = previousByRequestedId != null ? previousByRequestedId : previousByRequestedPath;
+            String noteId = requestedId;
+            if (noteId.isEmpty() && previousNote != null) noteId = previousNote.optString("id", "").trim();
+            if (noteId.isEmpty()) noteId = noteIdFromRelativePath(incomingRelativePath);
+
+            String relativePath = incomingRelativePath;
+            String storagePath = normalizeRelativePath(incoming.optString("storagePath", ""));
+            if (previousNote != null) {
+                String previousId = previousNote.optString("id", "").trim();
+                if (!previousId.isEmpty() && !previousId.equals(noteId)) {
+                    throw new IllegalArgumentException("기존 노트 경로에 다른 ID를 사용할 수 없습니다: " + relativePath);
+                }
+                String previousRelativePath = normalizeRelativePath(previousNote.optString("relativePath", ""));
+                if (!previousRelativePath.isEmpty()) relativePath = previousRelativePath;
+                String previousStoragePath = noteStoragePath(previousNote, relativePath);
+                if (!previousStoragePath.isEmpty()) storagePath = previousStoragePath;
+            }
+
+            if (relativePath.isEmpty()) {
+                throw new IllegalArgumentException("노트 경로가 비어 있습니다.");
+            }
+            if (!usedIds.add(noteId)) {
+                throw new IllegalArgumentException("중복된 노트 ID가 있습니다: " + noteId);
+            }
+            if (!usedRelativePaths.add(relativePath)) {
+                throw new IllegalArgumentException("중복된 노트 경로가 있습니다: " + relativePath);
+            }
+            if (!storagePath.isEmpty()) {
+                JSONObject previousStorageOwner = previousByStoragePath.get(storagePath);
+                if (previousStorageOwner != null && previousStorageOwner != previousNote) {
+                    throw new IllegalArgumentException("실제 저장 경로가 다른 기존 노트에서 사용 중입니다: " + storagePath);
+                }
+                if (!usedExplicitStoragePaths.add(storagePath)) {
+                    throw new IllegalArgumentException("중복된 실제 저장 경로가 있습니다: " + storagePath);
+                }
+            }
+
+            JSONObject prepared = cloneObject(incoming);
+            prepared.put("id", noteId);
+            prepared.put("relativePath", relativePath);
+            if (storagePath.isEmpty()) prepared.remove("storagePath");
+            else prepared.put("storagePath", storagePath);
+            prepared.put("attachments", prepareAttachmentsForSave(
+                incoming.optJSONArray("attachments"),
+                relativePath,
+                previousNote,
+                previousAttachmentById,
+                previousAttachmentByRelativePath,
+                previousAttachmentByStoragePath,
+                previousAttachmentNoteRelativePath,
+                deletedAttachments,
+                consumedDeletedAttachments,
+                usedAttachmentIds,
+                usedAttachmentRelativePaths,
+                usedAttachmentStoragePaths
+            ));
+            preparedNotes.put(prepared);
+        }
+
+        for (JSONObject deletedAttachment : deletedAttachments) {
+            if (!consumedDeletedAttachments.contains(deletedAttachment)) {
+                String id = deletedAttachment.optString(
+                    "id",
+                    deletedAttachment.optString("attachmentId", deletedAttachment.optString("relativePath", ""))
+                );
+                throw new IllegalArgumentException("삭제 첨부가 현재 노트 소유자와 일치하지 않습니다: " + id);
+            }
+        }
+        return preparedNotes;
+    }
+
+    private void putPreviousAttachmentIdentity(
+        Map<String, JSONObject> identities,
+        String key,
+        JSONObject attachment,
+        String label
+    ) {
+        if (key == null || key.isEmpty()) return;
+        JSONObject previous = identities.get(key);
+        if (previous != null && previous != attachment) {
+            throw new IllegalArgumentException("기존 메타데이터에 중복된 " + label + "가 있습니다: " + key);
+        }
+        identities.put(key, attachment);
+    }
+
+    private Set<JSONObject> resolveDeletedAttachments(
+        JSONArray deletedAttachmentIds,
+        Map<String, JSONObject> previousById,
+        Map<String, JSONObject> previousByRelativePath
+    ) {
+        Set<JSONObject> deleted = new HashSet<>();
+        Set<String> seenTokens = new HashSet<>();
+        if (deletedAttachmentIds == null) return deleted;
+        for (int i = 0; i < deletedAttachmentIds.length(); i++) {
+            String token = deletedAttachmentIds.optString(i, "").trim();
+            if (token.isEmpty()) continue;
+            if (!seenTokens.add(token)) {
+                throw new IllegalArgumentException("중복 삭제 첨부 ID가 있습니다: " + token);
+            }
+            JSONObject byId = previousById.get(token);
+            JSONObject byRelativePath = previousByRelativePath.get(token);
+            if (byId != null && byRelativePath != null && byId != byRelativePath) {
+                throw new IllegalArgumentException("삭제 첨부 ID가 다른 첨부 경로와 충돌합니다: " + token);
+            }
+            JSONObject attachment = byId != null ? byId : byRelativePath;
+            if (attachment == null) {
+                throw new IllegalArgumentException("삭제할 첨부를 찾을 수 없습니다: " + token);
+            }
+            deleted.add(attachment);
+        }
+        return deleted;
+    }
+
+    private JSONArray prepareAttachmentsForSave(
+        JSONArray attachments,
+        String noteRelativePath,
+        JSONObject previousNote,
+        Map<String, JSONObject> previousById,
+        Map<String, JSONObject> previousByRelativePath,
+        Map<String, JSONObject> previousByStoragePath,
+        Map<JSONObject, String> previousNoteRelativePath,
+        Set<JSONObject> deletedAttachments,
+        Set<JSONObject> consumedDeletedAttachments,
+        Set<String> usedIds,
+        Set<String> usedRelativePaths,
+        Set<String> usedStoragePaths
+    ) throws Exception {
+        JSONArray preparedAttachments = new JSONArray();
+        Set<JSONObject> matchedPreviousAttachments = new HashSet<>();
+        int attachmentCount = attachments == null ? 0 : attachments.length();
+
+        for (int i = 0; i < attachmentCount; i++) {
+            JSONObject incoming = attachments.optJSONObject(i);
+            if (incoming == null) continue;
+            String relativePath = normalizeRelativePath(incoming.optString("relativePath", ""));
+            if (relativePath.isEmpty()) throw new IllegalArgumentException("첨부 경로가 비어 있습니다.");
+
+            String requestedId = incoming.optString("id", incoming.optString("attachmentId", "")).trim();
+            JSONObject previousByRequestedId = requestedId.isEmpty() ? null : previousById.get(requestedId);
+            JSONObject previousByRequestedPath = previousByRelativePath.get(relativePath);
+            if (
+                previousByRequestedId != null
+                && previousByRequestedPath != null
+                && previousByRequestedId != previousByRequestedPath
+            ) {
+                throw new IllegalArgumentException("첨부 ID와 경로가 서로 다른 기존 첨부를 가리킵니다: " + relativePath);
+            }
+            if (previousByRequestedId != null) {
+                String previousRelativePath = normalizeRelativePath(
+                    previousByRequestedId.optString("relativePath", "")
+                );
+                if (!relativePath.equals(previousRelativePath)) {
+                    throw new IllegalArgumentException("첨부 ID가 다른 경로에 연결되어 있습니다: " + requestedId);
+                }
+            }
+            if (previousByRequestedPath != null && !requestedId.isEmpty()) {
+                String previousId = previousByRequestedPath.optString(
+                    "id",
+                    previousByRequestedPath.optString("attachmentId", "")
+                ).trim();
+                if (!previousId.isEmpty() && !requestedId.equals(previousId)) {
+                    throw new IllegalArgumentException("첨부 경로가 다른 ID에 연결되어 있습니다: " + relativePath);
+                }
+            }
+
+            JSONObject previousAttachment = previousByRequestedId != null
+                ? previousByRequestedId
+                : previousByRequestedPath;
+            if (previousAttachment != null && deletedAttachments.contains(previousAttachment)) {
+                throw new IllegalArgumentException("삭제 대상으로 지정한 첨부가 요청에 남아 있습니다: " + relativePath);
+            }
+            if (previousAttachment != null) matchedPreviousAttachments.add(previousAttachment);
+            String attachmentId = requestedId;
+            if (attachmentId.isEmpty() && previousAttachment != null) {
+                attachmentId = previousAttachment.optString(
+                    "id",
+                    previousAttachment.optString("attachmentId", "")
+                ).trim();
+            }
+
+            String requestedStoragePath = normalizeRelativePath(incoming.optString("storagePath", ""));
+            String previousStoragePath = previousAttachment == null
+                ? ""
+                : normalizeRelativePath(previousAttachment.optString("storagePath", relativePath));
+            if (
+                previousAttachment != null
+                && !requestedStoragePath.isEmpty()
+                && !previousStoragePath.isEmpty()
+                && !requestedStoragePath.equals(previousStoragePath)
+            ) {
+                throw new IllegalArgumentException(
+                    "첨부 실제 저장 경로가 기존 메타데이터와 다릅니다: " + relativePath
+                );
+            }
+            String storagePath = !previousStoragePath.isEmpty()
+                ? previousStoragePath
+                : (!requestedStoragePath.isEmpty() ? requestedStoragePath : relativePath);
+            JSONObject storageOwner = previousByStoragePath.get(storagePath);
+            if (storageOwner != null && storageOwner != previousAttachment) {
+                throw new IllegalArgumentException(
+                    "첨부 실제 저장 경로가 다른 첨부에서 사용 중입니다: " + storagePath
+                );
+            }
+
+            String requestedNoteRelativePath = normalizeRelativePath(
+                incoming.optString("noteRelativePath", "")
+            );
+            if (!requestedNoteRelativePath.isEmpty() && !requestedNoteRelativePath.equals(noteRelativePath)) {
+                throw new IllegalArgumentException("첨부가 다른 노트 경로를 가리킵니다: " + relativePath);
+            }
+            String existingNoteRelativePath = previousAttachment == null
+                ? ""
+                : normalizeRelativePath(previousNoteRelativePath.get(previousAttachment));
+            if (!existingNoteRelativePath.isEmpty() && !existingNoteRelativePath.equals(noteRelativePath)) {
+                throw new IllegalArgumentException("기존 첨부가 다른 노트 경로에 연결되어 있습니다: " + relativePath);
+            }
+
+            registerPreparedAttachment(
+                attachmentId,
+                relativePath,
+                storagePath,
+                usedIds,
+                usedRelativePaths,
+                usedStoragePaths
+            );
+            JSONObject prepared = previousAttachment == null
+                ? new JSONObject()
+                : cloneObject(previousAttachment);
+            java.util.Iterator<String> keys = incoming.keys();
+            while (keys.hasNext()) {
+                String key = keys.next();
+                prepared.put(key, incoming.opt(key));
+            }
+            if (!attachmentId.isEmpty()) prepared.put("id", attachmentId);
+            prepared.put("relativePath", relativePath);
+            prepared.put("storagePath", storagePath);
+            prepared.put("noteRelativePath", noteRelativePath);
+            preparedAttachments.put(prepared);
+        }
+
+        JSONArray previousAttachments = previousNote == null ? null : previousNote.optJSONArray("attachments");
+        int previousCount = previousAttachments == null ? 0 : previousAttachments.length();
+        for (int i = 0; i < previousCount; i++) {
+            JSONObject previousAttachment = previousAttachments.optJSONObject(i);
+            if (previousAttachment == null || matchedPreviousAttachments.contains(previousAttachment)) continue;
+            if (deletedAttachments.contains(previousAttachment)) {
+                consumedDeletedAttachments.add(previousAttachment);
+                continue;
+            }
+            String relativePath = normalizeRelativePath(previousAttachment.optString("relativePath", ""));
+            if (relativePath.isEmpty()) continue;
+            String attachmentId = previousAttachment.optString(
+                "id",
+                previousAttachment.optString("attachmentId", "")
+            ).trim();
+            String storagePath = normalizeRelativePath(
+                previousAttachment.optString("storagePath", relativePath)
+            );
+            String ownerPath = normalizeRelativePath(
+                previousAttachment.optString("noteRelativePath", noteRelativePath)
+            );
+            if (!ownerPath.isEmpty() && !ownerPath.equals(noteRelativePath)) {
+                throw new IllegalArgumentException("기존 첨부가 다른 노트 경로에 연결되어 있습니다: " + relativePath);
+            }
+            registerPreparedAttachment(
+                attachmentId,
+                relativePath,
+                storagePath,
+                usedIds,
+                usedRelativePaths,
+                usedStoragePaths
+            );
+            JSONObject prepared = cloneObject(previousAttachment);
+            if (!attachmentId.isEmpty()) prepared.put("id", attachmentId);
+            prepared.put("relativePath", relativePath);
+            prepared.put("storagePath", storagePath);
+            prepared.put("noteRelativePath", noteRelativePath);
+            preparedAttachments.put(prepared);
+        }
+        return preparedAttachments;
+    }
+
+    private void registerPreparedAttachment(
+        String id,
+        String relativePath,
+        String storagePath,
+        Set<String> usedIds,
+        Set<String> usedRelativePaths,
+        Set<String> usedStoragePaths
+    ) {
+        if (!id.isEmpty() && !usedIds.add(id)) {
+            throw new IllegalArgumentException("중복된 첨부 ID가 있습니다: " + id);
+        }
+        if (!usedRelativePaths.add(relativePath)) {
+            throw new IllegalArgumentException("중복된 첨부 경로가 있습니다: " + relativePath);
+        }
+        if (!usedStoragePaths.add(storagePath)) {
+            throw new IllegalArgumentException("중복된 실제 첨부 경로가 있습니다: " + storagePath);
+        }
+    }
+
     private String noteWorkspaceId(JSONObject note) {
         String value = note.optString("folder", note.optString("workspace", UNFILED_WORKSPACE_ID)).trim();
         return value.isEmpty() ? UNFILED_WORKSPACE_ID : value;
@@ -1629,8 +2264,10 @@ public class NotedownNativePlugin extends Plugin {
     private JSONObject normalizeAttachmentMetadata(JSONObject attachment, String noteRelativePath) throws Exception {
         String relativePath = normalizeRelativePath(attachment.optString("relativePath", ""));
         String storagePath = normalizeRelativePath(attachment.optString("storagePath", relativePath));
+        String attachmentId = attachment.optString("id", attachment.optString("attachmentId", "")).trim();
+        if (attachmentId.isEmpty()) attachmentId = "att-" + UUID.randomUUID();
         JSONObject result = new JSONObject();
-        result.put("id", attachment.optString("id", attachment.optString("attachmentId", "att-" + sha1(relativePath).substring(0, 16))));
+        result.put("id", attachmentId);
         result.put("fileName", safeAttachmentFileName(attachment.optString("fileName", new File(relativePath).getName())));
         result.put("relativePath", relativePath);
         result.put("storagePath", storagePath);
@@ -1688,20 +2325,59 @@ public class NotedownNativePlugin extends Plugin {
     }
 
     private void upsertMetadataNote(JSONObject metadata, JSONObject note) throws JSONException {
+        validateMetadataIdentities(metadata);
         JSONArray notes = metadata.optJSONArray("notes");
         if (notes == null) {
             notes = new JSONArray();
             metadata.put("notes", notes);
         }
         String relativePath = normalizeRelativePath(note.optString("relativePath", ""));
+        String id = note.optString("id", "").trim();
+        JSONObject existingById = null;
+        JSONObject existingByRelativePath = null;
         for (int i = 0; i < notes.length(); i++) {
             JSONObject item = notes.optJSONObject(i);
-            if (item != null && normalizeRelativePath(item.optString("relativePath", "")).equals(relativePath)) {
-                notes.put(i, note);
-                return;
+            if (item == null) continue;
+            if (!id.isEmpty() && id.equals(item.optString("id", "").trim())) existingById = item;
+            if (normalizeRelativePath(item.optString("relativePath", "")).equals(relativePath)) existingByRelativePath = item;
+        }
+        if (existingById != null && existingByRelativePath != null && existingById != existingByRelativePath) {
+            throw new IllegalArgumentException("노트 ID와 경로가 서로 다른 기존 노트를 가리킵니다: " + relativePath);
+        }
+        if (existingById != null && existingByRelativePath == null) {
+            throw new IllegalArgumentException("노트 ID가 다른 경로에 연결되어 있습니다: " + id);
+        }
+        if (existingByRelativePath != null && !id.isEmpty()) {
+            String existingId = existingByRelativePath.optString("id", "").trim();
+            if (!existingId.isEmpty() && !id.equals(existingId)) {
+                throw new IllegalArgumentException("노트 경로가 다른 ID에 연결되어 있습니다: " + relativePath);
             }
         }
+        JSONObject existing = existingById != null ? existingById : existingByRelativePath;
+        if (existing != null) {
+            JSONObject merged = cloneObject(existing);
+            java.util.Iterator<String> keys = note.keys();
+            while (keys.hasNext()) {
+                String key = keys.next();
+                if ("storagePath".equals(key) || "attachments".equals(key)) continue;
+                if ("id".equals(key) && note.optString("id", "").trim().isEmpty()) continue;
+                merged.put(key, note.opt(key));
+            }
+            merged.put("storagePath", noteStoragePath(existing, relativePath));
+            merged.put("attachments", existing.optJSONArray("attachments") == null
+                ? new JSONArray()
+                : existing.optJSONArray("attachments"));
+            notes.put(notesIndexOf(notes, existing), merged);
+            return;
+        }
         notes.put(note);
+    }
+
+    private int notesIndexOf(JSONArray notes, JSONObject target) {
+        for (int index = 0; index < notes.length(); index++) {
+            if (notes.optJSONObject(index) == target) return index;
+        }
+        return -1;
     }
 
     private JSONObject notePayload(JSONObject note, String relativePath) throws Exception {
@@ -1718,6 +2394,7 @@ public class NotedownNativePlugin extends Plugin {
     }
 
     private void upsertMetadataAttachment(JSONObject metadata, String noteRelativePath, JSONObject attachment) throws JSONException {
+        validateMetadataIdentities(metadata);
         JSONObject note = findMetadataNote(metadata, noteRelativePath);
         if (note == null) return;
         JSONArray attachments = note.optJSONArray("attachments");
@@ -1727,10 +2404,50 @@ public class NotedownNativePlugin extends Plugin {
         }
         String relativePath = attachment.optString("relativePath", "");
         String id = attachment.optString("id", "");
+        JSONObject existingById = null;
+        JSONObject existingByRelativePath = null;
+        JSONObject existingOwner = null;
+        JSONArray notes = metadata.optJSONArray("notes");
+        if (notes != null) {
+            for (int noteIndex = 0; noteIndex < notes.length(); noteIndex++) {
+                JSONObject owner = notes.optJSONObject(noteIndex);
+                if (owner == null) continue;
+                JSONArray ownerAttachments = owner.optJSONArray("attachments");
+                if (ownerAttachments == null) continue;
+                for (int index = 0; index < ownerAttachments.length(); index++) {
+                    JSONObject item = ownerAttachments.optJSONObject(index);
+                    if (item == null) continue;
+                    if (!id.isEmpty() && id.equals(item.optString("id", ""))) {
+                        existingById = item;
+                        existingOwner = owner;
+                    }
+                    if (relativePath.equals(item.optString("relativePath", ""))) {
+                        existingByRelativePath = item;
+                        existingOwner = owner;
+                    }
+                }
+            }
+        }
+        if (existingById != null && existingByRelativePath != null && existingById != existingByRelativePath) {
+            throw new IllegalArgumentException("첨부 ID와 경로가 서로 다른 기존 첨부를 가리킵니다: " + relativePath);
+        }
+        JSONObject existing = existingById != null ? existingById : existingByRelativePath;
+        if (existing != null && existingOwner != note) {
+            throw new IllegalArgumentException("첨부가 다른 노트에 연결되어 있습니다: " + relativePath);
+        }
+        if (existingById != null && !relativePath.equals(existingById.optString("relativePath", ""))) {
+            throw new IllegalArgumentException("첨부 ID가 다른 경로에 연결되어 있습니다: " + id);
+        }
+        if (existingByRelativePath != null && !id.isEmpty()) {
+            String existingId = existingByRelativePath.optString("id", "");
+            if (!existingId.isEmpty() && !id.equals(existingId)) {
+                throw new IllegalArgumentException("첨부 경로가 다른 ID에 연결되어 있습니다: " + relativePath);
+            }
+        }
         for (int i = 0; i < attachments.length(); i++) {
             JSONObject item = attachments.optJSONObject(i);
             if (item == null) continue;
-            if (relativePath.equals(item.optString("relativePath", "")) || (!id.isEmpty() && id.equals(item.optString("id", "")))) {
+            if (item == existing) {
                 attachments.put(i, attachment);
                 return;
             }
@@ -2002,8 +2719,66 @@ public class NotedownNativePlugin extends Plugin {
     }
 
     private void writeBytes(File file, byte[] bytes) throws IOException {
-        ensureDirectory(file.getParentFile());
-        Files.write(file.toPath(), bytes);
+        File parent = file.getParentFile();
+        ensureDirectory(parent);
+        if (parent == null) {
+            throw new IOException("저장 파일의 상위 디렉토리를 확인할 수 없습니다.");
+        }
+
+        File temporary = File.createTempFile("." + file.getName() + ".", ".tmp", parent);
+        try {
+            try (FileOutputStream output = new FileOutputStream(temporary)) {
+                output.write(bytes);
+                output.flush();
+                output.getFD().sync();
+            }
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                Api26FileMover.moveReplacing(temporary, file);
+            } else {
+                moveReplacingLegacy(temporary, file);
+            }
+        } finally {
+            if (temporary.exists() && !temporary.delete()) temporary.deleteOnExit();
+        }
+    }
+
+    private void moveReplacingLegacy(File temporary, File target) throws IOException {
+        if (temporary.renameTo(target)) return;
+
+        try (
+            FileInputStream input = new FileInputStream(temporary);
+            FileOutputStream output = new FileOutputStream(target, false)
+        ) {
+            byte[] buffer = new byte[8192];
+            int read;
+            while ((read = input.read(buffer)) != -1) output.write(buffer, 0, read);
+            output.flush();
+            output.getFD().sync();
+        }
+    }
+
+    @RequiresApi(api = Build.VERSION_CODES.O)
+    private static final class Api26FileMover {
+        private Api26FileMover() {
+        }
+
+        static void moveReplacing(File temporary, File target) throws IOException {
+            try {
+                Files.move(
+                    temporary.toPath(),
+                    target.toPath(),
+                    StandardCopyOption.ATOMIC_MOVE,
+                    StandardCopyOption.REPLACE_EXISTING
+                );
+            } catch (AtomicMoveNotSupportedException unsupported) {
+                Files.move(
+                    temporary.toPath(),
+                    target.toPath(),
+                    StandardCopyOption.REPLACE_EXISTING
+                );
+            }
+        }
     }
 
     private static class PdfRenderResult {

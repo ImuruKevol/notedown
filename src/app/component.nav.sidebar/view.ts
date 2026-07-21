@@ -19,6 +19,7 @@ interface NoteItem {
     workspaceName?: string;
     fileName?: string;
     relativePath?: string;
+    storagePath?: string;
     attachments?: any[];
 }
 
@@ -41,6 +42,9 @@ export class Component implements OnInit, OnDestroy {
     private settingsKey = 'notedown.settings.v1';
     private startupSyncResultKey = 'notedown.sync.startup.result.v1';
     private syncStatusHideTimeout: number | null = null;
+    private notesMutationGeneration = 0;
+    private notesLoadGeneration = 0;
+    private pendingNoteEdits = new Map<string, Pick<NoteItem, 'title' | 'body'>>();
 
     public query = '';
     public searchOpen = false;
@@ -71,7 +75,11 @@ export class Component implements OnInit, OnDestroy {
     public syncStatusDetail = '';
     public syncStatusTone: SyncStatusTone = 'idle';
 
-    private handleNotesChanged = () => { void this.loadNotes().then(() => this.renderSoon()); };
+    private handleNotesChanged = () => {
+        void this.loadNotes().then(didApply => {
+            if (didApply) this.renderSoon();
+        });
+    };
     private handleNoteTitleChanged = (event: Event) => {
         const detail = (event as CustomEvent<{ noteId?: string; title?: string }>).detail || {};
         if (!detail.noteId) return;
@@ -80,8 +88,30 @@ export class Component implements OnInit, OnDestroy {
         const index = this.notes.findIndex(note => note.id === detail.noteId);
         if (index < 0 || this.notes[index].title === title) return;
 
+        this.notesMutationGeneration++;
+        const pending = this.pendingNoteEdits.get(detail.noteId) || {
+            title: this.notes[index].title,
+            body: this.notes[index].body
+        };
+        this.pendingNoteEdits.set(detail.noteId, { ...pending, title });
         this.notes[index] = { ...this.notes[index], title };
         this.renderSoon();
+    };
+    private handleNoteBodyChanged = (event: Event) => {
+        const detail = (event as CustomEvent<{ noteId?: string; body?: string }>).detail || {};
+        if (!detail.noteId || typeof detail.body !== 'string') return;
+
+        const index = this.notes.findIndex(note => note.id === detail.noteId);
+        if (index < 0) return;
+
+        const pending = this.pendingNoteEdits.get(detail.noteId) || {
+            title: this.notes[index].title,
+            body: this.notes[index].body
+        };
+        if (pending.body === detail.body) return;
+
+        this.notesMutationGeneration++;
+        this.pendingNoteEdits.set(detail.noteId, { ...pending, body: detail.body });
     };
     private handleSelectNote = (event: Event) => {
         const noteId = (event as CustomEvent<string>).detail;
@@ -128,9 +158,12 @@ export class Component implements OnInit, OnDestroy {
         this.workspaceOpen = true;
         this.emitWorkspaceState(true);
         this.loadStartupSyncStatus();
-        void this.loadNotes().then(() => this.renderSoon());
+        void this.loadNotes().then(didApply => {
+            if (didApply) this.renderSoon();
+        });
         window.addEventListener('notedown:notes-changed', this.handleNotesChanged);
         window.addEventListener('notedown:note-title-changed', this.handleNoteTitleChanged);
+        window.addEventListener('notedown:note-body-changed', this.handleNoteBodyChanged);
         window.addEventListener('notedown:select-note', this.handleSelectNote);
         window.addEventListener('notedown:startup-sync-status', this.handleStartupSyncStatus);
         window.addEventListener('notedown:save-sync-status', this.handleSaveSyncStatus);
@@ -141,6 +174,7 @@ export class Component implements OnInit, OnDestroy {
     public ngOnDestroy() {
         window.removeEventListener('notedown:notes-changed', this.handleNotesChanged);
         window.removeEventListener('notedown:note-title-changed', this.handleNoteTitleChanged);
+        window.removeEventListener('notedown:note-body-changed', this.handleNoteBodyChanged);
         window.removeEventListener('notedown:select-note', this.handleSelectNote);
         window.removeEventListener('notedown:startup-sync-status', this.handleStartupSyncStatus);
         window.removeEventListener('notedown:save-sync-status', this.handleSaveSyncStatus);
@@ -271,6 +305,7 @@ export class Component implements OnInit, OnDestroy {
             ? storedFolders.map(folder => folder.id === folderId ? { ...folder, label: nextLabel } : folder)
             : [...storedFolders, { id: folderId, label: nextLabel }];
         this.saveStoredFolders(nextStoredFolders);
+        this.notesMutationGeneration++;
         this.notes = this.notes.map(note => (note.folder || 'memo') === folderId ? { ...note, workspaceName: nextLabel } : note);
         this.syncFolders();
         await this.persistNotes();
@@ -311,6 +346,12 @@ export class Component implements OnInit, OnDestroy {
         if (!folder) return;
 
         const notesToDelete = this.notes.filter(note => (note.folder || 'memo') === folderId);
+        const deletedNoteIds = notesToDelete.map(note => note.id);
+        const deletedAttachmentIds = notesToDelete.flatMap(note =>
+            (note.attachments || [])
+                .map(attachment => String(attachment?.id || attachment?.relativePath || '').trim())
+                .filter(Boolean)
+        );
         const countLabel = notesToDelete.length > 0 ? `와 노트 ${notesToDelete.length}개` : '';
         const confirmed = window.confirm(`'${folder.label}' 폴더${countLabel}를 삭제할까요?\n이 작업은 되돌릴 수 없습니다.`);
         if (!confirmed) return;
@@ -318,15 +359,16 @@ export class Component implements OnInit, OnDestroy {
         const deletedActiveNote = notesToDelete.some(note => note.id === this.activeNoteId);
         this.closeFolderContextMenu();
         this.saveStoredFolders(this.readStoredFolders().filter(item => item.id !== folderId));
+        this.notesMutationGeneration++;
         this.notes = this.notes.filter(note => (note.folder || 'memo') !== folderId);
+        for (const noteId of deletedNoteIds) this.pendingNoteEdits.delete(noteId);
         if (this.activeFolder === folderId) {
             this.activeFolder = 'all';
             localStorage.setItem(this.activeWorkspaceKey, this.activeFolder);
             window.dispatchEvent(new CustomEvent('notedown:workspace-changed', { detail: { workspaceId: this.activeFolder } }));
         }
         this.syncFolders();
-        await this.persistNotes();
-        await Promise.all(notesToDelete.map(note => this.syncNoteWithServer(note, true)));
+        const persistPromise = this.persistNotes(deletedNoteIds);
 
         const nextNote = deletedActiveNote ? (this.visibleNotes[0] || this.notes[0]) : null;
         if (nextNote) {
@@ -337,11 +379,23 @@ export class Component implements OnInit, OnDestroy {
             localStorage.removeItem(this.activeNoteKey);
         }
 
-        window.dispatchEvent(new CustomEvent('notedown:notes-changed', { detail: { source: 'component.nav.sidebar', foldersChanged: true } }));
+        window.dispatchEvent(new CustomEvent('notedown:notes-changed', {
+            detail: {
+                source: 'component.nav.sidebar',
+                foldersChanged: true,
+                deletedNoteIds,
+                deletedAttachmentIds
+            }
+        }));
         if (deletedActiveNote) {
             window.dispatchEvent(new CustomEvent('notedown:select-note', { detail: nextNote?.id || '' }));
         }
         this.renderSoon();
+
+        await persistPromise;
+        for (const note of notesToDelete) {
+            void this.syncNoteWithServer(note, true);
+        }
     }
 
     public async exportFolderZip(folderId: string, event?: Event) {
@@ -383,30 +437,11 @@ export class Component implements OnInit, OnDestroy {
         }
     }
 
-    public async createNote() {
-        const now = Date.now();
-        const note: NoteItem = {
-            id: `note-${now}`,
-            icon: 'N',
-            title: '새 노트',
-            body: '# 새 노트\n\n',
-            tags: ['draft'],
-            status: 'draft',
-            folder: this.activeFolder === 'all' ? 'memo' : this.activeFolder,
-            workspaceName: this.activeFolder === 'all' ? '메모' : this.activeFolderLabel,
-            createdAt: this.nowLabel(new Date(now)),
-            createdAtMs: now,
-            updatedAt: this.nowLabel(new Date(now)),
-            updatedAtMs: now,
-            attachments: []
-        };
-        this.notes = [note, ...this.notes];
-        this.activeNoteId = note.id;
-        localStorage.setItem(this.activeNoteKey, note.id);
-        this.syncFolders();
-        await this.persistNotes();
-        window.dispatchEvent(new CustomEvent('notedown:notes-changed', { detail: { source: 'component.nav.sidebar' } }));
-        this.renderSoon();
+    public createNote() {
+        const folder = this.activeFolder === 'all' ? 'memo' : this.activeFolder;
+        window.dispatchEvent(new CustomEvent('notedown:create-note', {
+            detail: { source: 'component.nav.sidebar', folder }
+        }));
     }
 
     public async deleteNote(id: string, event?: Event) {
@@ -421,30 +456,40 @@ export class Component implements OnInit, OnDestroy {
             if (!confirmed) return;
         }
 
+        const deletedAttachmentIds = (note.attachments || [])
+            .map(attachment => String(attachment?.id || attachment?.relativePath || '').trim())
+            .filter(Boolean);
         const wasActive = this.activeNoteId === id;
+        this.notesMutationGeneration++;
         this.notes = this.notes.filter(item => item.id !== id);
+        this.pendingNoteEdits.delete(id);
         this.syncFolders();
-        await this.persistNotes();
-        await this.syncNoteWithServer(note, true);
+        const persistPromise = this.persistNotes([id]);
 
-        if (!wasActive) {
-            window.dispatchEvent(new CustomEvent('notedown:notes-changed'));
-            return;
+        const nextNote = wasActive ? (this.visibleNotes[0] || this.notes[0]) : null;
+        if (wasActive) {
+            this.activeNoteId = nextNote?.id || '';
+            if (this.activeNoteId) {
+                localStorage.setItem(this.activeNoteKey, this.activeNoteId);
+            } else {
+                localStorage.removeItem(this.activeNoteKey);
+            }
         }
 
-        const nextNote = this.visibleNotes[0] || this.notes[0];
-        this.activeNoteId = nextNote?.id || '';
-
-        if (this.activeNoteId) {
-            localStorage.setItem(this.activeNoteKey, this.activeNoteId);
-        } else {
-            localStorage.removeItem(this.activeNoteKey);
+        window.dispatchEvent(new CustomEvent('notedown:notes-changed', {
+            detail: {
+                source: 'component.nav.sidebar',
+                deletedNoteIds: [id],
+                deletedAttachmentIds
+            }
+        }));
+        if (wasActive) {
+            window.dispatchEvent(new CustomEvent('notedown:select-note', { detail: nextNote?.id || '' }));
         }
+        this.renderSoon();
 
-        window.dispatchEvent(new CustomEvent('notedown:notes-changed'));
-        if (nextNote) {
-            window.dispatchEvent(new CustomEvent('notedown:select-note', { detail: nextNote.id }));
-        }
+        await persistPromise;
+        void this.syncNoteWithServer(note, true);
     }
 
     public toggleWorkspace(event?: Event) {
@@ -727,21 +772,30 @@ export class Component implements OnInit, OnDestroy {
     }
 
     private async loadNotes() {
+        const loadGeneration = ++this.notesLoadGeneration;
+        const mutationGeneration = this.notesMutationGeneration;
         const fallback = this.defaultNotes();
         const fileBacked = this.usesFileStorage();
         const fileNotes = await this.loadFileNotes();
+        if (loadGeneration !== this.notesLoadGeneration || mutationGeneration !== this.notesMutationGeneration) {
+            return false;
+        }
+
         if (fileNotes) {
-            this.notes = fileNotes;
+            this.notes = this.mergePendingNoteEdits(fileNotes);
+            localStorage.setItem(this.storageKey, JSON.stringify(this.notes));
             this.syncFolders();
             this.syncActiveNote();
-            return;
+            return true;
         }
 
         try {
             const stored = localStorage.getItem(this.storageKey);
             this.notes = stored ? JSON.parse(stored) : (fileBacked ? [] : fallback);
             if (!Array.isArray(this.notes) || this.notes.length === 0) this.notes = [];
-            this.notes = this.notes.map((note, index) => this.normalizeNote(note, index));
+            this.notes = this.mergePendingNoteEdits(
+                this.notes.map((note, index) => this.normalizeNote(note, index))
+            );
             if (!stored && !fileBacked) localStorage.setItem(this.storageKey, JSON.stringify(this.notes));
         } catch (error) {
             this.notes = fileBacked ? [] : fallback;
@@ -750,6 +804,19 @@ export class Component implements OnInit, OnDestroy {
 
         this.syncFolders();
         this.syncActiveNote();
+        return true;
+    }
+
+    private mergePendingNoteEdits(notes: NoteItem[]) {
+        return notes.map(note => {
+            const pending = this.pendingNoteEdits.get(note.id);
+            if (!pending) return note;
+            if (note.title === pending.title && note.body === pending.body) {
+                this.pendingNoteEdits.delete(note.id);
+                return note;
+            }
+            return { ...note, ...pending };
+        });
     }
 
     private syncActiveNote() {
@@ -882,17 +949,63 @@ export class Component implements OnInit, OnDestroy {
         return folder;
     }
 
-    private async persistNotes() {
+    private async persistNotes(deletedNoteIds: string[] = []) {
         localStorage.setItem(this.storageKey, JSON.stringify(this.notes));
         const api = (window as any).notedown?.storage;
         const storagePath = this.storagePath();
         if (!api?.saveNotes || !storagePath) return;
 
         try {
-            await api.saveNotes({ storagePath, notes: this.notes });
+            const notes = this.notes.map(note => ({
+                ...note,
+                attachments: Array.isArray(note.attachments)
+                    ? note.attachments.map(attachment => ({ ...attachment }))
+                    : []
+            }));
+            const result = await api.saveNotes({ storagePath, notes, deletedNoteIds });
+            if (result?.ok && Array.isArray(result.savedNotes)) {
+                this.mergeCanonicalSavedNotes(result.savedNotes);
+            }
         } catch (error) {
             // Keep localStorage as fallback when file persistence is unavailable.
         }
+    }
+
+    private mergeCanonicalSavedNotes(savedNotes: any[]) {
+        const byId = new Map<string, any>();
+        const byRelativePath = new Map<string, any>();
+        for (const savedNote of savedNotes) {
+            if (savedNote?.id) byId.set(String(savedNote.id), savedNote);
+            if (savedNote?.relativePath) byRelativePath.set(String(savedNote.relativePath), savedNote);
+        }
+
+        this.notes = this.notes.map(note => {
+            const savedNote = byId.get(note.id) || (note.relativePath ? byRelativePath.get(note.relativePath) : null);
+            if (!savedNote) return note;
+            const savedAttachments = new Map<string, any>();
+            for (const attachment of savedNote.attachments || []) {
+                const key = String(attachment?.id || attachment?.relativePath || '');
+                if (key) savedAttachments.set(key, attachment);
+            }
+            return {
+                ...note,
+                fileName: savedNote.fileName || note.fileName,
+                relativePath: savedNote.relativePath || note.relativePath,
+                storagePath: savedNote.storagePath || note.storagePath,
+                attachments: (note.attachments || []).map(attachment => {
+                    const key = String(attachment?.id || attachment?.relativePath || '');
+                    const saved = key ? savedAttachments.get(key) : null;
+                    return saved ? {
+                        ...attachment,
+                        fileName: saved.fileName || attachment.fileName,
+                        relativePath: saved.relativePath || attachment.relativePath,
+                        storagePath: saved.storagePath || attachment.storagePath,
+                        noteRelativePath: saved.noteRelativePath || attachment.noteRelativePath
+                    } : attachment;
+                })
+            };
+        });
+        localStorage.setItem(this.storageKey, JSON.stringify(this.notes));
     }
 
     private async loadFileNotes() {
@@ -903,9 +1016,7 @@ export class Component implements OnInit, OnDestroy {
         try {
             const result = await api.loadNotes({ storagePath });
             if (!result?.ok || !Array.isArray(result.notes)) return null;
-            const notes = result.notes.map((note: any, index: number) => this.normalizeNote(note, index));
-            localStorage.setItem(this.storageKey, JSON.stringify(notes));
-            return notes;
+            return result.notes.map((note: any, index: number) => this.normalizeNote(note, index));
         } catch (error) {
             return null;
         }
@@ -1002,6 +1113,7 @@ export class Component implements OnInit, OnDestroy {
             workspaceName: note?.workspaceName,
             fileName: note?.fileName,
             relativePath: note?.relativePath,
+            storagePath: note?.storagePath,
             attachments: Array.isArray(note?.attachments) ? note.attachments : [],
             createdAt: note?.createdAt || this.nowLabel(new Date(createdAtMs)),
             createdAtMs,
@@ -1025,11 +1137,11 @@ export class Component implements OnInit, OnDestroy {
 
     private taskStats(note: NoteItem) {
         return (note.body || '').split('\n').reduce((stats, line) => {
-            const task = /^\s*[-*]\s+\[([ xX])\]\s+/.exec(line);
+            const task = /^[\t ]*(?:[-*+]|\d+[.)])[\t ]+\[([ xX]?)\][\t ]+/.exec(line);
             if (!task) return stats;
 
             stats.total += 1;
-            if (task[1].toLowerCase() === 'x') stats.done += 1;
+            if ((task[1] || '').toLowerCase() === 'x') stats.done += 1;
             return stats;
         }, { total: 0, done: 0 });
     }

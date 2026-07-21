@@ -128,3 +128,7 @@
 | 2026-07-07 | 005 | macOS PKG 설치 script 중복 실행 방지 | [상세](devlog/2026-07-07/005-macos-pkg-script-dedup.md) |
 | 2026-07-16 | 001 | 첫 동기화 metadata 가상 충돌 및 디렉토리 읽기 오류 수정 | [상세](devlog/2026-07-16/001-initial-sync-metadata-conflict-fix.md) |
 | 2026-07-16 | 002 | 서버 이미지 배포 및 Notedown 0.2.1 멀티플랫폼 릴리스 | [상세](devlog/2026-07-16/002-release-0-2-1.md) |
+| 2026-07-21 | 001 | 체크박스 진행률 및 프리뷰-에디터 동기화 오류 수정 | [상세](devlog/2026-07-21/001-checkbox-progress-preview-sync.md) |
+| 2026-07-21 | 002 | 저속 네트워크 동기화 및 노트 저장 무결성 오류 수정 | [상세](devlog/2026-07-21/002-sync-slow-network-integrity-fix.md) |
+| 2026-07-21 | 003 | 공백 없는 체크박스 문법 지원 및 저장 기준 진행률 복원 | [상세](devlog/2026-07-21/003-compact-checkbox-syntax.md) |
+| 2026-07-21 | 004 | Notedown 0.2.2 및 Sync Server 1.0.1 멀티플랫폼 릴리스 | [상세](devlog/2026-07-21/004-release-0-2-2.md) |

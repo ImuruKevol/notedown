@@ -50,6 +50,7 @@ interface NoteItem {
     workspaceName?: string;
     fileName?: string;
     relativePath?: string;
+    storagePath?: string;
     attachments?: NoteAttachment[];
     titleManuallyEdited?: boolean;
 }
@@ -58,6 +59,7 @@ interface NoteAttachment {
     id?: string;
     fileName: string;
     relativePath: string;
+    storagePath?: string;
     noteRelativePath?: string;
     mimeType?: string;
     size?: number;
@@ -191,6 +193,10 @@ export class Component implements OnInit, OnDestroy {
     private editorMouseMoveDisposable: any;
     private editorMouseLeaveDisposable: any;
     private editorSelectionDisposables: any[] = [];
+    private editorContentDisposable: any;
+    private editorContentBindingTimeout: number | null = null;
+    private editorContentBindingEpoch = 0;
+    private editorBoundNoteId = '';
     private lastEditorSelectionState: EditorSelectionState | null = null;
     private pendingEditorSelectionState: EditorSelectionState | null = null;
     private pendingEditorRestoreFocus = false;
@@ -202,8 +208,12 @@ export class Component implements OnInit, OnDestroy {
     private attachmentDataUrlCache = new Map<string, string>();
     private attachmentPdfDataUrlCache = new Map<string, string>();
     private attachmentDataUrlLoading = new Set<string>();
+    private deletedAttachmentIds = new Set<string>();
+    private fileSaveTail: Promise<void> = Promise.resolve();
     private styleFoldTimeout: number | null = null;
     private syncUploadTimeout: number | null = null;
+    private notesMutationGeneration = 0;
+    private notesLoadGeneration = 0;
     private readonly androidSplitMinWidth = 840;
     private autoFoldedStyleNoteId = '';
     private hoveredLineDecorationIds: string[] = [];
@@ -279,22 +289,59 @@ export class Component implements OnInit, OnDestroy {
             this.requestViewUpdate();
         }
     };
+    private handleCreateNote = (event: Event) => {
+        const detail = (event as CustomEvent<{ folder?: string }>).detail || {};
+        this.createNote(typeof detail.folder === 'string' ? detail.folder : '');
+        this.requestViewUpdate();
+    };
 
     private handleNotesChanged = async (event: Event) => {
-        const source = (event as CustomEvent<{ source?: string }>).detail?.source;
-        if (source === 'page.notes') return;
+        const detail = (event as CustomEvent<{
+            source?: string;
+            deletedNoteIds?: string[];
+            deletedAttachmentIds?: string[];
+        }>).detail || {};
+        if (detail.source === 'page.notes') return;
 
+        const deletedNoteIds = new Set((detail.deletedNoteIds || []).map(id => String(id || '')).filter(Boolean));
+        const deletedAttachmentIds = new Set(
+            (detail.deletedAttachmentIds || []).map(id => String(id || '')).filter(Boolean)
+        );
         const editorState = this.captureEditorSelectionState();
         const activeId = this.activeNote?.id;
-        const unsavedNote = this.hasUnsavedChanges && activeId ? { ...this.activeNote } : null;
-        await this.loadNotes(false);
+        for (const identity of deletedAttachmentIds) this.deletedAttachmentIds.delete(identity);
+        if (deletedNoteIds.size > 0) {
+            for (const note of this.notes) {
+                if (!deletedNoteIds.has(note.id)) continue;
+                for (const attachment of note.attachments || []) {
+                    if (attachment.id) this.deletedAttachmentIds.delete(attachment.id);
+                    if (attachment.relativePath) this.deletedAttachmentIds.delete(attachment.relativePath);
+                }
+            }
+            this.notes = this.notes.filter(note => !deletedNoteIds.has(note.id));
+            if (activeId && deletedNoteIds.has(activeId)) this.hasUnsavedChanges = false;
+        }
+        const unsavedNote = this.hasUnsavedChanges && activeId && !deletedNoteIds.has(activeId)
+            ? { ...this.activeNote }
+            : null;
+        const didApply = await this.loadNotes(false);
+        if (!didApply) {
+            this.requestViewUpdate();
+            return;
+        }
+        if (deletedNoteIds.size > 0) {
+            this.notes = this.notes.filter(note => !deletedNoteIds.has(note.id));
+        }
         if (unsavedNote?.id) {
             const index = this.notes.findIndex(note => note.id === unsavedNote.id);
-            if (index >= 0) this.notes[index] = unsavedNote;
-            else this.notes = [unsavedNote, ...this.notes];
+            if (index >= 0) {
+                this.notes[index] = this.mergeUnsavedNoteWithCanonical(this.notes[index], unsavedNote);
+            } else {
+                this.notes = [unsavedNote, ...this.notes];
+            }
         }
         this.selectNoteById(localStorage.getItem(this.activeNoteKey) || activeId, { restoreEditorState: editorState });
-        if (unsavedNote?.id && this.activeNote?.id === unsavedNote.id) this.hasUnsavedChanges = true;
+        this.hasUnsavedChanges = Boolean(unsavedNote?.id && this.activeNote?.id === unsavedNote.id);
         this.requestViewUpdate();
     };
     private handleSettingsChanged = () => {
@@ -315,7 +362,11 @@ export class Component implements OnInit, OnDestroy {
         const detail = (event as CustomEvent<any>).detail;
         if (detail?.source === 'page.notes') return;
         this.applyStartupSyncConflict(detail);
-        if ((detail?.ok || detail?.status === 'ok') && this.extractSyncConflicts(detail).length === 0) {
+        if (
+            (detail?.ok || detail?.status === 'ok')
+            && this.extractSyncConflicts(detail).length === 0
+            && !this.hasUnsavedChanges
+        ) {
             void this.reloadNotesAfterStartupSync();
         }
     };
@@ -382,6 +433,7 @@ export class Component implements OnInit, OnDestroy {
         this.editorOptions = this.createEditorOptions();
         this.loadCachedNotes(true);
         window.addEventListener('notedown:select-note', this.handleSelectNote);
+        window.addEventListener('notedown:create-note', this.handleCreateNote);
         window.addEventListener('notedown:notes-changed', this.handleNotesChanged);
         window.addEventListener('notedown:settings-changed', this.handleSettingsChanged);
         window.addEventListener('notedown:startup-sync-status', this.handleStartupSyncStatus);
@@ -397,6 +449,7 @@ export class Component implements OnInit, OnDestroy {
 
     public ngOnDestroy() {
         window.removeEventListener('notedown:select-note', this.handleSelectNote);
+        window.removeEventListener('notedown:create-note', this.handleCreateNote);
         window.removeEventListener('notedown:notes-changed', this.handleNotesChanged);
         window.removeEventListener('notedown:settings-changed', this.handleSettingsChanged);
         window.removeEventListener('notedown:startup-sync-status', this.handleStartupSyncStatus);
@@ -411,17 +464,20 @@ export class Component implements OnInit, OnDestroy {
         if (this.foldingDisposable) this.foldingDisposable.dispose();
         this.clearScheduledEditorRestore();
         this.disposeEditorSelectionTracking();
+        this.disposeEditorContentBinding();
         this.clearScheduledStyleFold();
         this.clearScheduledSyncUpload();
         this.disposeEditorHoverHandlers();
         this.disposeDiffEditor();
     }
 
-    public createNote() {
+    public createNote(requestedFolder = '') {
+        this.prepareEditorNoteSwitch();
+        const mutationGeneration = ++this.notesMutationGeneration;
         const now = Date.now();
-        const folder = this.newNoteFolder();
+        const folder = requestedFolder && requestedFolder !== 'all' ? requestedFolder : this.newNoteFolder();
         const note: NoteItem = {
-            id: `note-${Date.now()}`,
+            id: this.createNoteId(),
             icon: 'N',
             title: '새 노트',
             tags: ['draft'],
@@ -437,14 +493,23 @@ export class Component implements OnInit, OnDestroy {
         };
         this.notes = [note, ...this.notes];
         this.activeNote = note;
-        this.persist(true);
+        this.hasUnsavedChanges = true;
+        const fileSave = this.persist(true);
+        if (fileSave) {
+            void fileSave.then((result: any) => {
+                this.completeLocalSave(note.id, mutationGeneration, Boolean(result?.ok));
+            });
+        } else {
+            this.completeLocalSave(note.id, mutationGeneration, true);
+        }
         this.refreshPreview();
+        this.bindEditorToActiveNoteSoon(note.id);
         if (this.isAndroidPlatform()) this.viewMode = 'preview';
         else if (!this.showSyncConflictViewer()) this.focusEditorSoon('first-line-end');
     }
 
-    public handleBodyChange(nextBody: string) {
-        if (!this.hasSelectedNote) return;
+    public handleBodyChange(nextBody: string, noteId = this.activeNote?.id || '') {
+        if (!this.hasSelectedNote || !noteId || this.activeNote.id !== noteId) return;
 
         const body = typeof nextBody === 'string' ? nextBody : '';
         if (this.activeNote.body === body) return;
@@ -465,8 +530,10 @@ export class Component implements OnInit, OnDestroy {
         const now = Date.now();
         this.activeNote.updatedAt = this.nowLabel(new Date(now));
         this.activeNote.updatedAtMs = now;
+        this.notesMutationGeneration++;
         this.refreshPreview();
         this.hasUnsavedChanges = true;
+        this.emitActiveNoteBodyChanged();
         if (saveImmediately) {
             void this.saveNow(true);
             return;
@@ -508,17 +575,36 @@ export class Component implements OnInit, OnDestroy {
         if (!this.hasSelectedNote || this.saveBusy) return;
         this.saveBusy = true;
         this.requestViewUpdate();
+
+        this.clearScheduledSyncUpload();
+        this.markActiveNoteSaved();
+        const syncNoteId = this.activeNote.id;
+        const mutationGeneration = this.notesMutationGeneration;
+        let localSaved = false;
         try {
-            this.clearScheduledSyncUpload();
-            this.markActiveNoteSaved();
-            const syncNoteId = this.activeNote.id;
             const fileSave = this.persist(emitChange);
-            if (fileSave) await fileSave;
-            if (emitChange) await this.uploadNoteToSyncServer(syncNoteId);
+            if (fileSave) {
+                const result = await fileSave;
+                localSaved = Boolean(result?.ok);
+            } else {
+                localSaved = true;
+            }
+            this.completeLocalSave(syncNoteId, mutationGeneration, localSaved);
         } finally {
             this.saveBusy = false;
             this.requestViewUpdate();
         }
+
+        if (emitChange && localSaved) {
+            void this.uploadNoteToSyncServer(syncNoteId);
+        }
+    }
+
+    private completeLocalSave(noteId: string, mutationGeneration: number, ok: boolean) {
+        if (!ok || this.activeNote?.id !== noteId || this.notesMutationGeneration !== mutationGeneration) return;
+        this.hasUnsavedChanges = false;
+        this.savedAt = this.nowLabel();
+        this.requestViewUpdate();
     }
 
     public setMode(mode: ViewMode) {
@@ -621,16 +707,6 @@ export class Component implements OnInit, OnDestroy {
         const target = event.target as HTMLElement | null;
         if (!target) return;
 
-        const taskCheckbox = target.closest('input[data-task-line]') as HTMLInputElement | null;
-        if (taskCheckbox) {
-            const lineIndex = Number(taskCheckbox.dataset['taskLine']);
-            if (Number.isFinite(lineIndex)) {
-                event.preventDefault();
-                this.toggleTaskLine(lineIndex, taskCheckbox.checked);
-            }
-            return;
-        }
-
         const taskControl = target.closest('[data-task-line]') as HTMLElement | null;
         if (taskControl) {
             const lineIndex = Number(taskControl.dataset['taskLine']);
@@ -675,7 +751,54 @@ export class Component implements OnInit, OnDestroy {
         if (event.type !== 'init' && event.type !== 're-init') return;
         this.editor = event.editor;
         this.configureMarkdownEditor();
+        this.bindEditorToActiveNoteSoon(this.activeNote?.id || '');
         this.restoreEditorSelectionSoon(this.pendingEditorSelectionState || this.lastEditorSelectionState, true);
+    }
+
+    private prepareEditorNoteSwitch() {
+        this.disposeEditorContentBinding();
+    }
+
+    private bindEditorToActiveNoteSoon(noteId: string, attempt = 0, epoch = this.editorContentBindingEpoch) {
+        if (!noteId || this.isAndroidPlatform()) return;
+        if (this.editorContentBindingTimeout != null) window.clearTimeout(this.editorContentBindingTimeout);
+        this.editorContentBindingTimeout = window.setTimeout(() => {
+            this.editorContentBindingTimeout = null;
+            if (epoch !== this.editorContentBindingEpoch || this.activeNote?.id !== noteId || !this.editor) return;
+
+            const editorAtBinding = this.editor;
+            const modelAtBinding = editorAtBinding.getModel?.();
+            if (!modelAtBinding) return;
+            const expectedBody = this.activeNote?.body || '';
+            if (modelAtBinding.getValue?.() !== expectedBody) {
+                if (attempt < 120) this.bindEditorToActiveNoteSoon(noteId, attempt + 1, epoch);
+                return;
+            }
+
+            this.editorContentDisposable?.dispose?.();
+            this.editorBoundNoteId = noteId;
+            this.editorContentDisposable = editorAtBinding.onDidChangeModelContent?.(() => {
+                if (
+                    epoch !== this.editorContentBindingEpoch
+                    || this.editorBoundNoteId !== noteId
+                    || this.activeNote?.id !== noteId
+                    || this.editor !== editorAtBinding
+                    || editorAtBinding.getModel?.() !== modelAtBinding
+                ) return;
+                this.handleBodyChange(modelAtBinding.getValue?.() || '', noteId);
+            });
+        }, attempt === 0 ? 0 : 16);
+    }
+
+    private disposeEditorContentBinding() {
+        this.editorContentBindingEpoch++;
+        if (this.editorContentBindingTimeout != null) {
+            window.clearTimeout(this.editorContentBindingTimeout);
+            this.editorContentBindingTimeout = null;
+        }
+        this.editorContentDisposable?.dispose?.();
+        this.editorContentDisposable = null;
+        this.editorBoundNoteId = '';
     }
 
     public modeButtonClass(mode: ViewMode) {
@@ -1164,11 +1287,35 @@ export class Component implements OnInit, OnDestroy {
         return 'application/octet-stream';
     }
 
+    public deleteAttachment(attachment: NoteAttachment, event?: Event) {
+        event?.preventDefault();
+        event?.stopPropagation();
+        if (!attachment?.relativePath || !this.hasSelectedNote) return;
+        const confirmed = window.confirm(`'${attachment.fileName || '첨부 파일'}'을 삭제할까요?`);
+        if (!confirmed) return;
+
+        const identity = String(attachment.id || attachment.relativePath || '').trim();
+        if (!identity) return;
+        this.deletedAttachmentIds.add(identity);
+        this.activeNote.attachments = this.noteAttachments().filter(item => !(
+            item === attachment
+            || (Boolean(attachment.id) && item.id === attachment.id)
+            || item.relativePath === attachment.relativePath
+        ));
+        this.attachmentDataUrlCache.delete(attachment.relativePath);
+        this.attachmentPdfDataUrlCache.delete(attachment.relativePath);
+        this.rebuildAttachmentPickerItems();
+        this.setAttachmentMessage('첨부 파일을 삭제했습니다.', 'success');
+        this.touchNote(true);
+    }
+
     private upsertActiveNoteAttachment(attachment: NoteAttachment) {
         if (!attachment?.relativePath) return;
         const attachments = this.noteAttachments();
         const index = attachments.findIndex(item => item.relativePath === attachment.relativePath || (attachment.id && item.id === attachment.id));
         const nextAttachment = this.normalizeAttachment(attachment, this.activeNote?.relativePath || '');
+        if (nextAttachment.id) this.deletedAttachmentIds.delete(nextAttachment.id);
+        this.deletedAttachmentIds.delete(nextAttachment.relativePath);
         if (nextAttachment.relativePath) this.attachmentDataUrlCache.delete(nextAttachment.relativePath);
         if (nextAttachment.relativePath) this.attachmentPdfDataUrlCache.delete(nextAttachment.relativePath);
         if (index >= 0) {
@@ -1217,6 +1364,7 @@ export class Component implements OnInit, OnDestroy {
             id: attachment?.id || attachment?.attachmentId || '',
             fileName: String(attachment?.fileName || this.basename(attachment?.relativePath || '첨부 파일')),
             relativePath: String(attachment?.relativePath || ''),
+            storagePath: String(attachment?.storagePath || ''),
             noteRelativePath: attachment?.noteRelativePath || noteRelativePath || this.activeNote?.relativePath || '',
             mimeType: attachment?.mimeType || '',
             size: Number.isFinite(attachment?.size) ? Number(attachment.size) : undefined,
@@ -1574,14 +1722,26 @@ export class Component implements OnInit, OnDestroy {
         }));
     }
 
+    private emitActiveNoteBodyChanged() {
+        if (!this.hasSelectedNote) return;
+        window.dispatchEvent(new CustomEvent('notedown:note-body-changed', {
+            detail: {
+                noteId: this.activeNote.id,
+                body: this.activeNote.body || ''
+            }
+        }));
+    }
+
     private markActiveNoteSaved() {
         if (!this.hasSelectedNote || this.activeNote.status !== 'draft') return;
         this.activeNote.status = 'active';
+        this.notesMutationGeneration++;
     }
 
     private selectNoteById(id?: string | null, options: { restoreEditorState?: EditorSelectionState | null } = {}) {
         const note = id === '' ? null : (id ? this.notes.find(item => item.id === id) || this.notes[0] : this.notes[0]);
         if (!note) {
+            this.prepareEditorNoteSwitch();
             this.activeNote = this.emptyNote();
             this.editingTitle = false;
             this.titleDraft = '';
@@ -1600,6 +1760,7 @@ export class Component implements OnInit, OnDestroy {
         }
         const isSameNote = Boolean(this.activeNote?.id && this.activeNote.id === note.id);
         const restoreEditorState = options.restoreEditorState || (isSameNote ? this.captureEditorSelectionState() : null);
+        if (!isSameNote) this.prepareEditorNoteSwitch();
         this.activeNote = note;
         this.editingTitle = false;
         this.titleDraft = note.title || '';
@@ -1609,6 +1770,7 @@ export class Component implements OnInit, OnDestroy {
         if (this.isAndroidPlatform() && !isSameNote) this.viewMode = 'preview';
         localStorage.setItem(this.activeNoteKey, note.id);
         this.refreshPreview();
+        this.bindEditorToActiveNoteSoon(note.id);
         if (this.showSyncConflictViewer()) {
             this.renderSyncConflictDiffSoon();
         } else {
@@ -1647,8 +1809,8 @@ export class Component implements OnInit, OnDestroy {
     }
 
     private async refreshNotesFromStorage(selectStored: boolean) {
-        await this.loadNotes(selectStored);
-        this.requestViewUpdate();
+        const didApply = await this.loadNotes(selectStored);
+        if (didApply) this.requestViewUpdate();
     }
 
     private async runStartupSyncOrApplyStoredConflict() {
@@ -1678,12 +1840,16 @@ export class Component implements OnInit, OnDestroy {
     }
 
     private async loadNotes(selectStored: boolean) {
+        const loadGeneration = ++this.notesLoadGeneration;
+        const mutationGeneration = this.notesMutationGeneration;
         const fileBacked = this.usesFileStorage();
         const fileNotes = await this.loadFileNotes();
+        if (!this.canApplyNotesLoad(loadGeneration, mutationGeneration)) return false;
         if (fileNotes) {
             this.notes = fileNotes;
+            localStorage.setItem(this.storageKey, JSON.stringify(this.notes));
             if (selectStored) this.selectNoteById(localStorage.getItem(this.activeNoteKey));
-            return;
+            return true;
         }
 
         try {
@@ -1698,17 +1864,21 @@ export class Component implements OnInit, OnDestroy {
         }
 
         if (selectStored) this.selectNoteById(localStorage.getItem(this.activeNoteKey));
+        return true;
+    }
+
+    private canApplyNotesLoad(loadGeneration: number, mutationGeneration: number) {
+        return loadGeneration === this.notesLoadGeneration
+            && mutationGeneration === this.notesMutationGeneration;
     }
 
     private persist(emitChange: boolean) {
         localStorage.setItem(this.storageKey, JSON.stringify(this.notes));
-        this.hasUnsavedChanges = false;
         if (this.hasSelectedNote) {
             localStorage.setItem(this.activeNoteKey, this.activeNote.id);
         } else {
             localStorage.removeItem(this.activeNoteKey);
         }
-        this.savedAt = this.nowLabel();
         const fileSave = this.persistFileNotes();
         if (emitChange) {
             if (fileSave) {
@@ -1736,9 +1906,7 @@ export class Component implements OnInit, OnDestroy {
         try {
             const result = await api.loadNotes({ storagePath });
             if (!result?.ok || !Array.isArray(result.notes)) return null;
-            const notes = result.notes.map((note: any, index: number) => this.normalizeNote(note, index));
-            localStorage.setItem(this.storageKey, JSON.stringify(notes));
-            return notes;
+            return result.notes.map((note: any, index: number) => this.normalizeNote(note, index));
         } catch (error) {
             return null;
         }
@@ -1749,7 +1917,131 @@ export class Component implements OnInit, OnDestroy {
         const storagePath = this.storagePath();
         if (!api?.saveNotes || !storagePath) return null;
 
-        return api.saveNotes({ storagePath, notes: this.notes }).catch(() => null);
+        const save = async () => {
+            const notes = this.notes.map(note => ({
+                ...note,
+                attachments: this.noteAttachments(note).map(attachment => ({ ...attachment }))
+            }));
+            const deletedAttachmentIds = Array.from(this.deletedAttachmentIds);
+            try {
+                const result = await api.saveNotes({ storagePath, notes, deletedAttachmentIds });
+                if (result?.ok) {
+                    for (const identity of deletedAttachmentIds) this.deletedAttachmentIds.delete(identity);
+                    if (Array.isArray(result.savedNotes)) {
+                        this.mergeCanonicalSavedNotes(result.savedNotes);
+                    }
+                }
+                return result;
+            } catch (error) {
+                return null;
+            }
+        };
+        const queued = this.fileSaveTail.then(save, save);
+        this.fileSaveTail = queued.then(() => undefined, () => undefined);
+        return queued;
+    }
+
+    private mergeUnsavedNoteWithCanonical(canonical: NoteItem, unsaved: NoteItem): NoteItem {
+        return {
+            ...canonical,
+            icon: unsaved.icon,
+            title: unsaved.title,
+            body: unsaved.body,
+            tags: [...(unsaved.tags || [])],
+            status: unsaved.status,
+            updatedAt: unsaved.updatedAt,
+            updatedAtMs: unsaved.updatedAtMs,
+            titleManuallyEdited: unsaved.titleManuallyEdited,
+            attachments: this.mergeUnsavedAttachmentsWithCanonical(
+                canonical.attachments || [],
+                unsaved.attachments || []
+            )
+        };
+    }
+
+    private mergeUnsavedAttachmentsWithCanonical(
+        canonicalAttachments: NoteAttachment[],
+        unsavedAttachments: NoteAttachment[]
+    ) {
+        const byId = new Map<string, NoteAttachment>();
+        const byRelativePath = new Map<string, NoteAttachment>();
+        for (const attachment of canonicalAttachments) {
+            if (attachment.id) byId.set(attachment.id, attachment);
+            if (attachment.relativePath) byRelativePath.set(attachment.relativePath, attachment);
+        }
+
+        const seenIds = new Set<string>();
+        const seenRelativePaths = new Set<string>();
+        const merged = unsavedAttachments.map(attachment => {
+            const canonical = (attachment.id ? byId.get(attachment.id) : null)
+                || byRelativePath.get(attachment.relativePath);
+            const next = !canonical ? attachment : {
+                ...attachment,
+                fileName: canonical.fileName || attachment.fileName,
+                relativePath: canonical.relativePath || attachment.relativePath,
+                storagePath: canonical.storagePath || attachment.storagePath,
+                noteRelativePath: canonical.noteRelativePath || attachment.noteRelativePath
+            };
+            if (next.id) seenIds.add(next.id);
+            if (next.relativePath) seenRelativePaths.add(next.relativePath);
+            return next;
+        });
+        for (const attachment of canonicalAttachments) {
+            if (
+                (attachment.id && seenIds.has(attachment.id))
+                || (attachment.relativePath && seenRelativePaths.has(attachment.relativePath))
+                || (attachment.id && this.deletedAttachmentIds.has(attachment.id))
+                || (attachment.relativePath && this.deletedAttachmentIds.has(attachment.relativePath))
+            ) continue;
+            merged.push(attachment);
+        }
+        return merged;
+    }
+
+    private mergeCanonicalSavedNotes(savedNotes: any[]) {
+        const byId = new Map<string, any>();
+        const byRelativePath = new Map<string, any>();
+        for (const savedNote of savedNotes) {
+            if (savedNote?.id) byId.set(String(savedNote.id), savedNote);
+            if (savedNote?.relativePath) byRelativePath.set(String(savedNote.relativePath), savedNote);
+        }
+
+        this.notes = this.notes.map(note => {
+            const savedNote = byId.get(note.id) || (note.relativePath ? byRelativePath.get(note.relativePath) : null);
+            if (!savedNote) return note;
+            return {
+                ...note,
+                fileName: savedNote.fileName || note.fileName,
+                relativePath: savedNote.relativePath || note.relativePath,
+                storagePath: savedNote.storagePath || note.storagePath,
+                attachments: this.mergeCanonicalAttachments(note.attachments || [], savedNote.attachments || [])
+            };
+        });
+
+        const activeId = this.activeNote?.id || '';
+        const canonicalActiveNote = activeId ? this.notes.find(note => note.id === activeId) : null;
+        if (canonicalActiveNote) this.activeNote = canonicalActiveNote;
+        localStorage.setItem(this.storageKey, JSON.stringify(this.notes));
+    }
+
+    private mergeCanonicalAttachments(attachments: NoteAttachment[], savedAttachments: any[]) {
+        const byId = new Map<string, any>();
+        const byRelativePath = new Map<string, any>();
+        for (const attachment of savedAttachments) {
+            if (attachment?.id) byId.set(String(attachment.id), attachment);
+            if (attachment?.relativePath) byRelativePath.set(String(attachment.relativePath), attachment);
+        }
+        return attachments.map(attachment => {
+            const saved = (attachment.id ? byId.get(attachment.id) : null) || byRelativePath.get(attachment.relativePath);
+            if (!saved) return attachment;
+            return {
+                ...attachment,
+                fileName: saved.fileName || attachment.fileName,
+                relativePath: saved.relativePath || attachment.relativePath,
+                storagePath: saved.storagePath || attachment.storagePath,
+                noteRelativePath: saved.noteRelativePath || attachment.noteRelativePath
+            };
+        });
     }
 
     private clearScheduledSyncUpload() {
@@ -1814,6 +2106,7 @@ export class Component implements OnInit, OnDestroy {
         if (sessionStorage.getItem(sessionKey)) return false;
         sessionStorage.setItem(sessionKey, 'running');
         this.storeStartupSyncResult({ ok: false, status: 'running' });
+        const startupMutationGeneration = this.notesMutationGeneration;
 
         try {
             const result = await api.runFull({
@@ -1823,7 +2116,10 @@ export class Component implements OnInit, OnDestroy {
                 storagePath: settings.storagePath
             });
             this.storeStartupSyncResult(result);
-            if (result?.ok || result?.status === 'conflict') {
+            if (
+                (result?.ok || result?.status === 'conflict')
+                && startupMutationGeneration === this.notesMutationGeneration
+            ) {
                 await this.reloadNotesAfterStartupSync();
             }
         } catch (error) {
@@ -1988,7 +2284,8 @@ export class Component implements OnInit, OnDestroy {
     private async reloadNotesAfterStartupSync() {
         const activeId = localStorage.getItem(this.activeNoteKey) || this.activeNote?.id || '';
         const editorState = this.captureEditorSelectionState();
-        await this.loadNotes(false);
+        const didApply = await this.loadNotes(false);
+        if (!didApply) return;
         this.selectNoteById(activeId, { restoreEditorState: editorState });
         this.emitNotesChanged();
         this.requestViewUpdate();
@@ -1997,7 +2294,8 @@ export class Component implements OnInit, OnDestroy {
     private async reloadNotesAfterSyncResolution() {
         const activeId = localStorage.getItem(this.activeNoteKey) || this.activeNote?.id || '';
         const editorState = this.captureEditorSelectionState();
-        await this.loadNotes(false);
+        const didApply = await this.loadNotes(false);
+        if (!didApply) return;
         this.selectNoteById(activeId, { restoreEditorState: editorState });
         this.emitNotesChanged();
     }
@@ -3243,8 +3541,25 @@ ${documentCss}
     }
 
     private renderMarkdownHtml(markdown: string, normalizeListIndent = false, pdfExport = false) {
-        const prepared = normalizeListIndent ? this.normalizeMarkdownListIndent(markdown) : markdown;
+        const taskNormalized = this.normalizeCompactTaskSyntax(markdown);
+        const prepared = normalizeListIndent ? this.normalizeMarkdownListIndent(taskNormalized) : taskNormalized;
         return this.addLinkTargets(this.converter.makeHtml(prepared), pdfExport);
+    }
+
+    private normalizeCompactTaskSyntax(markdown: string) {
+        let inCodeFence = false;
+        return markdown.split('\n').map(line => {
+            if (/^```/.test(line.trim())) {
+                inCodeFence = !inCodeFence;
+                return line;
+            }
+            if (inCodeFence) return line;
+
+            return line.replace(
+                /^([\t ]*(?:[-*+]|\d+[.)])[\t ]+)\[\]([\t ]+)/,
+                '$1[ ]$2'
+            );
+        }).join('\n');
     }
 
     private normalizeMarkdownListIndent(markdown: string) {
@@ -3355,7 +3670,7 @@ ${documentCss}
     }
 
     private markdownTaskLine(line: string) {
-        return /^[\t ]*(?:[-*+]|\d+[.)])[\t ]+\[[ xX]\][\t ]+(.+)$/.exec(line);
+        return /^[\t ]*(?:[-*+]|\d+[.)])[\t ]+\[[ xX]?\][\t ]+(.+)$/.exec(line);
     }
 
     private markdownTaskLineLabel(line: string) {
@@ -3363,7 +3678,7 @@ ${documentCss}
     }
 
     private markdownCellVariant(line: string): PreviewBlock['variant'] {
-        if (/^[\t ]*(?:[-*+]|\d+[.)])[\t ]+\[[ xX]\][\t ]+/.test(line)) return 'task';
+        if (/^[\t ]*(?:[-*+]|\d+[.)])[\t ]+\[[ xX]?\][\t ]+/.test(line)) return 'task';
         if (/^\s{0,3}#{1,6}\s+/.test(line)) return 'heading';
         if (/^[\t ]*(?:[-*+]|\d+[.)])[\t ]+/.test(line)) return 'list';
         return 'text';
@@ -3395,15 +3710,20 @@ ${documentCss}
         const lines = this.activeNote.body.split('\n');
         if (!lines[lineIndex]) return;
 
-        lines[lineIndex] = lines[lineIndex].replace(/^(\s*(?:[-*+]|\d+[.)])\s+\[)[ xX](\]\s+)/, `$1${checked ? 'x' : ' '}$2`);
+        const currentLine = lines[lineIndex];
+        const nextLine = currentLine.replace(/^(\s*(?:[-*+]|\d+[.)])\s+\[)[ xX]?(\]\s+)/, `$1${checked ? 'x' : ' '}$2`);
+        if (nextLine === currentLine) return;
+
+        lines[lineIndex] = nextLine;
         this.activeNote.body = lines.join('\n');
         this.touchNote();
+        this.requestViewUpdate();
     }
 
     private isTaskLineChecked(lineIndex: number) {
         const line = this.activeNote?.body.split('\n')[lineIndex] || '';
-        const task = /^[\t ]*(?:[-*+]|\d+[.)])[\t ]+\[([ xX])\][\t ]+/.exec(line);
-        return task ? task[1].toLowerCase() === 'x' : false;
+        const task = /^[\t ]*(?:[-*+]|\d+[.)])[\t ]+\[([ xX]?)\][\t ]+/.exec(line);
+        return task ? (task[1] || '').toLowerCase() === 'x' : false;
     }
 
     private addLinkTargets(html: string, pdfExport = false) {
@@ -3838,6 +4158,12 @@ ${documentCss}
         ];
     }
 
+    private createNoteId() {
+        const randomUuid = (globalThis.crypto as any)?.randomUUID?.();
+        if (randomUuid) return `note-${randomUuid}`;
+        return `note-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+    }
+
     private emptyNote(): NoteItem {
         return {
             id: '',
@@ -3904,6 +4230,7 @@ ${documentCss}
             workspaceName: note?.workspaceName,
             fileName: note?.fileName,
             relativePath: note?.relativePath,
+            storagePath: note?.storagePath,
             titleManuallyEdited: Boolean(note?.titleManuallyEdited),
             attachments: Array.isArray(note?.attachments)
                 ? note.attachments.map((attachment: any) => this.normalizeAttachment(attachment, note?.relativePath || '')).filter((attachment: NoteAttachment) => attachment.relativePath && !attachment.deleted)

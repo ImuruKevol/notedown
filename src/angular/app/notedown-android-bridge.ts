@@ -10,9 +10,70 @@ declare global {
 const METADATA_FILE = 'metadata.json';
 const METADATA_DB_FILE = 'metadata.db';
 const SYNC_STATE_FILE = '.notedown-sync.json';
-const SYNC_REQUEST_TIMEOUT_MS = 15000;
+const SYNC_REQUEST_TIMEOUT_MS = 60000;
+const SYNC_RETRY_ENDPOINTS = new Set(['/api/sync/plan', '/api/sync/file', '/api/sync/attachment']);
 const IMPORTED_WORKSPACE_ID = '_imported';
 const UNFILED_WORKSPACE_ID = 'unfiled';
+const syncOperationTails = new Map<string, Promise<any>>();
+const storageOperationTails = new Map<string, Promise<any>>();
+const storageMutationGenerations = new Map<string, number>();
+
+function storageMutationKey(storagePath?: string) {
+    return String(storagePath || '~/Documents/Notedown Notes').trim();
+}
+
+function storageMutationGeneration(storagePath?: string) {
+    return storageMutationGenerations.get(storageMutationKey(storagePath)) || 0;
+}
+
+function runStorageOperation(payload: any, task: () => Promise<any>) {
+    const key = storageMutationKey(payload?.storagePath);
+    const previous = storageOperationTails.get(key) || Promise.resolve();
+    const current = previous.catch(() => undefined).then(task);
+    storageOperationTails.set(key, current);
+    return current.finally(() => {
+        if (storageOperationTails.get(key) === current) storageOperationTails.delete(key);
+    });
+}
+
+function runStorageMutation(payload: any, task: () => Promise<any>) {
+    const key = storageMutationKey(payload?.storagePath);
+    return runStorageOperation(payload, async () => {
+        storageMutationGenerations.set(key, (storageMutationGenerations.get(key) || 0) + 1);
+        return task();
+    });
+}
+
+function assertStorageGeneration(storagePath: string, expectedGeneration?: number) {
+    if (expectedGeneration == null || storageMutationGeneration(storagePath) === expectedGeneration) return;
+    const error = new Error('동기화 중 로컬 저장소가 변경되었습니다.') as any;
+    error.code = 'local_storage_changed_during_sync';
+    throw error;
+}
+
+function runSyncOperation(payload: any, task: () => Promise<any>) {
+    const key = storageMutationKey(payload?.storagePath);
+    const previous = syncOperationTails.get(key) || Promise.resolve();
+    const current = previous.catch(() => undefined).then(task);
+    syncOperationTails.set(key, current);
+    return current.finally(() => {
+        if (syncOperationTails.get(key) === current) syncOperationTails.delete(key);
+    });
+}
+
+function stableAttachmentId(relativePath: string) {
+    const value = String(relativePath || 'attachment');
+    const seeds = [0x811c9dc5, 0x9e3779b9, 0x85ebca6b, 0xc2b2ae35];
+    const parts = seeds.map(seed => {
+        let hash = seed >>> 0;
+        for (let index = 0; index < value.length; index++) {
+            hash ^= value.charCodeAt(index);
+            hash = Math.imul(hash, 0x01000193) >>> 0;
+        }
+        return hash.toString(16).padStart(8, '0');
+    });
+    return `att-${parts.join('')}`;
+}
 
 function isDeletedFlag(value: unknown) {
     return value === true || value === 'true';
@@ -55,7 +116,7 @@ function isSystemRelativePath(relativePath?: string) {
     return [METADATA_FILE, METADATA_DB_FILE, SYNC_STATE_FILE].includes(firstPart);
 }
 
-async function syncRequest(serverUrl: string | undefined, endpoint: string, options: any = {}) {
+async function syncRequestOnce(serverUrl: string | undefined, endpoint: string, options: any = {}) {
     const url = new URL(endpoint, `${normalizeServerUrl(serverUrl)}/`).toString();
     const headers: Record<string, string> = {
         Accept: 'application/json',
@@ -105,6 +166,21 @@ async function syncRequest(serverUrl: string | undefined, endpoint: string, opti
         return data;
     } finally {
         window.clearTimeout(timeout);
+    }
+}
+
+async function syncRequest(serverUrl: string | undefined, endpoint: string, options: any = {}) {
+    const method = String(options.method || (options.body == null ? 'GET' : 'POST')).toUpperCase();
+    const retryableRequest = method === 'GET' || method === 'HEAD' || SYNC_RETRY_ENDPOINTS.has(endpoint);
+
+    try {
+        return await syncRequestOnce(serverUrl, endpoint, options);
+    } catch (error: any) {
+        const status = Number(error?.status || 0);
+        const transientFailure = !status || status === 408 || status === 429 || status >= 500 || error?.name === 'AbortError';
+        if (!retryableRequest || !transientFailure) throw error;
+        await new Promise(resolve => window.setTimeout(resolve, 300));
+        return syncRequestOnce(serverUrl, endpoint, options);
     }
 }
 
@@ -434,7 +510,7 @@ function normalizeAttachmentMetadata(attachment: any = {}, noteRelativePath = ''
     const storagePath = normalizeRelativePath(attachment.storagePath || relativePath);
     const fileName = attachment.fileName || relativePath.split('/').pop() || 'attachment';
     return {
-        id: attachment.id || attachment.attachmentId || `att-${relativePath.replace(/[^a-z0-9]/gi, '').slice(0, 16)}`,
+        id: attachment.id || attachment.attachmentId || stableAttachmentId(relativePath),
         fileName,
         relativePath,
         storagePath,
@@ -540,8 +616,14 @@ async function loadStorage(native: NativeBridge, storagePath: string) {
     };
 }
 
-async function saveStorageNotes(native: NativeBridge, storagePath: string, notes: any[]) {
-    return native.saveNotes({ storagePath, notes });
+async function saveStorageNotes(
+    native: NativeBridge,
+    storagePath: string,
+    notes: any[],
+    deletedNoteIds: string[] = [],
+    deletedAttachmentIds: string[] = []
+) {
+    return native.saveNotes({ storagePath, notes, deletedNoteIds, deletedAttachmentIds });
 }
 
 function upsertNote(notes: any[], note: any) {
@@ -747,7 +829,7 @@ async function createSyncPlan(args: any = {}) {
     return { ok: true, ...response, summary: summarizePlan(response.plan) };
 }
 
-async function uploadLocalFile(args: any = {}, relativePathOverride = '') {
+async function prepareLocalFileUpload(args: any = {}, relativePathOverride = '') {
     const { native, storagePath, serverUrl, token, clientId } = syncConfig(args);
     const { metadata } = await loadStorage(native, storagePath);
     const syncState = await readSyncState(native, storagePath);
@@ -782,12 +864,33 @@ async function uploadLocalFile(args: any = {}, relativePathOverride = '') {
         body.updatedAtMs = Number(note?.updatedAtMs) || Number(file.updatedAtMs) || Date.now();
     }
 
-    const response = await syncRequest(serverUrl, '/api/sync/file', { token, body });
-    if (response.manifest) await writeSyncStateFromManifest(native, storagePath, response.manifest, syncState);
+    return { native, storagePath, serverUrl, token, syncState, body };
+}
+
+async function sendPreparedSyncUpload(prepared: any, endpoint: string, writeState = true) {
+    const response = await syncRequest(prepared.serverUrl, endpoint, {
+        token: prepared.token,
+        body: prepared.body
+    });
+    if (writeState && response.manifest) {
+        await writeSyncStateFromManifest(
+            prepared.native,
+            prepared.storagePath,
+            response.manifest,
+            prepared.syncState
+        );
+    }
     return { ok: response.status === 'ok', ...response };
 }
 
-async function uploadLocalAttachment(args: any = {}, item: any = {}) {
+async function uploadLocalFile(args: any = {}, relativePathOverride = '') {
+    return sendPreparedSyncUpload(
+        await prepareLocalFileUpload(args, relativePathOverride),
+        '/api/sync/file'
+    );
+}
+
+async function prepareLocalAttachmentUpload(args: any = {}, item: any = {}) {
     const { native, storagePath, serverUrl, token, clientId } = syncConfig(args);
     const { metadata } = await loadStorage(native, storagePath);
     const syncState = await readSyncState(native, storagePath);
@@ -849,51 +952,116 @@ async function uploadLocalAttachment(args: any = {}, item: any = {}) {
         }
     }
 
-    const response = await syncRequest(serverUrl, '/api/sync/attachment', { token, body });
-    if (response.manifest) await writeSyncStateFromManifest(native, storagePath, response.manifest, syncState);
-    return { ok: response.status === 'ok', ...response };
+    return { native, storagePath, serverUrl, token, syncState, body };
+}
+
+async function uploadLocalAttachment(args: any = {}, item: any = {}) {
+    return sendPreparedSyncUpload(
+        await prepareLocalAttachmentUpload(args, item),
+        '/api/sync/attachment'
+    );
 }
 
 async function uploadLocalNoteWithAttachments(args: any = {}) {
-    const noteResult = await uploadLocalFile(args);
-    const note = args.note || null;
-    const attachments = Array.isArray(note?.attachments) ? note.attachments : [];
-    const deleting = isDeletedFlag(args.deleted);
-    const uploadedAttachments = [];
-    const attachmentConflicts = [];
+    const { storagePath } = syncConfig(args);
+    const snapshot: any = await runStorageOperation({ storagePath }, async () => {
+        const storageGeneration = storageMutationGeneration(storagePath);
+        const noteUpload = await prepareLocalFileUpload(args);
+        const note = noteUpload.body.note || args.note || null;
+        const attachments = Array.isArray(note?.attachments)
+            ? note.attachments.map((attachment: any) => ({ ...attachment }))
+            : [];
+        const deleting = isDeletedFlag(args.deleted);
+        const attachmentUploads: any[] = [];
 
-    if (!deleting && noteResult.status !== 'conflict') {
-        for (const attachment of attachments) {
-            if (!attachment?.relativePath || isDeletedFlag(attachment.deleted)) continue;
-            const result = await uploadLocalAttachment(args, {
-                ...attachment,
-                attachment,
-                noteRelativePath: attachment.noteRelativePath || note.relativePath || relativePathForNote(note)
-            });
-            if (result.status === 'conflict') attachmentConflicts.push(result.attachment || result.file);
-            else uploadedAttachments.push(result.attachment);
-        }
-    }
-
-    if (deleting) {
         for (const attachment of attachments) {
             if (!attachment?.relativePath) continue;
-            const result = await uploadLocalAttachment({ ...args, deleted: true }, {
-                ...attachment,
-                attachment,
-                noteRelativePath: attachment.noteRelativePath || note.relativePath || relativePathForNote(note)
-            });
+            if (!deleting && isDeletedFlag(attachment.deleted)) continue;
+            attachmentUploads.push(await prepareLocalAttachmentUpload(
+                deleting ? { ...args, deleted: true } : args,
+                {
+                    ...attachment,
+                    attachment,
+                    noteRelativePath: attachment.noteRelativePath
+                        || note?.relativePath
+                        || relativePathForNote(note)
+                }
+            ));
+        }
+        if (storageMutationGeneration(storagePath) !== storageGeneration) {
+            return { storageChanged: true, storageGeneration };
+        }
+        return { storageGeneration, noteUpload, attachmentUploads, deleting };
+    });
+
+    if (
+        snapshot.storageChanged
+        || storageMutationGeneration(storagePath) !== snapshot.storageGeneration
+    ) {
+        return localStorageChangedDuringSyncResult({ plan: {} }, null, false);
+    }
+
+    const uploadedAttachments: any[] = [];
+    const attachmentConflicts: any[] = [];
+    let latestManifest: any = null;
+    let didSend = false;
+    const sendSnapshot = async (prepared: any, endpoint: string) => {
+        if (latestManifest?.serverRevision != null) {
+            prepared.body.baseRevision = Number(latestManifest.serverRevision) || prepared.body.baseRevision;
+        }
+        didSend = true;
+        const result = await sendPreparedSyncUpload(prepared, endpoint, false);
+        if (result.manifest) latestManifest = result.manifest;
+        return result;
+    };
+
+    const noteResult = await sendSnapshot(snapshot.noteUpload, '/api/sync/file');
+
+    if (!snapshot.deleting && noteResult.status !== 'conflict') {
+        for (const prepared of snapshot.attachmentUploads) {
+            const result = await sendSnapshot(prepared, '/api/sync/attachment');
             if (result.status === 'conflict') attachmentConflicts.push(result.attachment || result.file);
             else uploadedAttachments.push(result.attachment);
         }
     }
 
-    return {
+    if (snapshot.deleting && noteResult.status !== 'conflict' && noteResult.ok) {
+        for (const prepared of snapshot.attachmentUploads) {
+            const result = await sendSnapshot(prepared, '/api/sync/attachment');
+            if (result.status === 'conflict') attachmentConflicts.push(result.attachment || result.file);
+            else uploadedAttachments.push(result.attachment);
+        }
+    } else if (snapshot.deleting && noteResult.status === 'conflict') {
+        attachmentConflicts.push(noteResult.file);
+    }
+
+    const uploadResult = {
         ...noteResult,
         ok: Boolean(noteResult.ok && attachmentConflicts.length === 0),
         uploadedAttachments,
         attachmentConflicts
     };
+    const stateApplied = await runStorageOperation({ storagePath }, async () => {
+        if (storageMutationGeneration(storagePath) !== snapshot.storageGeneration) return false;
+        if (latestManifest) {
+            await writeSyncStateFromManifest(
+                snapshot.noteUpload.native,
+                storagePath,
+                latestManifest,
+                snapshot.noteUpload.syncState
+            );
+        }
+        return true;
+    });
+    if (!stateApplied) {
+        return {
+            ...uploadResult,
+            ...localStorageChangedDuringSyncResult({ plan: {} }, null, didSend),
+            uploadedAttachments,
+            attachmentConflicts
+        };
+    }
+    return uploadResult;
 }
 
 function encodeRelativePathForUrl(relativePath: string) {
@@ -912,14 +1080,31 @@ function binaryPayloadAsBase64(payload: any = {}) {
     return encodeUtf8Base64(String(payload.content || ''));
 }
 
-async function downloadServerFile(args: any = {}, item: any) {
+async function downloadServerFile(
+    args: any = {},
+    item: any,
+    payloadOverride?: any,
+    expectedStorageGeneration?: number
+) {
     const { native, storagePath, serverUrl, token } = syncConfig(args);
     const relativePath = normalizeRelativePath(item.relativePath);
-    const payload = await syncRequest(serverUrl, `/api/files/${encodeRelativePathForUrl(relativePath)}`, { token });
+    const payload = payloadOverride === undefined
+        ? await syncRequest(serverUrl, `/api/files/${encodeRelativePathForUrl(relativePath)}`, { token })
+        : payloadOverride;
+    assertStorageGeneration(storagePath, expectedStorageGeneration);
     const { notes } = await loadStorage(native, storagePath);
+    assertStorageGeneration(storagePath, expectedStorageGeneration);
 
     if (isDeletedFlag(payload.deleted)) {
-        await saveStorageNotes(native, storagePath, removeNote(notes, relativePath));
+        const deletedNote = notes.find((note: any) =>
+            note?.relativePath && normalizeRelativePath(note.relativePath) === relativePath
+        );
+        await saveStorageNotes(
+            native,
+            storagePath,
+            removeNote(notes, relativePath),
+            deletedNote?.id ? [String(deletedNote.id)] : []
+        );
         return { relativePath, deleted: true };
     }
 
@@ -949,19 +1134,37 @@ async function downloadServerFile(args: any = {}, item: any) {
         workspaceName: item.note?.workspaceName || item.workspace?.name || existing?.workspaceName || item.workspace?.id || UNFILED_WORKSPACE_ID
     };
     upsertNote(notes, note);
+    assertStorageGeneration(storagePath, expectedStorageGeneration);
     await saveStorageNotes(native, storagePath, notes);
     return { relativePath, deleted: false };
 }
 
-async function downloadServerAttachment(args: any = {}, item: any) {
+async function downloadServerAttachment(
+    args: any = {},
+    item: any,
+    payloadOverride?: any,
+    expectedStorageGeneration?: number
+) {
     const { native, storagePath, serverUrl, token } = syncConfig(args);
     const relativePath = normalizeRelativePath(item.relativePath);
-    const payload = await syncRequest(serverUrl, `/api/attachments/${encodeRelativePathForUrl(relativePath)}`, { token });
+    const payload = payloadOverride === undefined
+        ? await syncRequest(serverUrl, `/api/attachments/${encodeRelativePathForUrl(relativePath)}`, { token })
+        : payloadOverride;
+    assertStorageGeneration(storagePath, expectedStorageGeneration);
     const { notes } = await loadStorage(native, storagePath);
+    assertStorageGeneration(storagePath, expectedStorageGeneration);
 
     if (isDeletedFlag(payload.deleted)) {
+        const deletedAttachment = findMetadataAttachment({ notes }, relativePath);
         removeAttachmentFromNotes(notes, relativePath);
-        await saveStorageNotes(native, storagePath, notes);
+        assertStorageGeneration(storagePath, expectedStorageGeneration);
+        await saveStorageNotes(
+            native,
+            storagePath,
+            notes,
+            [],
+            [String(deletedAttachment?.id || relativePath)]
+        );
         return { relativePath, deleted: true };
     }
 
@@ -975,6 +1178,7 @@ async function downloadServerAttachment(args: any = {}, item: any) {
     if (!note && item.note) {
         note = { ...item.note, body: item.note.body || '', relativePath: noteRelativePath };
         upsertNote(notes, note);
+        assertStorageGeneration(storagePath, expectedStorageGeneration);
         await saveStorageNotes(native, storagePath, notes);
     }
     if (!note) throw new Error('첨부 파일을 연결할 노트를 찾지 못했습니다.');
@@ -992,6 +1196,7 @@ async function downloadServerAttachment(args: any = {}, item: any) {
         updatedAtMs: item.attachment?.updatedAtMs || payload.clientUpdatedAtMs || Date.now()
     }, noteRelativePath);
 
+    assertStorageGeneration(storagePath, expectedStorageGeneration);
     const saved = await native.saveAttachment({
         storagePath,
         note,
@@ -999,6 +1204,7 @@ async function downloadServerAttachment(args: any = {}, item: any) {
         fileName: attachment.fileName,
         mimeType: attachment.mimeType,
         relativePath,
+        attachmentStoragePath: attachment.storagePath,
         content: binaryPayloadAsBase64(payload),
         contentEncoding: 'base64',
         id: attachment.id
@@ -1006,20 +1212,39 @@ async function downloadServerAttachment(args: any = {}, item: any) {
     return { relativePath, deleted: false, attachment: saved?.attachment || attachment };
 }
 
-async function deleteLocalFile(args: any = {}, item: any) {
+async function deleteLocalFile(args: any = {}, item: any, expectedStorageGeneration?: number) {
     const { native, storagePath } = syncConfig(args);
     const relativePath = normalizeRelativePath(item.relativePath);
+    assertStorageGeneration(storagePath, expectedStorageGeneration);
     const { notes } = await loadStorage(native, storagePath);
-    await saveStorageNotes(native, storagePath, removeNote(notes, relativePath));
+    assertStorageGeneration(storagePath, expectedStorageGeneration);
+    const deletedNote = notes.find((note: any) =>
+        note?.relativePath && normalizeRelativePath(note.relativePath) === relativePath
+    );
+    await saveStorageNotes(
+        native,
+        storagePath,
+        removeNote(notes, relativePath),
+        deletedNote?.id ? [String(deletedNote.id)] : []
+    );
     return { relativePath };
 }
 
-async function deleteLocalAttachment(args: any = {}, item: any) {
+async function deleteLocalAttachment(args: any = {}, item: any, expectedStorageGeneration?: number) {
     const { native, storagePath } = syncConfig(args);
     const relativePath = normalizeRelativePath(item.relativePath);
+    assertStorageGeneration(storagePath, expectedStorageGeneration);
     const { notes } = await loadStorage(native, storagePath);
+    assertStorageGeneration(storagePath, expectedStorageGeneration);
+    const deletedAttachment = findMetadataAttachment({ notes }, relativePath);
     removeAttachmentFromNotes(notes, relativePath);
-    await saveStorageNotes(native, storagePath, notes);
+    await saveStorageNotes(
+        native,
+        storagePath,
+        notes,
+        [],
+        [String(deletedAttachment?.id || relativePath)]
+    );
     return { relativePath };
 }
 
@@ -1079,33 +1304,58 @@ async function resolveSyncConflict(args: any = {}) {
     const resolution = String(args.resolution || '').trim();
     const isAttachment = args.type === 'attachment' || relativePath.includes('/.attachments/');
     if (!['server', 'local'].includes(resolution)) throw new Error('적용할 충돌 버전을 선택하세요.');
+    const initialStorageGeneration = await runStorageOperation(
+        { storagePath },
+        async () => storageMutationGeneration(storagePath)
+    );
+    const changedResult = (didApply: boolean) => ({
+        ...localStorageChangedDuringSyncResult({ plan: {} }, { conflicts: [] }, didApply),
+        resolution,
+        resolvedPath: relativePath
+    });
 
     if (resolution === 'server') {
         const previousState = await readSyncState(native, storagePath);
-        const file = isAttachment
-            ? await downloadServerAttachment(args, {
+        const endpoint = isAttachment
+            ? `/api/attachments/${encodeRelativePathForUrl(relativePath)}`
+            : `/api/files/${encodeRelativePathForUrl(relativePath)}`;
+        const payload = await syncRequest(serverUrl, endpoint, { token });
+        const applyResult = await runStorageOperation({ storagePath }, async () => {
+            if (storageMutationGeneration(storagePath) !== initialStorageGeneration) {
+                return { storageChanged: true };
+            }
+            const file = isAttachment
+                ? await downloadServerAttachment(args, {
                 relativePath,
                 serverAttachment: args.serverAttachment || args.serverFile || null,
                 attachment: args.serverAttachmentMetadata || args.serverAttachment || null,
                 noteRelativePath: args.noteRelativePath || args.serverAttachmentMetadata?.noteRelativePath || null,
                 note: args.serverNote || null,
                 workspace: args.serverWorkspace || null
-            })
-            : await downloadServerFile(args, {
+                }, payload)
+                : await downloadServerFile(args, {
                 relativePath,
                 serverFile: args.serverFile || null,
                 note: args.serverNote || null,
                 workspace: args.serverWorkspace || null
-            });
+                }, payload);
+            return { storageChanged: false, file };
+        });
+        if (applyResult.storageChanged) return changedResult(false);
         const manifest = await syncRequest(serverUrl, '/api/manifest', { token });
-        await writeSyncStateFromManifest(native, storagePath, manifest, previousState);
+        const wroteState = await runStorageOperation({ storagePath }, async () => {
+            if (storageMutationGeneration(storagePath) !== initialStorageGeneration) return false;
+            await writeSyncStateFromManifest(native, storagePath, manifest, previousState);
+            return true;
+        });
+        if (!wroteState) return changedResult(true);
         const planResponse = await createSyncPlan(args);
         return {
             ok: true,
             didApply: true,
             resolution,
             resolvedPath: relativePath,
-            file,
+            file: applyResult.file,
             ...planResponse,
             summary: summarizePlan(planResponse.plan || {})
         };
@@ -1118,13 +1368,38 @@ async function resolveSyncConflict(args: any = {}) {
         lastKnownRevision = Number(serverFile.revision) || 0;
     }
 
-    const uploadResult = isAttachment
-        ? await uploadLocalAttachment({ ...args, lastKnownRevision }, {
-            relativePath,
-            attachment: args.clientAttachment || args.attachment || null,
-            noteRelativePath: args.noteRelativePath || args.clientAttachment?.noteRelativePath || null
-        })
-        : await uploadLocalFile({ ...args, lastKnownRevision }, relativePath);
+    const preparedUpload = await runStorageOperation({ storagePath }, async () => {
+        if (storageMutationGeneration(storagePath) !== initialStorageGeneration) {
+            return { storageChanged: true };
+        }
+        const prepared = isAttachment
+            ? await prepareLocalAttachmentUpload({ ...args, lastKnownRevision }, {
+                relativePath,
+                attachment: args.clientAttachment || args.attachment || null,
+                noteRelativePath: args.noteRelativePath || args.clientAttachment?.noteRelativePath || null
+            })
+            : await prepareLocalFileUpload({ ...args, lastKnownRevision }, relativePath);
+        return { storageChanged: false, prepared };
+    });
+    if (preparedUpload.storageChanged) return changedResult(false);
+    const uploadResult = await sendPreparedSyncUpload(
+        preparedUpload.prepared,
+        isAttachment ? '/api/sync/attachment' : '/api/sync/file',
+        false
+    );
+    const appliedResponse = await runStorageOperation({ storagePath }, async () => {
+        if (storageMutationGeneration(storagePath) !== initialStorageGeneration) return false;
+        if (uploadResult.manifest) {
+            await writeSyncStateFromManifest(
+                native,
+                storagePath,
+                uploadResult.manifest,
+                preparedUpload.prepared.syncState
+            );
+        }
+        return true;
+    });
+    if (!appliedResponse) return changedResult(true);
     if (uploadResult.status === 'conflict') {
         return {
             ok: false,
@@ -1151,18 +1426,59 @@ async function resolveSyncConflict(args: any = {}) {
     };
 }
 
+function syncOperationsDidApply(operations: any = {}) {
+    return [
+        'uploaded',
+        'downloaded',
+        'deletedServer',
+        'deletedLocal',
+        'uploadedAttachments',
+        'downloadedAttachments',
+        'deletedServerAttachments',
+        'deletedLocalAttachments'
+    ].some(key => Array.isArray(operations[key]) && operations[key].length > 0);
+}
+
+function localStorageChangedDuringSyncResult(planResponse: any, operations: any = null, didApply = false) {
+    const conflict = {
+        type: 'local_storage_changed_during_sync',
+        reason: 'local_storage_changed_during_sync',
+        message: '동기화 중 로컬 저장소가 변경되어 적용을 중단했습니다. 다시 동기화해 주세요.'
+    };
+    const plan = {
+        ...(planResponse.plan || {}),
+        conflicts: [...(planResponse.plan?.conflicts || []), conflict]
+    };
+    if (operations) operations.conflicts.push(conflict);
+    return {
+        ...planResponse,
+        ok: false,
+        status: 'conflict',
+        didApply,
+        reason: conflict.reason,
+        conflicts: [conflict],
+        plan,
+        summary: summarizePlan(plan),
+        ...(operations ? { operations } : {})
+    };
+}
+
 async function runFullSync(args: any = {}) {
-    const { native, storagePath } = syncConfig(args);
+    const { native, storagePath, serverUrl, token } = syncConfig(args);
+    const initialStorageGeneration = await runStorageOperation(
+        { storagePath },
+        async () => storageMutationGeneration(storagePath)
+    );
     const syncState = await readSyncState(native, storagePath);
     const planResponse = await createSyncPlan(args);
     const plan = planResponse.plan || {};
 
     if ((plan.conflicts || []).length > 0) {
         return {
+            ...planResponse,
             ok: false,
             status: 'conflict',
-            didApply: false,
-            ...planResponse
+            didApply: false
         };
     }
 
@@ -1179,56 +1495,160 @@ async function runFullSync(args: any = {}) {
     };
     let latestManifest = planResponse.manifest;
 
-    for (const item of plan.downloadFiles || []) operations.downloaded.push(await downloadServerFile(args, item));
-    for (const item of plan.downloadAttachments || []) operations.downloadedAttachments.push(await downloadServerAttachment(args, item));
-    for (const item of plan.deleteLocalFiles || []) operations.deletedLocal.push(await deleteLocalFile(args, item));
-    for (const item of plan.deleteLocalAttachments || []) operations.deletedLocalAttachments.push(await deleteLocalAttachment(args, item));
+    try {
+    const pendingFileDownloads: any[] = [];
+    for (const item of plan.downloadFiles || []) {
+        const relativePath = normalizeRelativePath(item.relativePath);
+        const payload = await syncRequest(
+            serverUrl,
+            `/api/files/${encodeRelativePathForUrl(relativePath)}`,
+            { token }
+        );
+        pendingFileDownloads.push({ item, payload });
+    }
+    const pendingAttachmentDownloads: any[] = [];
+    for (const item of plan.downloadAttachments || []) {
+        const relativePath = normalizeRelativePath(item.relativePath);
+        const payload = await syncRequest(
+            serverUrl,
+            `/api/attachments/${encodeRelativePathForUrl(relativePath)}`,
+            { token }
+        );
+        pendingAttachmentDownloads.push({ item, payload });
+    }
+
+    const localApply = await runStorageOperation({ storagePath }, async () => {
+        if (storageMutationGeneration(storagePath) !== initialStorageGeneration) {
+            return { storageChanged: true };
+        }
+        for (const pending of pendingFileDownloads) {
+            operations.downloaded.push(await downloadServerFile(args, pending.item, pending.payload));
+        }
+        for (const pending of pendingAttachmentDownloads) {
+            operations.downloadedAttachments.push(await downloadServerAttachment(args, pending.item, pending.payload));
+        }
+        for (const item of plan.deleteLocalFiles || []) {
+            operations.deletedLocal.push(await deleteLocalFile(args, item));
+        }
+        for (const item of plan.deleteLocalAttachments || []) {
+            operations.deletedLocalAttachments.push(await deleteLocalAttachment(args, item));
+        }
+        return { storageChanged: false };
+    });
+    if (localApply.storageChanged) {
+        return localStorageChangedDuringSyncResult(planResponse, operations, false);
+    }
+
+    const changedResult = () => localStorageChangedDuringSyncResult(
+        planResponse,
+        operations,
+        syncOperationsDidApply(operations)
+    );
+    const guardedUpload = async (prepare: () => Promise<any>, endpoint: string) => {
+        const staged = await runStorageOperation({ storagePath }, async () => {
+            if (storageMutationGeneration(storagePath) !== initialStorageGeneration) {
+                return { storageChanged: true };
+            }
+            return { storageChanged: false, prepared: await prepare() };
+        });
+        if (staged.storageChanged) return staged;
+        const result = await sendPreparedSyncUpload(staged.prepared, endpoint, false);
+        const stateApplied = await runStorageOperation({ storagePath }, async () => {
+            if (storageMutationGeneration(storagePath) !== initialStorageGeneration) return false;
+            if (result.manifest) {
+                await writeSyncStateFromManifest(
+                    native,
+                    storagePath,
+                    result.manifest,
+                    staged.prepared.syncState
+                );
+            }
+            return true;
+        });
+        return stateApplied ? { storageChanged: false, result } : { storageChanged: true, result };
+    };
 
     for (const item of plan.uploadFiles || []) {
-        const result = await uploadLocalFile(args, item.relativePath);
-        latestManifest = result.manifest || latestManifest;
-        if (result.status === 'conflict') operations.conflicts.push(result.file);
-        else operations.uploaded.push(result.file);
+            const upload = await guardedUpload(
+                () => prepareLocalFileUpload(args, item.relativePath),
+                '/api/sync/file'
+            );
+            if (upload.storageChanged) return changedResult();
+            const result = upload.result;
+            latestManifest = result.manifest || latestManifest;
+            if (result.status === 'conflict') operations.conflicts.push(result.file);
+            else operations.uploaded.push(result.file);
     }
 
     for (const item of plan.uploadAttachments || []) {
-        const result = await uploadLocalAttachment(args, item);
-        latestManifest = result.manifest || latestManifest;
-        if (result.status === 'conflict') operations.conflicts.push(result.attachment || result.file);
-        else operations.uploadedAttachments.push(result.attachment);
+            const upload = await guardedUpload(
+                () => prepareLocalAttachmentUpload(args, item),
+                '/api/sync/attachment'
+            );
+            if (upload.storageChanged) return changedResult();
+            const result = upload.result;
+            latestManifest = result.manifest || latestManifest;
+            if (result.status === 'conflict') operations.conflicts.push(result.attachment || result.file);
+            else operations.uploadedAttachments.push(result.attachment);
     }
 
     for (const item of plan.deleteServerFiles || []) {
-        const lastKnownRevision = serverDeleteLastKnownRevision(syncState, item, false);
-        if (lastKnownRevision <= 0) continue;
-        const result = await uploadLocalFile({ ...args, deleted: true, lastKnownRevision }, item.relativePath);
-        latestManifest = result.manifest || latestManifest;
-        if (result.status === 'conflict') operations.conflicts.push(result.file);
-        else operations.deletedServer.push(result.file);
+            const lastKnownRevision = serverDeleteLastKnownRevision(syncState, item, false);
+            if (lastKnownRevision <= 0) continue;
+            const upload = await guardedUpload(
+                () => prepareLocalFileUpload({ ...args, deleted: true, lastKnownRevision }, item.relativePath),
+                '/api/sync/file'
+            );
+            if (upload.storageChanged) return changedResult();
+            const result = upload.result;
+            latestManifest = result.manifest || latestManifest;
+            if (result.status === 'conflict') operations.conflicts.push(result.file);
+            else operations.deletedServer.push(result.file);
     }
 
     for (const item of plan.deleteServerAttachments || []) {
-        const lastKnownRevision = serverDeleteLastKnownRevision(syncState, item, true);
-        if (lastKnownRevision <= 0) continue;
-        const result = await uploadLocalAttachment({ ...args, deleted: true, lastKnownRevision }, item);
-        latestManifest = result.manifest || latestManifest;
-        if (result.status === 'conflict') operations.conflicts.push(result.attachment || result.file);
-        else operations.deletedServerAttachments.push(result.attachment);
+            const lastKnownRevision = serverDeleteLastKnownRevision(syncState, item, true);
+            if (lastKnownRevision <= 0) continue;
+            const upload = await guardedUpload(
+                () => prepareLocalAttachmentUpload({ ...args, deleted: true, lastKnownRevision }, item),
+                '/api/sync/attachment'
+            );
+            if (upload.storageChanged) return changedResult();
+            const result = upload.result;
+            latestManifest = result.manifest || latestManifest;
+            if (result.status === 'conflict') operations.conflicts.push(result.attachment || result.file);
+            else operations.deletedServerAttachments.push(result.attachment);
     }
 
     if (operations.conflicts.length === 0 && latestManifest) {
-        const previousState = await readSyncState(native, storagePath);
-        await writeSyncStateFromManifest(native, storagePath, latestManifest, previousState);
+        const wroteState = await runStorageOperation({ storagePath }, async () => {
+            if (storageMutationGeneration(storagePath) !== initialStorageGeneration) return false;
+            const previousState = await readSyncState(native, storagePath);
+            await writeSyncStateFromManifest(native, storagePath, latestManifest, previousState);
+            return true;
+        });
+        if (!wroteState) return changedResult();
     }
 
     return {
+        ...planResponse,
         ok: operations.conflicts.length === 0,
         status: operations.conflicts.length > 0 ? 'conflict' : 'ok',
         didApply: true,
-        ...planResponse,
         manifest: latestManifest || planResponse.manifest,
         operations
     };
+    } catch (error: any) {
+        return {
+            ...planResponse,
+            ok: false,
+            status: 'error',
+            didApply: syncOperationsDidApply(operations),
+            error: error?.message || '전체 동기화 작업 중 오류가 발생했습니다.',
+            manifest: latestManifest || planResponse.manifest,
+            operations
+        };
+    }
 }
 
 function encodeUtf8Base64(value: string) {
@@ -1271,12 +1691,16 @@ function installAndroidBridge() {
             defaultPath: () => native.defaultPath({}),
             chooseDirectory: () => native.defaultPath({}),
             info: (payload: Record<string, unknown> = {}) => native.info(payload),
-            initialize: (payload: Record<string, unknown> = {}) => native.initialize(payload),
+            initialize: (payload: Record<string, unknown> = {}) =>
+                runStorageMutation(payload, () => native.initialize(payload)),
             loadNotes: (payload: Record<string, unknown> = {}) => native.loadNotes(payload),
-            saveNotes: (payload: Record<string, unknown> = {}) => native.saveNotes(payload),
+            saveNotes: (payload: Record<string, unknown> = {}) =>
+                runStorageMutation(payload, () => native.saveNotes(payload)),
             exportFolderZip: async () => ({ ok: false, error: 'Android에서는 폴더 ZIP 내보내기를 아직 사용할 수 없습니다.' }),
-            saveAttachment: (payload: Record<string, unknown> = {}) => native.saveAttachment(payload),
-            chooseAttachments: (payload: Record<string, unknown> = {}) => native.chooseAttachments(payload),
+            saveAttachment: (payload: Record<string, unknown> = {}) =>
+                runStorageMutation(payload, () => native.saveAttachment(payload)),
+            chooseAttachments: (payload: Record<string, unknown> = {}) =>
+                runStorageMutation(payload, () => native.chooseAttachments(payload)),
             openAttachment: (payload: Record<string, unknown> = {}) => native.openAttachment(payload),
             readFile: (payload: Record<string, unknown> = {}) => native.readFile(payload)
         },
@@ -1325,35 +1749,35 @@ function installAndroidBridge() {
             },
             plan: async (payload: any = {}) => {
                 try {
-                    return await createSyncPlan(payload);
+                    return await runSyncOperation(payload, () => createSyncPlan(payload));
                 } catch (error) {
                     return syncError(error, '동기화 계획을 만들지 못했습니다.');
                 }
             },
             runFull: async (payload: any = {}) => {
                 try {
-                    return await runFullSync(payload);
+                    return await runSyncOperation(payload, () => runFullSync(payload));
                 } catch (error) {
                     return syncError(error, '전체 동기화에 실패했습니다.');
                 }
             },
             uploadNote: async (payload: any = {}) => {
                 try {
-                    return await uploadLocalNoteWithAttachments(payload);
+                    return await runSyncOperation(payload, () => uploadLocalNoteWithAttachments(payload));
                 } catch (error) {
                     return syncError(error, '문서 동기화에 실패했습니다.');
                 }
             },
             readFile: async (payload: any = {}) => {
                 try {
-                    return await readSyncConflictFile(payload);
+                    return await runSyncOperation(payload, () => readSyncConflictFile(payload));
                 } catch (error) {
                     return syncError(error, '충돌 파일을 읽지 못했습니다.');
                 }
             },
             resolveConflict: async (payload: any = {}) => {
                 try {
-                    return await resolveSyncConflict(payload);
+                    return await runSyncOperation(payload, () => resolveSyncConflict(payload));
                 } catch (error) {
                     return syncError(error, '충돌을 적용하지 못했습니다.');
                 }
