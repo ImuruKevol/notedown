@@ -25,9 +25,9 @@ Notedown은 데스크톱과 Android에서 Markdown 문서를 빠르게 작성하
 - 저장소 관리: 저장소 디렉토리 선택, `metadata.db` 생성/갱신, 저장소 상태 확인, 깊은 경로 Markdown 문서 가져오기를 지원합니다.
 - Markdown 작성 화면: Monaco 기반 편집기, 작성/분할/미리보기 모드, 에디터와 미리보기 hover 동기화, Markdown 접기 UI를 제공합니다.
 - 문서 렌더링: 체크리스트 진행률, 코드 블록, 인용문, 표, 구분선, 문서/구역 단위 스타일 지시문을 미리보기와 PDF 출력에 반영합니다.
-- 사이드바: 워크스페이스 패널, 폴더 이름 인라인 수정, 노트 검색, 정렬, 새 노트 생성, 노트 삭제, 최근 동기화 상태 표시를 제공합니다.
+- 사이드바: 워크스페이스 패널, 폴더 이름 인라인 수정, 노트 검색, 정렬, 새 노트 생성, 노트 삭제, 수동 전체 동기화와 최근 동기화 상태 표시를 제공합니다.
 - 커맨드 팔렛트: `Cmd/Ctrl+P`로 노트 검색을 열고, `@`로 워크스페이스 선택, `>`로 설정 명령을 실행할 수 있습니다.
-- 설정: 수동 저장 중심의 저장 흐름, 닫을 때 백그라운드 유지, 시작 프로그램 등록, 기본 보기 모드, 탭 크기, Light/Dark/System 테마를 관리합니다.
+- 설정: 수동 저장 중심의 저장 흐름, 닫을 때 백그라운드 유지, 시작 프로그램 등록, 앱 업데이트 확인·설치, 기본 보기 모드, 탭 크기, Light/Dark/System 테마를 관리합니다.
 - 첨부 파일: 이미지/파일 첨부, 미리보기 렌더링, 파일 열기, PDF용 첨부 ZIP 생성을 지원합니다.
 - PDF 내보내기: Electron `printToPDF` 또는 Android 네이티브 PDF 흐름으로 현재 노트를 저장합니다.
 - 서버 동기화: 서버 연결 확인, 초기 설정, 로그인, 전체 동기화, 문서/첨부 저장 시 업로드, 시작 시 동기화, 충돌 감지를 지원합니다.
@@ -108,6 +108,8 @@ npm run dist:requested
 
 생성 산출물은 `dist/`에 저장됩니다.
 
+데스크톱 앱의 `설정 > 일반 > 앱 업데이트`는 `https://file.nanoha.kr/share/i3TGy3GF`의 버전 디렉토리를 확인합니다. 배포 파일 이름은 `Notedown-{version}-mac-{arch}.pkg` 또는 `Notedown-{version}-win-x64.exe` 형식을 유지해야 하며, 앱은 운영체제와 CPU에 맞는 파일을 내려받아 파일 크기를 확인한 뒤 설치하고 다시 실행합니다.
+
 ### 작성자
 
 - [ImuruKevol](https://github.com/ImuruKevol)
@@ -129,9 +131,9 @@ Notedown is a desktop and Android Markdown note app for writing quickly, keeping
 - Storage management: choose a storage directory, generate or refresh `metadata.db`, inspect storage status, and import deeply nested Markdown documents.
 - Markdown workspace: Monaco-based editor, write/split/preview modes, editor-preview hover sync, and Markdown folding controls.
 - Document rendering: task progress, code blocks, quotes, tables, dividers, and document/section style directives are reflected in preview and PDF output.
-- Sidebar: workspace panel, inline folder rename, note search, sorting, new note creation, note deletion, and recent sync status.
+- Sidebar: workspace panel, inline folder rename, note search, sorting, new note creation, note deletion, manual full sync, and recent sync status.
 - Command palette: open note search with `Cmd/Ctrl+P`, use `@` for workspace selection, and use `>` for settings commands.
-- Settings: manual-save-oriented editing, keep in background on close, launch at startup, default editor mode, tab size, and Light/Dark/System theme.
+- Settings: manual-save-oriented editing, keep in background on close, launch at startup, in-app update checks and installation, default editor mode, tab size, and Light/Dark/System theme.
 - Attachments: attach images/files, render previews, open files, and include attachments in PDF ZIP exports.
 - PDF export: save the current note through Electron `printToPDF` or Android native PDF output.
 - Server sync: health check, initial setup, login, full sync, save-time document/attachment upload, startup sync, and conflict detection.
@@ -211,6 +213,8 @@ npm run dist:requested
 ```
 
 Release artifacts are written to `dist/`.
+
+The desktop app checks version directories under `https://file.nanoha.kr/share/i3TGy3GF` from `Settings > General > App update`. Keep release artifact names in the form `Notedown-{version}-mac-{arch}.pkg` or `Notedown-{version}-win-x64.exe`; the app downloads the matching OS/CPU artifact, verifies its size, installs it, and relaunches.
 
 ### Author
 

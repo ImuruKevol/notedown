@@ -1,7 +1,7 @@
 {
   "name": "notedown",
   "productName": "Notedown",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Notedown desktop Markdown notes app",
   "author": "Taewook Kwon (ImuruKevol) <kwon3286@season.co.kr>",
   "license": "MIT",
@@ -15,6 +15,7 @@
     "android:run": "npx cap run android",
     "android:build:debug": "npm run android:sync && cd android && ./gradlew assembleDebug",
     "android:clean": "cd android && ./gradlew clean",
+    "test:electron": "node --test electron/*.test.cjs",
     "dist": "electron-builder",
     "dist:mac:arm64": "electron-builder --mac --arm64",
     "dist:mac:x64": "electron-builder --mac --x64",

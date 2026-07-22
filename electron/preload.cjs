@@ -13,6 +13,17 @@ contextBridge.exposeInMainWorld('notedown', {
         setPreferences: (payload) => ipcRenderer.invoke('notedown:app:set-preferences', payload),
         showWindow: () => ipcRenderer.invoke('notedown:app:show-window')
     },
+    update: {
+        current: () => ipcRenderer.invoke('notedown:update:current'),
+        check: () => ipcRenderer.invoke('notedown:update:check'),
+        downloadAndInstall: () => ipcRenderer.invoke('notedown:update:download-and-install'),
+        onStatus: (callback) => {
+            if (typeof callback !== 'function') return () => { };
+            const listener = (_event, status) => callback(status);
+            ipcRenderer.on('notedown:update:status', listener);
+            return () => ipcRenderer.removeListener('notedown:update:status', listener);
+        }
+    },
     storage: {
         defaultPath: () => ipcRenderer.invoke('notedown:storage:default-path'),
         chooseDirectory: () => ipcRenderer.invoke('notedown:storage:choose-directory'),

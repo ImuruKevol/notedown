@@ -118,6 +118,9 @@ export class Component implements OnInit, OnDestroy {
         }
         this.lastInactiveAtMs = Date.now();
     };
+    private handleManualSync = () => {
+        void this.runManualSync();
+    };
 
     public mobileOpen = false;
     public isSettingsRoute = false;
@@ -143,6 +146,7 @@ export class Component implements OnInit, OnDestroy {
         window.addEventListener('keydown', this.handlePaletteShortcut, true);
         window.addEventListener('focus', this.handleWindowFocus);
         window.addEventListener('blur', this.handleWindowBlur);
+        window.addEventListener('notedown:manual-sync', this.handleManualSync);
         document.addEventListener('visibilitychange', this.handleVisibilityChange);
         this.routeSubscription = this.router.events
             .pipe(filter(event => event instanceof NavigationEnd))
@@ -159,6 +163,7 @@ export class Component implements OnInit, OnDestroy {
         window.removeEventListener('keydown', this.handlePaletteShortcut, true);
         window.removeEventListener('focus', this.handleWindowFocus);
         window.removeEventListener('blur', this.handleWindowBlur);
+        window.removeEventListener('notedown:manual-sync', this.handleManualSync);
         document.removeEventListener('visibilitychange', this.handleVisibilityChange);
         this.routeSubscription?.unsubscribe();
     }
@@ -756,8 +761,34 @@ export class Component implements OnInit, OnDestroy {
             && inactiveMs < this.focusIdleThresholdMs
         ) return;
 
-        this.activationSyncBusy = true;
         this.activationSyncLastAttemptMs = now;
+        await this.runSavedSync(settings, '포커스 동기화에 실패했습니다.', 'layout.sidebar-sync');
+    }
+
+    private async runManualSync() {
+        const api = (window as any).notedown?.sync;
+        const settings = this.readSettings();
+        if (!api?.runFull) {
+            this.storeSyncResult({ ok: false, status: 'error', error: '현재 환경에서는 전체 동기화를 사용할 수 없습니다.' });
+            return;
+        }
+        if (!this.canRunSavedSync(settings)) {
+            this.storeSyncResult({ ok: false, status: 'error', error: '설정에서 동기화 서버에 로그인한 뒤 다시 시도해 주세요.' });
+            return;
+        }
+        if (this.activationSyncBusy) {
+            this.broadcastSyncResult(this.readStartupSyncResult());
+            return;
+        }
+        this.activationSyncLastAttemptMs = Date.now();
+        await this.runSavedSync(settings, '수동 동기화에 실패했습니다.', 'layout.sidebar-manual-sync');
+    }
+
+    private async runSavedSync(settings: AppSettings, fallbackError: string, source: string) {
+        const api = (window as any).notedown?.sync;
+        if (!api?.runFull || this.activationSyncBusy) return;
+
+        this.activationSyncBusy = true;
         this.storeSyncResult({ ok: false, status: 'running' });
 
         try {
@@ -769,7 +800,7 @@ export class Component implements OnInit, OnDestroy {
             });
             const payload = this.storeSyncResult(result);
             if (payload.ok && this.syncConflictCount(payload) === 0) {
-                window.dispatchEvent(new CustomEvent('notedown:notes-changed', { detail: { source: 'layout.sidebar-sync' } }));
+                window.dispatchEvent(new CustomEvent('notedown:notes-changed', { detail: { source } }));
                 this.refreshPaletteData();
                 this.renderSoon();
             }
@@ -777,7 +808,7 @@ export class Component implements OnInit, OnDestroy {
             this.storeSyncResult({
                 ok: false,
                 status: 'error',
-                error: error instanceof Error && error.message ? error.message : '포커스 동기화에 실패했습니다.'
+                error: error instanceof Error && error.message ? error.message : fallbackError
             });
         } finally {
             this.activationSyncBusy = false;

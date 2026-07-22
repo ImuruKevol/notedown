@@ -1,5 +1,6 @@
 !include LogicLib.nsh
 !include nsDialogs.nsh
+!include FileFunc.nsh
 
 !ifndef BUILD_UNINSTALLER
 Var NotedownStoragePath
@@ -7,6 +8,7 @@ Var NotedownSyncServerUrl
 Var NotedownSyncUsername
 Var NotedownKeepBackgroundOnClose
 Var NotedownLaunchAtStartup
+Var NotedownIsUpdate
 Var NotedownStoragePathField
 Var NotedownSyncServerUrlField
 Var NotedownSyncUsernameField
@@ -14,6 +16,14 @@ Var NotedownKeepBackgroundOnCloseCheckbox
 Var NotedownLaunchAtStartupCheckbox
 
 !macro customInit
+  StrCpy $NotedownIsUpdate "false"
+  ${GetParameters} $R0
+  ClearErrors
+  ${GetOptions} $R0 "--updated" $R1
+  ${IfNot} ${Errors}
+    StrCpy $NotedownIsUpdate "true"
+  ${EndIf}
+
   DetailPrint "Checking for running Notedown processes."
   nsExec::ExecToLog 'taskkill /IM "Notedown.exe" /T'
   Pop $0
@@ -33,10 +43,16 @@ Var NotedownLaunchAtStartupCheckbox
 !macroend
 
 !macro customInstall
-  Call NotedownWriteInstallerSettings
+  ${If} $NotedownIsUpdate != "true"
+    Call NotedownWriteInstallerSettings
+  ${EndIf}
 !macroend
 
 Function NotedownInitialConfigPageCreate
+  ${If} $NotedownIsUpdate == "true"
+    Abort
+  ${EndIf}
+
   nsDialogs::Create 1018
   Pop $0
   ${If} $0 == error

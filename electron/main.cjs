@@ -2,6 +2,7 @@ const { app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, net, protocol, s
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const crypto = require('node:crypto');
+const { execFile, spawn } = require('node:child_process');
 const { pathToFileURL } = require('node:url');
 const zlib = require('node:zlib');
 const { promisify } = require('node:util');
@@ -18,6 +19,11 @@ const {
     prepareNoteStorageIdentities,
     selectMissingPreviousNotes
 } = require('./storage-identity.cjs');
+const {
+    createUpdater,
+    DEFAULT_UPDATE_SHARE_URL,
+    supportedArtifact
+} = require('./updater.cjs');
 
 const DEV_URL = process.env.NOTEDOWN_DEV_URL;
 const DIST_DIR = path.resolve(__dirname, '..', 'bundle', 'www');
@@ -40,6 +46,8 @@ const storageOperationQueue = createKeyedQueue();
 const syncOperationQueue = createKeyedQueue();
 const storageMutationGenerations = new Map();
 const deflateRaw = promisify(zlib.deflateRaw);
+const execFileAsync = promisify(execFile);
+let updateOperation = null;
 let appPreferences = {
     keepInBackgroundOnClose: defaultKeepInBackgroundOnClose(),
     launchAtStartup: false
@@ -3448,6 +3456,143 @@ async function showMainWindow(options = {}) {
     if (typeof win.moveTop === 'function') win.moveTop();
 }
 
+function updateShareUrl() {
+    return process.env.NOTEDOWN_UPDATE_SHARE_URL || DEFAULT_UPDATE_SHARE_URL;
+}
+
+function updateDownloadDirectory() {
+    return path.join(app.getPath('temp'), 'Notedown Updates');
+}
+
+function currentUpdateInfo() {
+    return {
+        ok: true,
+        currentVersion: app.getVersion(),
+        platform: process.platform,
+        arch: process.arch,
+        packaged: app.isPackaged,
+        supported: Boolean(supportedArtifact(process.platform, process.arch)),
+        shareUrl: updateShareUrl()
+    };
+}
+
+function createAppUpdater() {
+    return createUpdater({
+        fetch: (url, options) => net.fetch(url, options),
+        currentVersion: app.getVersion(),
+        platform: process.platform,
+        arch: process.arch,
+        shareUrl: updateShareUrl(),
+        downloadDirectory: updateDownloadDirectory()
+    });
+}
+
+function sendUpdateStatus(webContents, status) {
+    if (!webContents || webContents.isDestroyed()) return;
+    webContents.send('notedown:update:status', status);
+}
+
+function updateErrorMessage(error, fallback = '업데이트 작업에 실패했습니다.') {
+    const message = error instanceof Error ? error.message : String(error || '');
+    if (/User canceled|User cancelled|-128/i.test(message)) return '업데이트 설치가 취소되었습니다.';
+    if (/aborted|timed?\s*out|timeout/i.test(message)) return '업데이트 서버 응답 시간이 초과되었습니다.';
+    return message || fallback;
+}
+
+function appleScriptString(value) {
+    return `"${String(value || '').replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+}
+
+function relaunchArgs() {
+    return process.argv.slice(1).filter(arg => arg !== START_HIDDEN_ARG && arg !== QUIT_ARG);
+}
+
+async function installMacUpdate(installerPath, webContents, version) {
+    const script = `do shell script "/usr/sbin/installer -pkg " & quoted form of ${appleScriptString(installerPath)} & " -target /" with administrator privileges`;
+    await execFileAsync('/usr/bin/osascript', ['-e', script], {
+        timeout: 15 * 60 * 1000,
+        maxBuffer: 1024 * 1024,
+        windowsHide: true
+    });
+    sendUpdateStatus(webContents, { stage: 'restarting', version, message: '설치가 완료되어 앱을 다시 엽니다.' });
+    isQuitting = true;
+    app.relaunch({
+        execPath: '/Applications/Notedown.app/Contents/MacOS/Notedown',
+        args: relaunchArgs()
+    });
+    setTimeout(() => app.exit(0), 250);
+    return { ok: true, restarting: true, version };
+}
+
+async function installWindowsUpdate(installerPath, webContents, version) {
+    const child = spawn(installerPath, ['/S', '--updated', '--force-run'], {
+        detached: true,
+        stdio: 'ignore',
+        windowsHide: true
+    });
+    await new Promise((resolve, reject) => {
+        child.once('spawn', resolve);
+        child.once('error', reject);
+    });
+    child.unref();
+    sendUpdateStatus(webContents, { stage: 'restarting', version, message: '설치를 시작했습니다. 앱이 곧 다시 열립니다.' });
+    isQuitting = true;
+    setTimeout(() => app.quit(), 250);
+    return { ok: true, restarting: true, version };
+}
+
+async function downloadAndInstallUpdate(webContents) {
+    if (updateOperation) return { ok: false, error: '이미 업데이트 작업을 진행 중입니다.' };
+    if (!app.isPackaged) return { ok: false, error: '개발 실행 중에는 업데이트를 설치할 수 없습니다.' };
+
+    updateOperation = (async () => {
+        const updater = createAppUpdater();
+        sendUpdateStatus(webContents, { stage: 'checking', message: '새 버전을 확인하는 중입니다.' });
+        const release = await updater.check();
+        if (!release.updateAvailable) {
+            return {
+                ...release,
+                ok: true,
+                error: release.error || '현재 최신 버전을 사용하고 있습니다.'
+            };
+        }
+
+        sendUpdateStatus(webContents, {
+            stage: 'downloading',
+            version: release.version,
+            percent: 0,
+            message: `Notedown ${release.version} 다운로드를 시작합니다.`
+        });
+        const installerPath = await updater.download(release, status => {
+            sendUpdateStatus(webContents, { ...status, version: release.version });
+        });
+        sendUpdateStatus(webContents, {
+            stage: 'installing',
+            version: release.version,
+            percent: 100,
+            message: '다운로드를 확인했습니다. 업데이트를 설치하는 중입니다.'
+        });
+
+        if (process.platform === 'darwin') {
+            return installMacUpdate(installerPath, webContents, release.version);
+        }
+        if (process.platform === 'win32') {
+            return installWindowsUpdate(installerPath, webContents, release.version);
+        }
+        throw new Error('현재 운영체제에서는 앱 내 설치를 지원하지 않습니다.');
+    })();
+
+    try {
+        return await updateOperation;
+    } catch (error) {
+        const message = updateErrorMessage(error);
+        sendUpdateStatus(webContents, { stage: 'error', message });
+        return { ok: false, error: message };
+    } finally {
+        updateOperation = null;
+    }
+}
+
 function registerAppHandlers() {
     ipcMain.handle('notedown:app:installer-settings', async () => {
         const settings = await readInstallerSettings();
@@ -3467,6 +3612,18 @@ function registerAppHandlers() {
         await showMainWindow();
         return { ok: true };
     });
+}
+
+function registerUpdateHandlers() {
+    ipcMain.handle('notedown:update:current', async () => currentUpdateInfo());
+    ipcMain.handle('notedown:update:check', async () => {
+        try {
+            return await createAppUpdater().check();
+        } catch (error) {
+            return { ...currentUpdateInfo(), ok: false, error: updateErrorMessage(error, '업데이트를 확인하지 못했습니다.') };
+        }
+    });
+    ipcMain.handle('notedown:update:download-and-install', async (event) => downloadAndInstallUpdate(event.sender));
 }
 
 protocol.registerSchemesAsPrivileged([
@@ -3650,6 +3807,7 @@ if (!hasSingleInstanceLock) {
         await readAppPreferences();
         syncTrayState();
         registerAppHandlers();
+        registerUpdateHandlers();
         registerStorageHandlers();
         registerSyncHandlers();
         registerPdfHandlers();

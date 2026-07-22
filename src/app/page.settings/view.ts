@@ -6,6 +6,7 @@ type EditorMode = 'markdown' | 'split' | 'preview';
 type ToggleKey = 'keepInBackgroundOnClose' | 'launchAtStartup';
 type StorageAction = '' | 'choose' | 'refresh' | 'initialize' | 'import';
 type SyncAction = '' | 'health' | 'setup' | 'login' | 'plan' | 'run';
+type UpdateAction = '' | 'check' | 'install';
 type StorageMessageTone = 'info' | 'success' | 'warning' | 'error';
 
 interface AppSettings {
@@ -76,6 +77,22 @@ interface SyncConflictDetail {
     serverError?: string;
 }
 
+interface UpdateInfo {
+    currentVersion?: string;
+    latestVersion?: string;
+    version?: string;
+    supported?: boolean;
+    packaged?: boolean;
+    updateAvailable?: boolean;
+    platform?: string;
+    arch?: string;
+    shareUrl?: string;
+    artifact?: {
+        fileName?: string;
+        size?: number;
+    };
+}
+
 export class Component implements OnInit, OnDestroy {
     private storageKey = 'notedown.settings.v1';
     private notesKey = 'notedown.notes.v1';
@@ -83,6 +100,7 @@ export class Component implements OnInit, OnDestroy {
     private hadStoredSettings = false;
     private lastSyncedKeepInBackgroundOnClose: boolean | null = null;
     private lastSyncedLaunchAtStartup: boolean | null = null;
+    private removeUpdateStatusListener: (() => void) | null = null;
     private readonly androidSplitMinWidth = 840;
 
     public activeSection = 'general';
@@ -103,6 +121,13 @@ export class Component implements OnInit, OnDestroy {
     public syncConflictDetail: SyncConflictDetail | null = null;
     public syncConflictBusy = false;
     public launchAtStartupSupported = false;
+    public updateFeatureAvailable = false;
+    public updateBusy = false;
+    public updateAction: UpdateAction = '';
+    public updateMessage = '';
+    public updateMessageTone: StorageMessageTone = 'info';
+    public updateProgress = 0;
+    public updateInfo: UpdateInfo = {};
     public sections = [
         { id: 'general', label: '일반' },
         { id: 'storage', label: '저장소' },
@@ -136,12 +161,33 @@ export class Component implements OnInit, OnDestroy {
         if (detail?.ok || detail?.status === 'ok') void this.refreshStorageInfo();
         void this.service.render();
     };
+    private handleUpdateStatus = (status: any) => {
+        const stage = String(status?.stage || '');
+        if (stage === 'checking') {
+            this.setUpdateMessage(status?.message || '새 버전을 확인하는 중입니다.', 'info');
+        } else if (stage === 'downloading') {
+            this.updateAction = 'install';
+            this.updateBusy = true;
+            this.updateProgress = Math.max(0, Math.min(100, Number(status?.percent) || 0));
+            this.setUpdateMessage(`업데이트를 다운로드하는 중입니다. ${this.updateProgress}%`, 'info');
+        } else if (stage === 'downloaded' || stage === 'installing') {
+            this.updateProgress = 100;
+            this.setUpdateMessage(status?.message || '업데이트를 설치하는 중입니다.', 'info');
+        } else if (stage === 'restarting') {
+            this.updateProgress = 100;
+            this.setUpdateMessage(status?.message || '설치가 완료되어 앱을 다시 엽니다.', 'success');
+        } else if (stage === 'error') {
+            this.setUpdateMessage(status?.message || '업데이트 작업에 실패했습니다.', 'error');
+        }
+        void this.service.render();
+    };
 
     constructor(public service: Service) { }
 
     public async ngOnInit() {
         this.loadSettings();
         await this.hydrateAppPreferences();
+        await this.hydrateUpdateInfo();
         this.ensureVisibleSection();
         this.applyStartupSyncResult();
         await this.ensureDefaultStoragePath();
@@ -156,6 +202,8 @@ export class Component implements OnInit, OnDestroy {
         window.removeEventListener('notedown:settings-changed', this.handleExternalSettingsChanged);
         window.removeEventListener('notedown:startup-sync-status', this.handleStartupSyncStatus);
         window.removeEventListener('resize', this.handleViewportResize);
+        this.removeUpdateStatusListener?.();
+        this.removeUpdateStatusListener = null;
     }
 
     public setSection(id: string) {
@@ -184,6 +232,110 @@ export class Component implements OnInit, OnDestroy {
     public setTabSize(value: number | string) {
         this.settings.tabSize = this.normalizeTabSize(value);
         this.saveSettings();
+    }
+
+    public hasUpdateFeature() {
+        return this.updateFeatureAvailable && this.updateInfo.supported !== false;
+    }
+
+    public updateVersionLabel() {
+        const current = this.updateInfo.currentVersion ? `v${this.updateInfo.currentVersion}` : '버전 확인 중';
+        if (this.updateInfo.updateAvailable && this.updateInfo.version) return `${current} → v${this.updateInfo.version}`;
+        return current;
+    }
+
+    public updateButtonLabel() {
+        if (this.updateAction === 'check') return '확인 중...';
+        if (this.updateAction === 'install') {
+            if (this.updateProgress > 0 && this.updateProgress < 100) return `다운로드 ${this.updateProgress}%`;
+            return '설치 준비 중...';
+        }
+        return this.updateInfo.updateAvailable ? '다운로드 및 설치' : '업데이트 확인';
+    }
+
+    public updateMessageClass() {
+        const base = 'mt-2 min-h-5 text-[12px]';
+        if (this.updateMessageTone === 'success') return `${base} text-emerald-700 dark:text-emerald-300`;
+        if (this.updateMessageTone === 'warning') return `${base} text-amber-700 dark:text-amber-300`;
+        if (this.updateMessageTone === 'error') return `${base} text-red-600 dark:text-red-300`;
+        return `${base} text-stone-400 dark:text-zinc-500`;
+    }
+
+    public async runUpdateAction() {
+        if (this.updateInfo.updateAvailable) {
+            await this.downloadAndInstallUpdate();
+            return;
+        }
+        await this.checkForUpdates();
+    }
+
+    public async checkForUpdates() {
+        const api = this.updateApi();
+        if (!api?.check || this.updateBusy) return;
+        this.updateBusy = true;
+        this.updateAction = 'check';
+        this.updateProgress = 0;
+        this.setUpdateMessage('새 버전을 확인하는 중입니다.', 'info');
+        await this.service.render();
+        try {
+            const result = await api.check();
+            this.updateInfo = { ...this.updateInfo, ...result };
+            if (!result?.ok) {
+                this.setUpdateMessage(result?.error || '업데이트를 확인하지 못했습니다.', 'error');
+            } else if (result.updateAvailable) {
+                this.setUpdateMessage(`Notedown v${result.version} 업데이트를 사용할 수 있습니다.`, 'success');
+            } else if (result.error) {
+                this.setUpdateMessage(result.error, 'warning');
+            } else {
+                this.setUpdateMessage('현재 최신 버전을 사용하고 있습니다.', 'success');
+            }
+        } catch (error) {
+            this.setUpdateMessage(this.errorMessage(error, '업데이트를 확인하지 못했습니다.'), 'error');
+        } finally {
+            this.updateAction = '';
+            this.updateBusy = false;
+            await this.service.render();
+        }
+    }
+
+    public async downloadAndInstallUpdate() {
+        const api = this.updateApi();
+        if (!api?.downloadAndInstall || this.updateBusy || !this.updateInfo.updateAvailable) return;
+        const confirmed = await this.service.modal.show({
+            title: '업데이트 설치',
+            message: `Notedown v${this.updateInfo.version}을 내려받아 설치한 뒤 앱을 다시 엽니다. 저장하지 않은 편집 내용이 없는지 확인해 주세요.`,
+            action: '다운로드 및 설치',
+            cancel: '취소',
+            status: 'warning',
+            actionBtn: 'success'
+        });
+        if (!confirmed) return;
+
+        this.updateBusy = true;
+        this.updateAction = 'install';
+        this.updateProgress = 0;
+        this.setUpdateMessage('업데이트 다운로드를 준비하는 중입니다.', 'info');
+        await this.service.render();
+        try {
+            const result = await api.downloadAndInstall();
+            if (!result?.ok || !result.restarting) {
+                if (result?.updateAvailable === false) {
+                    this.updateInfo = { ...this.updateInfo, ...result, updateAvailable: false };
+                }
+                this.setUpdateMessage(
+                    result?.error || '업데이트를 설치하지 못했습니다.',
+                    result?.ok && result?.updateAvailable === false ? 'success' : 'error'
+                );
+                return;
+            }
+            this.setUpdateMessage('업데이트 설치를 시작했습니다. 앱이 곧 다시 열립니다.', 'success');
+        } catch (error) {
+            this.setUpdateMessage(this.errorMessage(error, '업데이트를 설치하지 못했습니다.'), 'error');
+        } finally {
+            this.updateAction = '';
+            this.updateBusy = false;
+            await this.service.render();
+        }
     }
 
     public toggle(key: ToggleKey) {
@@ -842,6 +994,25 @@ export class Component implements OnInit, OnDestroy {
         }
     }
 
+    private async hydrateUpdateInfo() {
+        const api = this.updateApi();
+        if (!api?.current) return;
+        this.updateFeatureAvailable = true;
+        if (api.onStatus && !this.removeUpdateStatusListener) {
+            this.removeUpdateStatusListener = api.onStatus(this.handleUpdateStatus);
+        }
+        try {
+            const result = await api.current();
+            this.updateInfo = { ...this.updateInfo, ...result };
+        } catch (error) {
+            this.setUpdateMessage(this.errorMessage(error, '현재 앱 버전을 확인하지 못했습니다.'), 'error');
+        }
+    }
+
+    private updateApi() {
+        return (window as any).notedown?.update;
+    }
+
     private applyStorageFallback(message: string, tone: StorageMessageTone) {
         const summary = this.localNoteSummary();
         this.storageInfo = {
@@ -875,6 +1046,11 @@ export class Component implements OnInit, OnDestroy {
     private setSyncMessage(message: string, tone: StorageMessageTone) {
         this.syncMessage = message;
         this.syncMessageTone = tone;
+    }
+
+    private setUpdateMessage(message: string, tone: StorageMessageTone) {
+        this.updateMessage = message;
+        this.updateMessageTone = tone;
     }
 
     private applyStartupSyncResult(result: any = null) {

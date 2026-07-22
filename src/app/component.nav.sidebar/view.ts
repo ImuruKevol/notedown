@@ -620,6 +620,18 @@ export class Component implements OnInit, OnDestroy {
         return this.syncStatusVisible;
     }
 
+    public showManualSyncButton() {
+        return !this.showSyncStatus() && Boolean((window as any).notedown?.sync?.runFull);
+    }
+
+    public requestManualSync(event?: Event) {
+        event?.preventDefault();
+        event?.stopPropagation();
+        window.dispatchEvent(new CustomEvent('notedown:manual-sync', {
+            detail: { source: 'component.nav.sidebar' }
+        }));
+    }
+
     public openSyncConflict() {
         if (!this.isSyncConflictStatus()) return;
         window.dispatchEvent(new CustomEvent('notedown:open-sync-conflict'));
@@ -660,12 +672,17 @@ export class Component implements OnInit, OnDestroy {
 
     private loadStartupSyncStatus() {
         const settings = this.readSettings();
+        const result = this.readStartupSyncResult();
         if (!settings.syncToken || !settings.storagePath) {
+            const elapsedMs = Date.now() - Number(result?.syncedAtMs || 0);
+            if (result?.status === 'error' && result.error && elapsedMs <= 10 * 1000) {
+                this.setSyncStatus('동기화 실패', result.error, 'error', 5000);
+                return;
+            }
             this.clearSyncStatus();
             return;
         }
 
-        const result = this.readStartupSyncResult();
         if (!result?.syncedAtMs) {
             this.clearSyncStatus();
             return;

@@ -132,3 +132,5 @@
 | 2026-07-21 | 002 | 저속 네트워크 동기화 및 노트 저장 무결성 오류 수정 | [상세](devlog/2026-07-21/002-sync-slow-network-integrity-fix.md) |
 | 2026-07-21 | 003 | 공백 없는 체크박스 문법 지원 및 저장 기준 진행률 복원 | [상세](devlog/2026-07-21/003-compact-checkbox-syntax.md) |
 | 2026-07-21 | 004 | Notedown 0.2.2 및 Sync Server 1.0.1 멀티플랫폼 릴리스 | [상세](devlog/2026-07-21/004-release-0-2-2.md) |
+| 2026-07-22 | 001 | 사이드바 수동 동기화 및 앱 내 업데이트 설치 기능 추가 | [상세](devlog/2026-07-22/001-manual-sync-in-app-update.md) |
+| 2026-07-22 | 002 | Notedown 0.2.3 멀티플랫폼 릴리스 | [상세](devlog/2026-07-22/002-release-0-2-3.md) |
