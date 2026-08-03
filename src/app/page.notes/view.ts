@@ -2173,13 +2173,15 @@ export class Component implements OnInit, OnDestroy {
     }
 
     private extractSyncConflicts(result: any) {
+        const topLevelConflicts = result?.status === 'conflict' && result?.didApply !== true
+            ? [result?.file, result?.attachment].filter(Boolean)
+            : [];
         const items = [
             ...(Array.isArray(result?.conflicts) ? result.conflicts : []),
             ...(Array.isArray(result?.plan?.conflicts) ? result.plan.conflicts : []),
             ...(Array.isArray(result?.operations?.conflicts) ? result.operations.conflicts : []),
             ...(Array.isArray(result?.attachmentConflicts) ? result.attachmentConflicts : []),
-            ...(result?.file ? [result.file] : []),
-            ...(result?.attachment ? [result.attachment] : [])
+            ...topLevelConflicts
         ];
         const conflicts = new Map<string, any>();
         for (const rawItem of items) {
