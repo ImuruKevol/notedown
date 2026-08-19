@@ -1059,7 +1059,7 @@ export class Component implements OnInit, OnDestroy {
         if (!api?.uploadNote || !settings.syncToken || !storagePath) return;
 
         try {
-            await api.uploadNote({
+            const result = await api.uploadNote({
                 serverUrl: settings.syncServerUrl,
                 token: settings.syncToken,
                 clientId: settings.syncClientId,
@@ -1067,9 +1067,27 @@ export class Component implements OnInit, OnDestroy {
                 note,
                 deleted
             });
+            this.emitSyncOperationResult(result, note);
         } catch (error) {
-            // Local save remains authoritative when server sync is unavailable.
+            this.emitSyncOperationResult({
+                ok: false,
+                status: 'error',
+                error: error instanceof Error ? error.message : '문서 동기화에 실패했습니다.'
+            }, note);
         }
+    }
+
+    private emitSyncOperationResult(result: any, note: NoteItem) {
+        window.dispatchEvent(new CustomEvent('notedown:sync-operation-result', {
+            detail: {
+                result,
+                relativePaths: [
+                    note.relativePath,
+                    ...(note.attachments || []).map(attachment => attachment?.relativePath)
+                ].filter(Boolean),
+                source: 'component.nav.sidebar'
+            }
+        }));
     }
 
     private readSettings() {

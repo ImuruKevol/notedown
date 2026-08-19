@@ -1,7 +1,7 @@
 {
   "name": "notedown",
   "productName": "Notedown",
-  "version": "0.2.4",
+  "version": "0.2.5",
   "description": "Notedown desktop Markdown notes app",
   "author": "Taewook Kwon (ImuruKevol) <kwon3286@season.co.kr>",
   "license": "MIT",
@@ -10,11 +10,6 @@
   "scripts": {
     "electron": "electron .",
     "electron:dev": "NOTEDOWN_DEV_URL=http://localhost:4200 electron .",
-    "android:sync": "npx cap sync android",
-    "android:open": "npx cap open android",
-    "android:run": "npx cap run android",
-    "android:build:debug": "npm run android:sync && cd android && ./gradlew assembleDebug",
-    "android:clean": "cd android && ./gradlew clean",
     "test:electron": "node --test electron/*.test.cjs",
     "dist": "electron-builder",
     "dist:mac:arm64": "electron-builder --mac --arm64",
@@ -24,7 +19,6 @@
   },
   "devDependencies": {
     "@angular/cli": "^21.0.0",
-    "@capacitor/cli": "^8.4.0",
     "electron": "^42.3.0",
     "electron-builder": "^26.8.1"
   },
@@ -75,9 +69,5 @@
       "uninstallDisplayName": "Notedown",
       "include": "build-resources/installer.nsh"
     }
-  },
-  "dependencies": {
-    "@capacitor/android": "^8.4.0",
-    "@capacitor/core": "^8.4.0"
   }
 }

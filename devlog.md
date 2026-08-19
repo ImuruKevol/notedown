@@ -136,3 +136,6 @@
 | 2026-07-22 | 002 | Notedown 0.2.3 멀티플랫폼 릴리스 | [상세](devlog/2026-07-22/002-release-0-2-3.md) |
 | 2026-08-03 | 001 | 충돌 해결 성공 파일의 충돌 재등록 및 뷰어 잔류 수정 | [상세](devlog/2026-08-03/001-sync-conflict-viewer-dismiss.md) |
 | 2026-08-03 | 002 | Notedown 0.2.4 멀티플랫폼 릴리스 | [상세](devlog/2026-08-03/002-release-0-2-4.md) |
+| 2026-08-19 | 001 | 다중 기기 동기화 및 삭제 충돌 수렴 로직 보강 | [상세](devlog/2026-08-19/001-sync-convergence-delete-conflict-hardening.md) |
+| 2026-08-19 | 002 | Android 제거 및 자동 동기화·다중 기기 충돌 기준 보강 | [상세](devlog/2026-08-19/002-remove-android-focus-sync-audit.md) |
+| 2026-08-19 | 003 | Notedown 0.2.5 데스크톱 릴리스 | [상세](devlog/2026-08-19/003-release-0-2-5.md) |

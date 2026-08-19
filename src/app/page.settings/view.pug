@@ -64,7 +64,7 @@ section(class="flex h-full min-h-0 flex-col bg-[#fbfbfa] text-stone-950 dark:bg-
                                     button(type="button", [class]="optionClass(settings.theme === 'dark')", (click)="setTheme('dark')") Dark
                                     button(type="button", [class]="optionClass(settings.theme === 'system')", (click)="setTheme('system')") System
 
-                section(*ngIf="activeSection === 'storage' && !isAndroidPlatform()", class="space-y-6")
+                section(*ngIf="activeSection === 'storage'", class="space-y-6")
                     div(class="border-b border-stone-200 pb-5 dark:border-zinc-800")
                         div(class="flex flex-wrap items-center justify-between gap-3")
                             div

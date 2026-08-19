@@ -1,6 +1,6 @@
 # Notedown
 
-Notedown is a local-first Markdown notes app built with Electron, Capacitor Android, WIZ, and Angular. It is designed for writing Markdown files in a readable local workspace, previewing them immediately, exporting PDFs, and syncing later when a server is available.
+Notedown is a local-first desktop Markdown notes app built with Electron, WIZ, and Angular. It is designed for writing Markdown files in a readable local workspace, previewing them immediately, exporting PDFs, and syncing later when a server is available.
 
 > Developed by [WIZ](https://github.com/season-framework/wiz) with AI.
 
@@ -16,11 +16,11 @@ Notedown is a local-first Markdown notes app built with Electron, Capacitor Andr
 
 ## 한국어
 
-Notedown은 데스크톱과 Android에서 Markdown 문서를 빠르게 작성하고 로컬 파일로 관리하는 노트 앱입니다. Electron/Capacitor 셸 위에 WIZ/Angular 화면을 올렸고, 저장소는 읽기 쉬운 Markdown 파일 경로와 `metadata.db`를 기준으로 동작합니다. 필요할 때 서버 동기화, 충돌 비교, PDF 내보내기를 사용할 수 있습니다.
+Notedown은 데스크톱에서 Markdown 문서를 빠르게 작성하고 로컬 파일로 관리하는 노트 앱입니다. Electron 셸 위에 WIZ/Angular 화면을 올렸고, 저장소는 읽기 쉬운 Markdown 파일 경로와 `metadata.db`를 기준으로 동작합니다. 필요할 때 서버 동기화, 충돌 비교, PDF 내보내기를 사용할 수 있습니다.
 
 ### 주요 기능
 
-- 로컬 우선 저장소: Electron 기본 경로는 `~/Documents/Notedown Notes`이며, Android는 앱 전용 저장소의 Notedown 폴더를 사용합니다.
+- 로컬 우선 저장소: 기본 경로는 `~/Documents/Notedown Notes`입니다.
 - 읽기 쉬운 파일 구조: 앱의 폴더 표시명과 문서 제목을 실제 폴더/Markdown 파일명으로 사용하고, 세부 메타데이터는 SQLite `metadata.db`에 저장합니다.
 - 저장소 관리: 저장소 디렉토리 선택, `metadata.db` 생성/갱신, 저장소 상태 확인, 깊은 경로 Markdown 문서 가져오기를 지원합니다.
 - Markdown 작성 화면: Monaco 기반 편집기, 작성/분할/미리보기 모드, 에디터와 미리보기 hover 동기화, Markdown 접기 UI를 제공합니다.
@@ -29,10 +29,10 @@ Notedown은 데스크톱과 Android에서 Markdown 문서를 빠르게 작성하
 - 커맨드 팔렛트: `Cmd/Ctrl+P`로 노트 검색을 열고, `@`로 워크스페이스 선택, `>`로 설정 명령을 실행할 수 있습니다.
 - 설정: 수동 저장 중심의 저장 흐름, 닫을 때 백그라운드 유지, 시작 프로그램 등록, 앱 업데이트 확인·설치, 기본 보기 모드, 탭 크기, Light/Dark/System 테마를 관리합니다.
 - 첨부 파일: 이미지/파일 첨부, 미리보기 렌더링, 파일 열기, PDF용 첨부 ZIP 생성을 지원합니다.
-- PDF 내보내기: Electron `printToPDF` 또는 Android 네이티브 PDF 흐름으로 현재 노트를 저장합니다.
-- 서버 동기화: 서버 연결 확인, 초기 설정, 로그인, 전체 동기화, 문서/첨부 저장 시 업로드, 시작 시 동기화, 충돌 감지를 지원합니다.
+- PDF 내보내기: Electron `printToPDF`로 현재 노트를 저장합니다.
+- 서버 동기화: 서버 연결 확인, 초기 설정, 로그인, 앱 시작 시 동기화, 문서/첨부 저장 시 업로드, 버튼을 통한 수동 전체 동기화, 충돌 감지를 지원합니다. 포커스 복귀나 화면 표시 전환만으로는 동기화하지 않습니다.
 - 충돌 해결: 동기화 충돌이 발생하면 노트 화면에서 서버 버전과 로컬 버전을 Monaco diff 뷰어로 비교하고 선택한 버전을 적용합니다.
-- 데스크톱/모바일 동작: macOS 상태바/Windows 트레이에서 다시 열기, Android 파일 선택/공유 저장, 백그라운드 유지와 시작 프로그램 등록 설정, Notedown 이름과 앱 아이콘이 적용된 패키징을 지원합니다.
+- 데스크톱 동작: macOS 상태바/Windows 트레이에서 다시 열기, 백그라운드 유지와 시작 프로그램 등록 설정, Notedown 이름과 앱 아이콘이 적용된 패키징을 지원합니다.
 
 ### 기본 워크플로
 
@@ -55,7 +55,6 @@ Notedown은 데스크톱과 Android에서 Markdown 문서를 빠르게 작성하
 ```text
 project/main/
 ├── electron/              # Electron main/preload 프로세스
-├── android/               # Capacitor Android native project
 ├── src/app/               # WIZ/Angular 화면 앱
 ├── src/assets/brand/      # 서비스 로고와 원본 브랜드 에셋
 ├── build-resources/       # Electron 빌드용 icon.icns/icon.ico/icon.png
@@ -76,19 +75,6 @@ npm run electron
 ```bash
 NOTEDOWN_DEV_URL=http://localhost:4200 npm run electron
 ```
-
-### Android 환경
-
-Android 앱은 Capacitor로 구성되어 있으며 `bundle/www/`의 WIZ/Angular 번들을 로드합니다. 현재 Android 브리지는 앱 설정, 앱 전용 로컬 저장소, `metadata.db` 기반 Markdown/첨부 저장, 읽기 쉬운 `storagePath`, 첨부 파일 선택/저장/열기, 동기화 서버 health/setup/login, 전체 동기화, 저장 시 업로드, 충돌 파일 비교/해결, PDF 저장을 지원합니다.
-
-```bash
-npm install
-npm run android:sync
-npm run android:open
-npm run android:build:debug
-```
-
-필요 SDK, 권한, 로컬 HTTP 정책은 [Android Environment](./docs/android-environment.md)를 참고하세요.
 
 ### 배포 빌드
 
@@ -122,11 +108,11 @@ MIT License. 자세한 내용은 `LICENSE`를 참고하세요.
 
 ## English
 
-Notedown is a desktop and Android Markdown note app for writing quickly, keeping notes as local files, and syncing them when needed. It combines Electron/Capacitor shells with a WIZ/Angular interface, stores Markdown files with readable paths and `metadata.db`, and supports packaged builds for macOS, Windows, and Android.
+Notedown is a desktop Markdown note app for writing quickly, keeping notes as local files, and syncing them when needed. It combines an Electron shell with a WIZ/Angular interface, stores Markdown files with readable paths and `metadata.db`, and supports packaged builds for macOS and Windows.
 
 ### Features
 
-- Local-first storage: Electron defaults to `~/Documents/Notedown Notes`, and Android uses an app-specific Notedown folder.
+- Local-first storage: the default path is `~/Documents/Notedown Notes`.
 - Readable file layout: workspace display names and note titles are used as physical folder/Markdown file names, while detailed metadata is stored in SQLite `metadata.db`.
 - Storage management: choose a storage directory, generate or refresh `metadata.db`, inspect storage status, and import deeply nested Markdown documents.
 - Markdown workspace: Monaco-based editor, write/split/preview modes, editor-preview hover sync, and Markdown folding controls.
@@ -135,10 +121,10 @@ Notedown is a desktop and Android Markdown note app for writing quickly, keeping
 - Command palette: open note search with `Cmd/Ctrl+P`, use `@` for workspace selection, and use `>` for settings commands.
 - Settings: manual-save-oriented editing, keep in background on close, launch at startup, in-app update checks and installation, default editor mode, tab size, and Light/Dark/System theme.
 - Attachments: attach images/files, render previews, open files, and include attachments in PDF ZIP exports.
-- PDF export: save the current note through Electron `printToPDF` or Android native PDF output.
-- Server sync: health check, initial setup, login, full sync, save-time document/attachment upload, startup sync, and conflict detection.
+- PDF export: save the current note through Electron `printToPDF`.
+- Server sync: health check, initial setup, login, startup sync, save-time document/attachment upload, manual full sync from the sync button, and conflict detection. Focus or visibility changes do not trigger sync.
 - Conflict resolution: compare server and local versions in a Monaco diff viewer, then apply the selected version.
-- Desktop/mobile behavior: reopen from macOS status bar or Windows tray, use Android file pick/save flows, configure background close and launch-at-startup behavior, and package with the Notedown name and app icon.
+- Desktop behavior: reopen from macOS status bar or Windows tray, configure background close and launch-at-startup behavior, and package with the Notedown name and app icon.
 
 ### Basic Workflow
 
@@ -161,7 +147,6 @@ Notedown is a desktop and Android Markdown note app for writing quickly, keeping
 ```text
 project/main/
 ├── electron/              # Electron main/preload process
-├── android/               # Capacitor Android native project
 ├── src/app/               # WIZ/Angular app screens
 ├── src/assets/brand/      # Source brand logo assets
 ├── build-resources/       # Electron build icons: icon.icns/icon.ico/icon.png
@@ -182,19 +167,6 @@ To attach Electron to a development server:
 ```bash
 NOTEDOWN_DEV_URL=http://localhost:4200 npm run electron
 ```
-
-### Android Environment
-
-The Android app is configured with Capacitor and loads the WIZ/Angular bundle from `bundle/www/`. The current Android bridge supports app preferences, app-specific local note storage, `metadata.db`-backed Markdown/attachment persistence, readable `storagePath` values, attachment pick/save/open, sync server health/setup/login, full sync, save-time upload, conflict read/resolve, and PDF export.
-
-```bash
-npm install
-npm run android:sync
-npm run android:open
-npm run android:build:debug
-```
-
-See [Android Environment](./docs/android-environment.md) for SDK prerequisites, permissions, and local HTTP policy.
 
 ### Release Builds
 

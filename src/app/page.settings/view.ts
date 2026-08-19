@@ -64,6 +64,8 @@ interface SyncConflict {
     clientAttachment?: any;
     serverAttachment?: any;
     serverAttachmentMetadata?: any;
+    localDeleted?: boolean;
+    clientDeleted?: boolean;
 }
 
 interface SyncConflictDetail {
@@ -75,6 +77,7 @@ interface SyncConflictDetail {
     serverContent?: string;
     serverFile?: any;
     serverError?: string;
+    localDeleted?: boolean;
 }
 
 interface UpdateInfo {
@@ -101,7 +104,6 @@ export class Component implements OnInit, OnDestroy {
     private lastSyncedKeepInBackgroundOnClose: boolean | null = null;
     private lastSyncedLaunchAtStartup: boolean | null = null;
     private removeUpdateStatusListener: (() => void) | null = null;
-    private readonly androidSplitMinWidth = 840;
 
     public activeSection = 'general';
     public savedAt = '';
@@ -139,7 +141,6 @@ export class Component implements OnInit, OnDestroy {
         const settings = (event as CustomEvent<AppSettings>).detail;
         if (!settings) return;
         this.settings = this.normalizeSettings(settings);
-        this.ensureVisibleSection();
         this.savedAt = this.nowLabel();
         this.applyTheme();
         void this.service.render();
@@ -188,7 +189,6 @@ export class Component implements OnInit, OnDestroy {
         this.loadSettings();
         await this.hydrateAppPreferences();
         await this.hydrateUpdateInfo();
-        this.ensureVisibleSection();
         this.applyStartupSyncResult();
         await this.ensureDefaultStoragePath();
         await this.refreshStorageInfo();
@@ -207,7 +207,7 @@ export class Component implements OnInit, OnDestroy {
     }
 
     public setSection(id: string) {
-        this.activeSection = this.isVisibleSection(id) ? id : 'general';
+        this.activeSection = this.sections.some(section => section.id === id) ? id : 'general';
     }
 
     public setTheme(theme: ThemeMode) {
@@ -222,11 +222,11 @@ export class Component implements OnInit, OnDestroy {
     }
 
     public visibleSections() {
-        return this.sections.filter(section => this.isVisibleSection(section.id));
+        return this.sections;
     }
 
     public shouldShowSplitEditorMode() {
-        return this.canUseSplitEditorMode();
+        return true;
     }
 
     public setTabSize(value: number | string) {
@@ -608,6 +608,8 @@ export class Component implements OnInit, OnDestroy {
         if (reason === 'server_file_changed') return '서버 파일이 변경되었습니다.';
         if (reason === 'server_metadata_changed') return '서버 메타데이터가 변경되었습니다.';
         if (reason === 'same_path_without_sync_history') return '동기화 이력이 없는 같은 경로의 파일이 서버와 로컬에 모두 있습니다.';
+        if (reason === 'server_file_changed_after_client_delete') return '로컬 삭제 후 다른 기기에서 문서가 변경되었습니다.';
+        if (reason === 'server_attachment_changed_after_client_delete') return '로컬 삭제 후 다른 기기에서 첨부 파일이 변경되었습니다.';
         if (reason === 'conflict') return '서버와 로컬 버전이 충돌했습니다.';
         return reason || '충돌 상세 정보가 필요합니다.';
     }
@@ -625,6 +627,9 @@ export class Component implements OnInit, OnDestroy {
         const conflict = this.selectedSyncConflict();
         if (!conflict) return '';
         if (this.syncConflictBusy) return '로컬 파일을 불러오는 중입니다...';
+        if (conflict.localDeleted || this.syncConflictDetail?.localDeleted) {
+            return '로컬에서 삭제된 항목입니다.';
+        }
         if (this.syncConflictDetail?.localError && !this.syncConflictDetail.localExists) {
             return `로컬 파일을 읽지 못했습니다.\n\n${this.syncConflictDetail.localError}`;
         }
@@ -778,7 +783,7 @@ export class Component implements OnInit, OnDestroy {
             workspaceName: 'Notedown',
             storagePath: '~/Documents/Notedown Notes',
             theme: 'light',
-            editorMode: this.canUseSplitEditorMode() ? 'split' : 'markdown',
+            editorMode: 'split',
             keepInBackgroundOnClose: this.defaultKeepInBackgroundOnClose(),
             launchAtStartup: false,
             tabSize: 2,
@@ -842,30 +847,7 @@ export class Component implements OnInit, OnDestroy {
     }
 
     private normalizeEditorMode(value: unknown): EditorMode {
-        if (value === 'split') return this.canUseSplitEditorMode() ? 'split' : 'markdown';
-        return value === 'markdown' || value === 'preview' ? value : (this.canUseSplitEditorMode() ? 'split' : 'markdown');
-    }
-
-    private isVisibleSection(id: string) {
-        return id !== 'storage' || !this.isAndroidPlatform();
-    }
-
-    private ensureVisibleSection() {
-        if (!this.isVisibleSection(this.activeSection)) this.activeSection = 'general';
-    }
-
-    private canUseSplitEditorMode() {
-        if (this.isAndroidPlatform()) return false;
-        if (!this.isAndroidPlatform()) return true;
-        const width = Math.max(
-            Number(window.innerWidth) || 0,
-            Number(document.documentElement?.clientWidth) || 0
-        );
-        return width >= this.androidSplitMinWidth;
-    }
-
-    public isAndroidPlatform() {
-        return String((window as any).notedown?.platform || '').toLowerCase() === 'android';
+        return value === 'markdown' || value === 'preview' || value === 'split' ? value : 'split';
     }
 
     private normalizeTabSize(value: unknown) {
@@ -943,7 +925,7 @@ export class Component implements OnInit, OnDestroy {
         if (!api?.defaultPath) return;
 
         const result = await api.defaultPath();
-        if (result?.ok && result.storagePath && (this.isAndroidPlatform() || this.shouldUseDefaultStoragePath(result.storagePath))) {
+        if (result?.ok && result.storagePath && this.shouldUseDefaultStoragePath(result.storagePath)) {
             this.settings.storagePath = result.storagePath;
             this.saveSettings();
         }
@@ -1181,7 +1163,9 @@ export class Component implements OnInit, OnDestroy {
                 serverWorkspace: item.serverWorkspace || null,
                 clientAttachment: item.clientAttachment || null,
                 serverAttachment: item.serverAttachment || null,
-                serverAttachmentMetadata: item.serverAttachmentMetadata || null
+                serverAttachmentMetadata: item.serverAttachmentMetadata || null,
+                localDeleted: item.localDeleted === true,
+                clientDeleted: item.clientDeleted === true
             };
             conflicts.set(`${relativePath}:${conflict.reason || ''}`, conflict);
         }

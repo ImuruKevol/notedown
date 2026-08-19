@@ -69,11 +69,7 @@ export class Component implements OnInit, OnDestroy {
     private settingsKey = 'notedown.settings.v1';
     private startupSyncResultKey = 'notedown.sync.startup.result.v1';
     private routeSubscription?: Subscription;
-    private activationSyncBusy = false;
-    private activationSyncLastAttemptMs = Date.now();
-    private lastInactiveAtMs = Date.now();
-    private readonly activationSyncMinIntervalMs = 60 * 1000;
-    private readonly focusIdleThresholdMs = 5 * 60 * 1000;
+    private fullSyncBusy = false;
     private handleWorkspacePanel = (event: Event) => {
         if (this.isSettingsRoute) return;
         this.workspacePanelOpen = Boolean((event as CustomEvent<boolean>).detail);
@@ -105,21 +101,13 @@ export class Component implements OnInit, OnDestroy {
         event.stopImmediatePropagation();
         this.openPalette(event.shiftKey ? '>' : '');
     };
-    private handleWindowFocus = () => {
-        this.scheduleActivationSync();
-    };
-    private handleWindowBlur = () => {
-        this.lastInactiveAtMs = Date.now();
-    };
-    private handleVisibilityChange = () => {
-        if (document.visibilityState === 'visible') {
-            this.scheduleActivationSync();
-            return;
-        }
-        this.lastInactiveAtMs = Date.now();
-    };
     private handleManualSync = () => {
         void this.runManualSync();
+    };
+    private handleSyncOperationResult = (event: Event) => {
+        const detail = (event as CustomEvent<any>).detail || {};
+        if (!detail.result) return;
+        this.mergeSyncOperationResult(detail.result, detail.relativePaths);
     };
 
     public mobileOpen = false;
@@ -144,10 +132,8 @@ export class Component implements OnInit, OnDestroy {
         window.addEventListener('notedown:workspace-changed', this.handleWorkspaceChanged);
         window.addEventListener('storage', this.handleStorageChanged);
         window.addEventListener('keydown', this.handlePaletteShortcut, true);
-        window.addEventListener('focus', this.handleWindowFocus);
-        window.addEventListener('blur', this.handleWindowBlur);
         window.addEventListener('notedown:manual-sync', this.handleManualSync);
-        document.addEventListener('visibilitychange', this.handleVisibilityChange);
+        window.addEventListener('notedown:sync-operation-result', this.handleSyncOperationResult);
         this.routeSubscription = this.router.events
             .pipe(filter(event => event instanceof NavigationEnd))
             .subscribe(() => this.syncRouteState());
@@ -161,10 +147,8 @@ export class Component implements OnInit, OnDestroy {
         window.removeEventListener('notedown:workspace-changed', this.handleWorkspaceChanged);
         window.removeEventListener('storage', this.handleStorageChanged);
         window.removeEventListener('keydown', this.handlePaletteShortcut, true);
-        window.removeEventListener('focus', this.handleWindowFocus);
-        window.removeEventListener('blur', this.handleWindowBlur);
         window.removeEventListener('notedown:manual-sync', this.handleManualSync);
-        document.removeEventListener('visibilitychange', this.handleVisibilityChange);
+        window.removeEventListener('notedown:sync-operation-result', this.handleSyncOperationResult);
         this.routeSubscription?.unsubscribe();
     }
 
@@ -717,8 +701,7 @@ export class Component implements OnInit, OnDestroy {
     }
 
     private canUseLaunchAtStartupCommand() {
-        const platform = String((window as any).notedown?.platform || '').toLowerCase();
-        return platform !== 'android' && Boolean((window as any).notedown?.app?.setPreferences);
+        return Boolean((window as any).notedown?.app?.setPreferences);
     }
 
     private applyTheme() {
@@ -736,35 +719,6 @@ export class Component implements OnInit, OnDestroy {
         }).catch(() => { });
     }
 
-    private scheduleActivationSync() {
-        window.setTimeout(() => { void this.runActivationSync(); }, 250);
-    }
-
-    private async runActivationSync() {
-        const api = (window as any).notedown?.sync;
-        const settings = this.readSettings();
-        if (!api?.runFull || !this.canRunSavedSync(settings)) return;
-
-        const now = Date.now();
-        const inactiveMs = now - this.lastInactiveAtMs;
-        const lastResult = this.readStartupSyncResult();
-        if (this.activationSyncBusy) return;
-        if (lastResult.status === 'running' && now - Number(lastResult.syncedAtMs || 0) <= 5 * 60 * 1000) return;
-        if (this.syncConflictCount(lastResult) > 0) {
-            this.broadcastSyncResult(lastResult);
-            return;
-        }
-        if (now - this.activationSyncLastAttemptMs < this.activationSyncMinIntervalMs) return;
-        if (
-            lastResult?.syncedAtMs
-            && now - Number(lastResult.syncedAtMs) < this.activationSyncMinIntervalMs
-            && inactiveMs < this.focusIdleThresholdMs
-        ) return;
-
-        this.activationSyncLastAttemptMs = now;
-        await this.runSavedSync(settings, '포커스 동기화에 실패했습니다.', 'layout.sidebar-sync');
-    }
-
     private async runManualSync() {
         const api = (window as any).notedown?.sync;
         const settings = this.readSettings();
@@ -776,19 +730,18 @@ export class Component implements OnInit, OnDestroy {
             this.storeSyncResult({ ok: false, status: 'error', error: '설정에서 동기화 서버에 로그인한 뒤 다시 시도해 주세요.' });
             return;
         }
-        if (this.activationSyncBusy) {
+        if (this.fullSyncBusy) {
             this.broadcastSyncResult(this.readStartupSyncResult());
             return;
         }
-        this.activationSyncLastAttemptMs = Date.now();
         await this.runSavedSync(settings, '수동 동기화에 실패했습니다.', 'layout.sidebar-manual-sync');
     }
 
     private async runSavedSync(settings: AppSettings, fallbackError: string, source: string) {
         const api = (window as any).notedown?.sync;
-        if (!api?.runFull || this.activationSyncBusy) return;
+        if (!api?.runFull || this.fullSyncBusy) return;
 
-        this.activationSyncBusy = true;
+        this.fullSyncBusy = true;
         this.storeSyncResult({ ok: false, status: 'running' });
 
         try {
@@ -811,8 +764,7 @@ export class Component implements OnInit, OnDestroy {
                 error: error instanceof Error && error.message ? error.message : fallbackError
             });
         } finally {
-            this.activationSyncBusy = false;
-            this.lastInactiveAtMs = Date.now();
+            this.fullSyncBusy = false;
         }
     }
 
@@ -852,6 +804,61 @@ export class Component implements OnInit, OnDestroy {
         localStorage.setItem(this.startupSyncResultKey, JSON.stringify(payload));
         this.broadcastSyncResult(payload);
         return payload;
+    }
+
+    private mergeSyncOperationResult(result: any, rawRelativePaths: any = []) {
+        const incomingConflicts = this.extractSyncConflicts(result);
+        const previous = this.readStartupSyncResult();
+        const previousConflicts = this.extractSyncConflicts(previous);
+        const relativePaths = Array.isArray(rawRelativePaths) ? rawRelativePaths : [rawRelativePaths];
+        const affectedPaths = new Set(
+            relativePaths
+                .map(value => String(value || '').replace(/\\/g, '/').replace(/^\/+|\/+$/g, ''))
+                .filter(Boolean)
+        );
+        for (const conflict of incomingConflicts) affectedPaths.add(conflict.relativePath);
+
+        const canReplaceAffected = incomingConflicts.length > 0
+            || result?.ok === true
+            || result?.didApply === true
+            || result?.status === 'ok'
+            || result?.status === 'conflict';
+        const merged = new Map<string, any>();
+        for (const conflict of previousConflicts) {
+            if (canReplaceAffected && affectedPaths.has(conflict.relativePath)) continue;
+            merged.set(`${conflict.relativePath}:${conflict.reason || ''}`, conflict);
+        }
+        for (const conflict of incomingConflicts) {
+            merged.set(`${conflict.relativePath}:${conflict.reason || ''}`, conflict);
+        }
+
+        const conflicts = Array.from(merged.values());
+        const rawSummary = result?.summary || previous?.summary || {};
+        const status = conflicts.length > 0
+            ? 'conflict'
+            : result?.ok
+                ? 'ok'
+                : result?.status || 'error';
+        const payload = {
+            status,
+            ok: Boolean(result?.ok && conflicts.length === 0),
+            summary: {
+                uploadFiles: Number(rawSummary.uploadFiles) || 0,
+                downloadFiles: Number(rawSummary.downloadFiles) || 0,
+                deleteServerFiles: Number(rawSummary.deleteServerFiles) || 0,
+                deleteLocalFiles: Number(rawSummary.deleteLocalFiles) || 0,
+                uploadAttachments: Number(rawSummary.uploadAttachments) || 0,
+                downloadAttachments: Number(rawSummary.downloadAttachments) || 0,
+                deleteServerAttachments: Number(rawSummary.deleteServerAttachments) || 0,
+                deleteLocalAttachments: Number(rawSummary.deleteLocalAttachments) || 0,
+                conflicts: conflicts.length
+            },
+            conflicts,
+            error: result?.error || '',
+            syncedAtMs: Date.now()
+        };
+        localStorage.setItem(this.startupSyncResultKey, JSON.stringify(payload));
+        this.broadcastSyncResult(payload);
     }
 
     private broadcastSyncResult(result: any) {
@@ -905,7 +912,9 @@ export class Component implements OnInit, OnDestroy {
                 serverWorkspace: item.serverWorkspace || null,
                 clientAttachment: item.clientAttachment || null,
                 serverAttachment: item.serverAttachment || null,
-                serverAttachmentMetadata: item.serverAttachmentMetadata || null
+                serverAttachmentMetadata: item.serverAttachmentMetadata || null,
+                localDeleted: item.localDeleted === true,
+                clientDeleted: item.clientDeleted === true
             });
         }
         return Array.from(conflicts.values());
