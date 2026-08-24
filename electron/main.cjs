@@ -14,18 +14,53 @@ const {
 } = require('./metadata-store.cjs');
 const { createKeyedQueue } = require('./keyed-queue.cjs');
 const {
+    runSyncConflictBatch,
+    serverResolutionStillCurrent
+} = require('./sync-conflict-batch.cjs');
+const {
     acknowledgedSyncUploadEntry,
+    clearAcknowledgedSyncMutations,
     isLocalDeleteConflict,
     isLocalStorageChangedResult,
+    isPendingSyncDeleteIntent,
+    isPendingSyncDeleteState,
     markLocalDeleteConflict,
-    syncStateFromManifest
+    shouldPreserveLocalSyncEntry,
+    syncLocalMetadataFingerprint,
+    syncManifestEntryChanged,
+    syncStateFromManifest,
+    updateSyncEntryLocalMetadataHash
 } = require('./sync-state.cjs');
 const {
+    applyLocalIdentityDetailsToRebasedState,
+    consolidateDuplicateMetadataStoragePaths,
+    findPendingDeleteIdentity,
+    matchSyncIdentityEntries,
+    rebaseMetadataRelativePaths,
+    shouldRebaseServerRevision
+} = require('./sync-rebase.cjs');
+const {
+    identityMatches,
     indexPreviousAttachmentIdentities,
     indexPreviousNoteIdentities,
     prepareNoteStorageIdentities,
     selectMissingPreviousNotes
 } = require('./storage-identity.cjs');
+const {
+    isTransientSyncNetworkError,
+    recoverMutationFromManifest,
+    shouldProbeMutationResult,
+    shouldRetrySyncNetworkError,
+    syncNetworkErrorKind,
+    syncNetworkUserMessage,
+    syncRequestTimeoutMs
+} = require('./sync-network.cjs');
+const {
+    shouldStartHiddenLoginItem,
+    windowsLoginItemEnabled,
+    windowsLoginItemOptions,
+    windowsLoginItemQuery
+} = require('./startup-settings.cjs');
 const {
     createUpdater,
     DEFAULT_UPDATE_SHARE_URL,
@@ -62,7 +97,6 @@ let appPreferences = {
 
 const LEGACY_METADATA_FILE = 'metadata.json';
 const SYNC_STATE_FILE = '.notedown-sync.json';
-const SYNC_REQUEST_TIMEOUT_MS = 60000;
 const RETRYABLE_SYNC_ENDPOINTS = new Set(['/api/sync/plan']);
 const IMPORTED_WORKSPACE_ID = '_imported';
 const UNFILED_WORKSPACE_ID = 'unfiled';
@@ -106,10 +140,7 @@ function supportsLaunchAtStartup() {
 
 function loginItemSettingsOptions() {
     if (process.platform !== 'win32') return {};
-    return {
-        path: process.execPath,
-        args: [START_HIDDEN_ARG]
-    };
+    return windowsLoginItemQuery(process.execPath, START_HIDDEN_ARG);
 }
 
 function loginItemOptions(openAtLogin) {
@@ -117,9 +148,12 @@ function loginItemOptions(openAtLogin) {
     if (process.platform === 'darwin') {
         options.openAsHidden = true;
     } else if (process.platform === 'win32') {
-        options.path = process.execPath;
-        options.args = [START_HIDDEN_ARG];
-        options.name = APP_NAME;
+        return windowsLoginItemOptions(
+            process.execPath,
+            APP_NAME,
+            START_HIDDEN_ARG,
+            openAtLogin
+        );
     }
     return options;
 }
@@ -133,7 +167,9 @@ function launchAtStartupState() {
         const settings = app.getLoginItemSettings(loginItemSettingsOptions());
         return {
             launchAtStartupSupported: true,
-            launchAtStartup: Boolean(settings.openAtLogin)
+            launchAtStartup: process.platform === 'win32'
+                ? windowsLoginItemEnabled(settings, loginItemSettingsOptions())
+                : Boolean(settings.openAtLogin)
         };
     } catch (error) {
         return {
@@ -582,7 +618,8 @@ async function exists(filePath) {
         await fs.access(filePath);
         return true;
     } catch (error) {
-        return false;
+        if (error?.code === 'ENOENT') return false;
+        throw error;
     }
 }
 
@@ -649,6 +686,14 @@ async function readSyncState(storagePath) {
     try {
         return JSON.parse(await fs.readFile(syncStatePath(storagePath), 'utf8'));
     } catch (error) {
+        if (error?.code !== 'ENOENT') {
+            const stateError = new Error(
+                '동기화 상태 파일을 읽지 못했습니다. 상태를 초기화하지 않았으며 파일 권한과 손상 여부를 확인해야 합니다.'
+            );
+            stateError.code = 'SYNC_STATE_UNREADABLE';
+            stateError.cause = error;
+            throw stateError;
+        }
         return {
             serverRevision: 0,
             metadataRevision: 0,
@@ -669,6 +714,242 @@ async function writeSyncState(storagePath, state) {
     } finally {
         await fs.rm(temporaryPath, { force: true }).catch(() => undefined);
     }
+}
+
+function syncMutationJournalKey(endpoint, relativePath) {
+    const kind = String(endpoint || '').includes('/attachment') ? 'attachment' : 'file';
+    return `${kind}:${normalizeRelativePath(relativePath)}`;
+}
+
+function syncMutationProofBody(body = {}) {
+    return {
+        relativePath: normalizeRelativePath(body.relativePath),
+        lastKnownRevision: Number(body.lastKnownRevision) || 0,
+        deleted: isDeletedFlag(body.deleted),
+        contentHash: body.contentHash || null,
+        updatedAtMs: Number(body.updatedAtMs) || null,
+        ...(body.note ? { note: body.note } : {}),
+        ...(body.attachment ? { attachment: body.attachment } : {})
+    };
+}
+
+async function rememberUncertainSyncMutation(prepared, endpoint) {
+    const key = syncMutationJournalKey(endpoint, prepared.body.relativePath);
+    await runStorageOperation(prepared.storagePath, async () => {
+        const state = await readSyncState(prepared.storagePath);
+        state.uncertainMutations = {
+            ...(state.uncertainMutations || {}),
+            [key]: {
+                endpoint,
+                body: syncMutationProofBody(prepared.body),
+                attemptedAt: new Date().toISOString()
+            }
+        };
+        state.updatedAt = new Date().toISOString();
+        await writeSyncState(prepared.storagePath, state);
+    });
+    return key;
+}
+
+async function forgetUncertainSyncMutation(storagePath, key) {
+    await runStorageOperation(storagePath, async () => {
+        const state = await readSyncState(storagePath);
+        if (!state.uncertainMutations?.[key]) return;
+        delete state.uncertainMutations[key];
+        if (Object.keys(state.uncertainMutations).length === 0) delete state.uncertainMutations;
+        state.updatedAt = new Date().toISOString();
+        await writeSyncState(storagePath, state);
+    });
+}
+
+async function recoverPreviousUncertainSyncMutation(prepared, endpoint) {
+    const key = syncMutationJournalKey(endpoint, prepared.body.relativePath);
+    const state = await readSyncState(prepared.storagePath);
+    const mutation = state.uncertainMutations?.[key];
+    if (!mutation) return null;
+
+    const proof = await recoverMutationFromManifest({
+        loadManifest: () => fetchFreshSyncManifest(
+            prepared.serverUrl,
+            prepared.token,
+            state.serverRevision,
+            { timeoutMs: 8000, maxAttempts: 1 }
+        ),
+        acknowledged: manifest => acknowledgedSyncUploadEntry(
+            mutation.body,
+            mutation.endpoint || endpoint,
+            manifest
+        )
+    });
+    if (!proof.manifest) {
+        const recoveryError = proof.error || new Error('이전 동기화 결과를 확인하지 못했습니다.');
+        recoveryError.userMessage = syncNetworkUserMessage(recoveryError)
+            || '이전 동기화 요청의 서버 반영 여부를 확인하지 못했습니다. 로컬 변경은 보존되며 연결이 안정된 뒤 다시 시도할 수 있습니다.';
+        throw recoveryError;
+    }
+
+    const nextState = await runStorageOperation(prepared.storagePath, async () => {
+        const currentState = await readSyncState(prepared.storagePath);
+        const checkpoint = await writeSyncStateFromManifest(
+            prepared.storagePath,
+            proof.manifest,
+            currentState,
+            proof.acknowledged
+                ? preparedUploadCheckpointOptions(
+                    { body: mutation.body },
+                    mutation.endpoint || endpoint
+                )
+                : {}
+        );
+        return checkpoint;
+    });
+    prepared.syncState = nextState;
+    prepared.body.baseRevision = Number(nextState.serverRevision)
+        || Number(proof.manifest.serverRevision)
+        || 0;
+    const attachment = endpoint.includes('/attachment');
+    const entryState = attachment
+        ? nextState.attachments?.[prepared.body.relativePath]
+        : nextState.files?.[prepared.body.relativePath];
+    prepared.body.lastKnownRevision = Number(entryState?.lastKnownRevision) || 0;
+
+    const acknowledgedEntry = acknowledgedSyncUploadEntry(
+        prepared.body,
+        endpoint,
+        proof.manifest
+    );
+    if (!acknowledgedEntry) return { recovered: proof.acknowledged, manifest: proof.manifest };
+    return {
+        recovered: true,
+        response: {
+            status: 'ok',
+            manifest: proof.manifest,
+            recoveredBeforeRetry: true,
+            ...(attachment ? { attachment: acknowledgedEntry } : { file: acknowledgedEntry })
+        }
+    };
+}
+
+function normalizeSyncManifest(manifest = {}) {
+    return {
+        ...manifest,
+        files: (manifest.files || [])
+            .filter(file => file?.relativePath && !isSystemRelativePath(file.relativePath))
+            .map(file => ({ ...file, relativePath: normalizeRelativePath(file.relativePath) })),
+        attachments: (manifest.attachments || [])
+            .filter(file => file?.relativePath && !isSystemRelativePath(file.relativePath))
+            .map(file => ({ ...file, relativePath: normalizeRelativePath(file.relativePath) }))
+    };
+}
+
+function syncCheckpointAcceptedPaths(options = {}) {
+    return new Set([
+        ...(Array.isArray(options.acceptPaths) ? options.acceptPaths : []),
+        ...(Array.isArray(options.clearRebaseConflictPaths)
+            ? options.clearRebaseConflictPaths
+            : [])
+    ].map(value => normalizeRelativePath(value)));
+}
+
+async function localCheckpointDescriptor(storagePath, storageRelativePath, metadata) {
+    try {
+        const content = await fs.readFile(
+            resolveStorageFile(storagePath, storageRelativePath).absolutePath
+        );
+        return {
+            exists: true,
+            contentHash: sha256(content),
+            updatedAtMs: Number(metadata?.updatedAtMs) || 0,
+            metadata
+        };
+    } catch (error) {
+        if (error?.code !== 'ENOENT') throw error;
+        return {
+            exists: false,
+            contentHash: null,
+            updatedAtMs: Number(metadata?.updatedAtMs) || 0,
+            metadata
+        };
+    }
+}
+
+async function protectLocallyChangedCheckpointPaths(
+    storagePath,
+    currentState,
+    manifest,
+    options = {}
+) {
+    const acceptedPaths = syncCheckpointAcceptedPaths(options);
+    const metadata = await readMetadata(storagePath);
+    const notes = new Map();
+    const attachments = new Map();
+    for (const note of metadata?.notes || []) {
+        if (!note?.relativePath) continue;
+        const relativePath = normalizeRelativePath(note.relativePath);
+        notes.set(relativePath, note);
+        for (const attachment of note.attachments || []) {
+            if (!attachment?.relativePath || isDeletedFlag(attachment.deleted)) continue;
+            attachments.set(normalizeRelativePath(attachment.relativePath), attachment);
+        }
+    }
+
+    const preservePaths = new Set(
+        (Array.isArray(options.preservePaths) ? options.preservePaths : [])
+            .map(value => normalizeRelativePath(value))
+    );
+    const inspectEntries = async (entries, stateEntries, localEntries, attachment) => {
+        for (const remote of entries || []) {
+            const relativePath = normalizeRelativePath(remote.relativePath);
+            if (acceptedPaths.has(relativePath)) continue;
+            const localMetadata = localEntries.get(relativePath);
+            if (!localMetadata) continue;
+            const previous = stateEntries?.[relativePath];
+            if (!syncManifestEntryChanged(previous, remote)) continue;
+            const storageRelativePath = attachment
+                ? normalizeRelativePath(localMetadata.storagePath || relativePath)
+                : noteStoragePath(localMetadata, relativePath);
+            const local = await localCheckpointDescriptor(
+                storagePath,
+                storageRelativePath,
+                localMetadata
+            );
+            if (shouldPreserveLocalSyncEntry(previous, remote, local, attachment)) {
+                preservePaths.add(relativePath);
+            }
+        }
+    };
+    await inspectEntries(manifest.files, currentState.files, notes, false);
+    await inspectEntries(manifest.attachments, currentState.attachments, attachments, true);
+    return { acceptedPaths, attachments, notes, preservePaths };
+}
+
+function updateCheckpointLocalMetadataHashes(state, currentState, local, acceptedPaths, options = {}) {
+    const acceptedMetadataByPath = options.acceptedMetadataByPath || {};
+    for (const [relativePath, note] of local.notes.entries()) {
+        const accepted = acceptedPaths.has(relativePath);
+        updateSyncEntryLocalMetadataHash(
+            state.files?.[relativePath],
+            currentState.files?.[relativePath],
+            accepted && acceptedMetadataByPath[relativePath]
+                ? acceptedMetadataByPath[relativePath]
+                : note,
+            false,
+            accepted
+        );
+    }
+    for (const [relativePath, attachment] of local.attachments.entries()) {
+        const accepted = acceptedPaths.has(relativePath);
+        updateSyncEntryLocalMetadataHash(
+            state.attachments?.[relativePath],
+            currentState.attachments?.[relativePath],
+            accepted && acceptedMetadataByPath[relativePath]
+                ? acceptedMetadataByPath[relativePath]
+                : attachment,
+            true,
+            accepted
+        );
+    }
+    return state;
 }
 
 function syncConflictCheckpointOptions(items = [], fallbackRelativePath = '') {
@@ -706,23 +987,237 @@ function syncConflictCheckpointOptions(items = [], fallbackRelativePath = '') {
 async function writeSyncStateFromManifest(storagePath, manifest, previousState = {}, options = {}) {
     if (!manifest) return previousState;
     const currentState = await readSyncState(storagePath);
-    const normalizedManifest = {
-        ...manifest,
-        files: (manifest.files || [])
-            .filter(file => file?.relativePath && !isSystemRelativePath(file.relativePath))
-            .map(file => ({ ...file, relativePath: normalizeRelativePath(file.relativePath) })),
-        attachments: (manifest.attachments || [])
-            .filter(file => file?.relativePath && !isSystemRelativePath(file.relativePath))
-            .map(file => ({ ...file, relativePath: normalizeRelativePath(file.relativePath) }))
-    };
-    const { state, shouldWrite } = syncStateFromManifest(
+    const normalizedManifest = normalizeSyncManifest(manifest);
+    const initial = syncStateFromManifest(
         currentState,
         normalizedManifest,
         previousState,
         options
     );
-    if (shouldWrite) await writeSyncState(storagePath, state);
+    if (!initial.shouldWrite) return initial.state;
+    const local = await protectLocallyChangedCheckpointPaths(
+        storagePath,
+        currentState,
+        normalizedManifest,
+        options
+    );
+    const { state, shouldWrite } = syncStateFromManifest(
+        currentState,
+        normalizedManifest,
+        previousState,
+        {
+            ...options,
+            preservePaths: [...local.preservePaths],
+            preserveState: currentState
+        }
+    );
+    if (shouldWrite) {
+        updateCheckpointLocalMetadataHashes(
+            state,
+            currentState,
+            local,
+            local.acceptedPaths,
+            options
+        );
+        clearAcknowledgedSyncMutations(state, normalizedManifest);
+        await writeSyncState(storagePath, state);
+    }
     return state;
+}
+
+async function localSyncIdentityDescriptors(storagePath, metadata = {}) {
+    const notes = [];
+    const attachments = [];
+    for (const note of metadata.notes || []) {
+        if (!note?.relativePath) continue;
+        const relativePath = normalizeRelativePath(note.relativePath);
+        const storagePathForNote = noteStoragePath(note, relativePath);
+        let contentHash = '';
+        try {
+            contentHash = sha256(await fs.readFile(resolveStorageFile(storagePath, storagePathForNote).absolutePath));
+        } catch (error) {
+            if (error?.code !== 'ENOENT') throw error;
+        }
+        notes.push({
+            relativePath,
+            id: String(note.id || '').trim(),
+            storagePath: storagePathForNote,
+            contentHash,
+            note
+        });
+
+        for (const attachment of note.attachments || []) {
+            if (!attachment?.relativePath || isDeletedFlag(attachment.deleted)) continue;
+            const attachmentRelativePath = normalizeRelativePath(attachment.relativePath);
+            const attachmentStoragePath = normalizeRelativePath(attachment.storagePath || attachmentRelativePath);
+            let attachmentHash = '';
+            try {
+                attachmentHash = sha256(await fs.readFile(
+                    resolveStorageFile(storagePath, attachmentStoragePath).absolutePath
+                ));
+            } catch (error) {
+                if (error?.code !== 'ENOENT') throw error;
+            }
+            attachments.push({
+                attachmentIdentity: true,
+                relativePath: attachmentRelativePath,
+                id: String(attachment.id || attachment.attachmentId || '').trim(),
+                storagePath: attachmentStoragePath,
+                contentHash: attachmentHash,
+                noteRelativePath: relativePath,
+                attachment,
+                note
+            });
+        }
+    }
+    return { notes, attachments };
+}
+
+function remoteSyncIdentityDescriptors(manifest = {}) {
+    return {
+        notes: (manifest.files || []).map(file => ({ ...file })),
+        attachments: (manifest.attachments || []).map(attachment => ({
+            ...attachment,
+            attachmentIdentity: true
+        }))
+    };
+}
+
+function pendingDeleteDescriptors(syncState = {}, attachment = false) {
+    const entries = attachment ? syncState.attachments : syncState.files;
+    return Object.entries(entries || {})
+        .filter(([_relativePath, state]) => isPendingSyncDeleteIntent(state))
+        .map(([relativePath, state]) => ({
+            ...state,
+            ...(attachment ? { attachmentIdentity: true } : {}),
+            relativePath: normalizeRelativePath(relativePath),
+            id: attachment
+                ? String(state.attachmentId || '').trim()
+                : String(state.noteId || '').trim()
+        }));
+}
+
+function preservePendingDeletesAfterRebase(state, syncState, manifest) {
+    const remote = remoteSyncIdentityDescriptors(manifest);
+    const pendingNotes = matchSyncIdentityEntries(
+        pendingDeleteDescriptors(syncState, false),
+        remote.notes
+    ).matches;
+    const pendingAttachments = matchSyncIdentityEntries(
+        pendingDeleteDescriptors(syncState, true),
+        remote.attachments
+    ).matches;
+    for (const match of pendingNotes) {
+        if (isDeletedFlag(match.remote.deleted)) continue;
+        const entry = state.files?.[normalizeRelativePath(match.remote.relativePath)];
+        if (entry) {
+            entry.pendingDelete = true;
+            entry.lastKnownRevision = 0;
+            entry.rebaseConflict = true;
+            if (match.local.storagePath) {
+                entry.storagePath = normalizeRelativePath(match.local.storagePath);
+            }
+            if (Array.isArray(match.local.syncIdentityAliases)) {
+                entry.syncIdentityAliases = [...match.local.syncIdentityAliases];
+            }
+        }
+    }
+    for (const match of pendingAttachments) {
+        if (isDeletedFlag(match.remote.deleted)) continue;
+        const entry = state.attachments?.[normalizeRelativePath(match.remote.relativePath)];
+        if (entry) {
+            entry.pendingDelete = true;
+            entry.lastKnownRevision = 0;
+            entry.rebaseConflict = true;
+            if (match.local.storagePath) {
+                entry.storagePath = normalizeRelativePath(match.local.storagePath);
+            }
+            if (match.remote.noteRelativePath) {
+                entry.noteRelativePath = normalizeRelativePath(match.remote.noteRelativePath);
+            }
+            if (Array.isArray(match.local.syncIdentityAliases)) {
+                entry.syncIdentityAliases = [...match.local.syncIdentityAliases];
+            }
+        }
+    }
+}
+
+async function fetchFreshSyncManifest(serverUrl, token, clientRevision, options = {}) {
+    const query = new URLSearchParams({
+        notedownClientRevision: String(Number(clientRevision) || 0),
+        notedownNonce: crypto.randomUUID()
+    });
+    return syncRequest(serverUrl, `/api/manifest?${query.toString()}`, {
+        token,
+        ...options,
+        headers: { 'Cache-Control': 'no-cache', ...(options.headers || {}) }
+    });
+}
+
+async function rebaseSyncStateIfServerReset(args = {}) {
+    const { storagePath, serverUrl, token } = syncConfig(args);
+    const initialState = await readSyncState(storagePath);
+    if (!hasSyncHistory(initialState) || Number(initialState.serverRevision) <= 0) {
+        return { rebased: false };
+    }
+
+    let manifest = await fetchFreshSyncManifest(serverUrl, token, initialState.serverRevision);
+    if (!shouldRebaseServerRevision(initialState, manifest)) return { rebased: false, manifest };
+    manifest = await fetchFreshSyncManifest(serverUrl, token, initialState.serverRevision);
+    if (!shouldRebaseServerRevision(initialState, manifest)) return { rebased: false, manifest };
+
+    return runStorageOperation(storagePath, async () => {
+        const syncState = await readSyncState(storagePath);
+        if (!shouldRebaseServerRevision(syncState, manifest)) return { rebased: false, manifest };
+        const storedMetadata = await ensureMetadata(storagePath);
+        const normalizedManifest = normalizeSyncManifest(manifest);
+        const duplicateRepair = consolidateDuplicateMetadataStoragePaths(
+            storedMetadata,
+            syncState,
+            normalizedManifest
+        );
+        if (duplicateRepair.unresolved > 0) {
+            throw new Error('같은 실제 파일을 가리키는 문서 identity를 안전하게 복구하지 못했습니다.');
+        }
+        const metadata = duplicateRepair.metadata;
+        validateMetadataStorageIdentities(metadata);
+        const local = await localSyncIdentityDescriptors(storagePath, metadata);
+        const remote = remoteSyncIdentityDescriptors(normalizedManifest);
+        const noteMatches = matchSyncIdentityEntries(local.notes, remote.notes).matches;
+        const attachmentMatches = matchSyncIdentityEntries(local.attachments, remote.attachments).matches;
+        const metadataRebase = rebaseMetadataRelativePaths(metadata, noteMatches, attachmentMatches);
+        validateMetadataStorageIdentities(metadataRebase.metadata);
+
+        const { state, shouldWrite } = syncStateFromManifest(
+            syncState,
+            normalizedManifest,
+            syncState,
+            { allowServerRevisionReset: true }
+        );
+        if (!shouldWrite) return { rebased: false, manifest };
+        applyLocalIdentityDetailsToRebasedState(state, noteMatches, attachmentMatches);
+        preservePendingDeletesAfterRebase(state, syncState, normalizedManifest);
+        state.lastServerRevisionReset = {
+            previousRevision: Number(syncState.serverRevision) || 0,
+            serverRevision: Number(normalizedManifest.serverRevision) || 0,
+            recoveredAt: new Date().toISOString()
+        };
+        if (duplicateRepair.changed || metadataRebase.changed) {
+            metadataRebase.metadata.generatedAt = new Date().toISOString();
+            await writeMetadata(storagePath, metadataRebase.metadata);
+        }
+        await writeSyncState(storagePath, state);
+        bumpStorageMutationGeneration(storagePath);
+        return {
+            rebased: true,
+            manifest: normalizedManifest,
+            previousRevision: Number(syncState.serverRevision) || 0,
+            serverRevision: Number(normalizedManifest.serverRevision) || 0,
+            matchedFiles: noteMatches.length,
+            matchedAttachments: attachmentMatches.length,
+            consolidatedDuplicateFiles: duplicateRepair.consolidated
+        };
+    });
 }
 
 function sha256(buffer) {
@@ -933,7 +1428,10 @@ function normalizeAttachmentMetadata(attachment = {}, noteRelativePath = '') {
         size: Number.isFinite(attachment.size) ? Number(attachment.size) : null,
         contentHash: attachment.contentHash || null,
         updatedAtMs: Number.isFinite(attachment.updatedAtMs) ? Number(attachment.updatedAtMs) : null,
-        deleted: isDeletedFlag(attachment.deleted)
+        deleted: isDeletedFlag(attachment.deleted),
+        ...(Array.isArray(attachment.syncIdentityAliases) && attachment.syncIdentityAliases.length > 0
+            ? { syncIdentityAliases: [...new Set(attachment.syncIdentityAliases.map(String).filter(Boolean))] }
+            : {})
     };
 }
 
@@ -972,10 +1470,21 @@ function resolveAttachmentStorageIdentity(metadata, attachment = {}, noteRelativ
     if (existing && existing.noteRelativePath !== safeNoteRelativePath) {
         throw new Error(`첨부가 다른 노트에 연결되어 있습니다: ${requestedRelativePath || requestedId}`);
     }
-    if (existingById && requestedRelativePath && existingById.relativePath !== requestedRelativePath) {
+    if (
+        existingById
+        && requestedRelativePath
+        && existingById.relativePath !== requestedRelativePath
+        && !identityMatches(existingById.attachment, requestedId)
+        && (!requestedStoragePath || requestedStoragePath !== existingById.storagePath)
+    ) {
         throw new Error(`첨부 ID가 다른 경로에 연결되어 있습니다: ${requestedId}`);
     }
-    if (existingByRelativePath && requestedId && existingByRelativePath.id && existingByRelativePath.id !== requestedId) {
+    if (
+        existingByRelativePath
+        && requestedId
+        && existingByRelativePath.id
+        && !identityMatches(existingByRelativePath.attachment, requestedId)
+    ) {
         throw new Error(`첨부 경로가 다른 ID에 연결되어 있습니다: ${requestedRelativePath}`);
     }
     if (existing && requestedStoragePath && existing.storagePath && existing.storagePath !== requestedStoragePath) {
@@ -992,8 +1501,8 @@ function resolveAttachmentStorageIdentity(metadata, attachment = {}, noteRelativ
     }
     return {
         existing,
-        id: requestedId || existing?.id || '',
-        relativePath: requestedRelativePath || existing?.relativePath || '',
+        id: existing?.id || requestedId || '',
+        relativePath: existing?.relativePath || requestedRelativePath || '',
         storagePath
     };
 }
@@ -1214,12 +1723,169 @@ async function mergeIncomingNotesWithStoredNotes(storagePath, notes, previousMet
     return merged;
 }
 
+function syncStateIdentityDescriptors(syncState = {}, attachment = false) {
+    const entries = attachment ? syncState.attachments : syncState.files;
+    return Object.entries(entries || {}).map(([relativePath, state]) => ({
+        ...state,
+        ...(attachment ? { attachmentIdentity: true } : {}),
+        relativePath: normalizeRelativePath(relativePath),
+        id: attachment
+            ? String(state?.attachmentId || '').trim()
+            : String(state?.noteId || '').trim()
+    }));
+}
+
+function deletedTokensMatchIdentity(tokens, value = {}) {
+    const relativePath = value?.relativePath
+        ? normalizeRelativePath(value.relativePath)
+        : '';
+    for (const token of tokens || []) {
+        if (identityMatches(value, token)) return true;
+        if (relativePath && normalizeRelativePath(token) === relativePath) return true;
+    }
+    return false;
+}
+
+function pendingDeleteStateMatch(syncState, value = {}, attachment = false) {
+    const descriptor = {
+        ...value,
+        ...(attachment ? { attachmentIdentity: true } : {}),
+        relativePath: value?.relativePath ? normalizeRelativePath(value.relativePath) : '',
+        id: String(
+            attachment
+                ? (value?.attachmentId || value?.id || '')
+                : (value?.noteId || value?.id || '')
+        ).trim(),
+        storagePath: value?.storagePath ? normalizeRelativePath(value.storagePath) : '',
+        contentHash: String(value?.contentHash || '').trim()
+    };
+    return findPendingDeleteIdentity(
+        descriptor,
+        pendingDeleteDescriptors(syncState, attachment),
+        attachment
+    );
+}
+
+async function recordPendingSyncDeletes(storagePath, previousMetadata, options = {}) {
+    if (!previousMetadata) return false;
+    const deletedNoteTokens = new Set(
+        (options.deletedNoteIds || []).map(value => String(value || '').trim()).filter(Boolean)
+    );
+    const deletedAttachmentTokens = new Set(
+        (options.deletedAttachmentIds || []).map(value => String(value || '').trim()).filter(Boolean)
+    );
+    if (deletedNoteTokens.size === 0 && deletedAttachmentTokens.size === 0) return false;
+
+    const syncState = await readSyncState(storagePath);
+    const local = await localSyncIdentityDescriptors(storagePath, previousMetadata);
+    const noteMatches = matchSyncIdentityEntries(
+        local.notes,
+        syncStateIdentityDescriptors(syncState, false)
+    ).matches;
+    const attachmentMatches = matchSyncIdentityEntries(
+        local.attachments,
+        syncStateIdentityDescriptors(syncState, true)
+    ).matches;
+    const noteStatePathByLocalPath = new Map(noteMatches.map(match => [
+        normalizeRelativePath(match.local.relativePath),
+        normalizeRelativePath(match.remote.relativePath)
+    ]));
+    const attachmentStatePathByLocalPath = new Map(attachmentMatches.map(match => [
+        normalizeRelativePath(match.local.relativePath),
+        normalizeRelativePath(match.remote.relativePath)
+    ]));
+    let changed = false;
+
+    for (const descriptor of local.notes) {
+        const note = descriptor.note;
+        const deletingNote = deletedTokensMatchIdentity(deletedNoteTokens, note);
+        if (!deletingNote) continue;
+        const statePath = noteStatePathByLocalPath.get(normalizeRelativePath(descriptor.relativePath));
+        const state = statePath ? syncState.files?.[statePath] : null;
+        if (state && Number(state.lastKnownRevision) > 0 && !isDeletedFlag(state.deleted)) {
+            state.pendingDelete = true;
+            state.storagePath = descriptor.storagePath;
+            if (descriptor.id) state.noteId = descriptor.id;
+            state.syncIdentityAliases = [...new Set([
+                ...(Array.isArray(state.syncIdentityAliases) ? state.syncIdentityAliases : []),
+                ...(Array.isArray(note?.syncIdentityAliases) ? note.syncIdentityAliases : [])
+            ].map(value => String(value || '').trim()).filter(Boolean))];
+            changed = true;
+        }
+    }
+
+    for (const descriptor of local.attachments) {
+        const note = descriptor.note;
+        const attachment = descriptor.attachment;
+        const deletingNote = deletedTokensMatchIdentity(deletedNoteTokens, note);
+        const deletingAttachment = deletedTokensMatchIdentity(deletedAttachmentTokens, attachment);
+        if (!deletingNote && !deletingAttachment) continue;
+        const statePath = attachmentStatePathByLocalPath.get(normalizeRelativePath(descriptor.relativePath));
+        const state = statePath ? syncState.attachments?.[statePath] : null;
+        if (state && Number(state.lastKnownRevision) > 0 && !isDeletedFlag(state.deleted)) {
+            state.pendingDelete = true;
+            state.storagePath = descriptor.storagePath;
+            state.noteRelativePath = descriptor.noteRelativePath;
+            if (descriptor.id) state.attachmentId = descriptor.id;
+            state.syncIdentityAliases = [...new Set([
+                ...(Array.isArray(state.syncIdentityAliases) ? state.syncIdentityAliases : []),
+                ...(Array.isArray(attachment?.syncIdentityAliases)
+                    ? attachment.syncIdentityAliases
+                    : [])
+            ].map(value => String(value || '').trim()).filter(Boolean))];
+            changed = true;
+        }
+    }
+
+    if (changed) {
+        syncState.updatedAt = new Date().toISOString();
+        await writeSyncState(storagePath, syncState);
+    }
+    return changed;
+}
+
+async function clearPendingSyncDeletesForActiveMetadata(storagePath, metadata = {}) {
+    const syncState = await readSyncState(storagePath);
+    let changed = false;
+    for (const note of metadata.notes || []) {
+        if (!note?.relativePath) continue;
+        const noteState = syncState.files?.[normalizeRelativePath(note.relativePath)];
+        if (noteState?.pendingDelete === true) {
+            delete noteState.pendingDelete;
+            changed = true;
+        }
+        for (const attachment of note.attachments || []) {
+            if (!attachment?.relativePath) continue;
+            const attachmentState = syncState.attachments?.[
+                normalizeRelativePath(attachment.relativePath)
+            ];
+            if (attachmentState?.pendingDelete === true) {
+                delete attachmentState.pendingDelete;
+                changed = true;
+            }
+        }
+    }
+    if (changed) {
+        syncState.updatedAt = new Date().toISOString();
+        await writeSyncState(storagePath, syncState);
+    }
+    return changed;
+}
+
 async function saveNotesToStorage(storagePath, notes, options = {}) {
     await fs.mkdir(storagePath, { recursive: true });
-    const previousMetadata = await readMetadata(storagePath);
+    let previousMetadata = await readMetadata(storagePath);
+    const syncState = await readSyncState(storagePath);
+    const previousRepair = consolidateDuplicateMetadataStoragePaths(previousMetadata, syncState);
+    const incomingRepair = consolidateDuplicateMetadataStoragePaths({ notes: notes || [] }, syncState);
+    if (previousRepair.unresolved > 0 || incomingRepair.unresolved > 0) {
+        throw new Error('같은 실제 파일을 가리키는 문서 identity를 안전하게 복구하지 못했습니다.');
+    }
+    previousMetadata = previousRepair.metadata;
+    await recordPendingSyncDeletes(storagePath, previousMetadata, options);
     const mergedNotes = await mergeIncomingNotesWithStoredNotes(
         storagePath,
-        notes || [],
+        incomingRepair.metadata.notes || [],
         previousMetadata,
         options.deletedNoteIds || []
     );
@@ -1280,12 +1946,14 @@ async function saveNotesToStorage(storagePath, notes, options = {}) {
         });
     }
 
-    await writeMetadata(storagePath, {
+    const nextMetadata = {
         version: 1,
         generatedAt: new Date().toISOString(),
         workspaces: Array.from(workspaces.values()),
-            notes: metadataNotes
-        });
+        notes: metadataNotes
+    };
+    await writeMetadata(storagePath, nextMetadata);
+    await clearPendingSyncDeletesForActiveMetadata(storagePath, nextMetadata);
     await removeMetadataOrphans(storagePath, previousMetadata, writtenStoragePaths, writtenAttachmentStoragePaths);
 
     return {
@@ -1447,7 +2115,7 @@ function syncConfig(args = {}, requireToken = true) {
 async function syncRequestOnce(serverUrl, endpoint, options = {}) {
     const url = new URL(endpoint, `${normalizeServerUrl(serverUrl)}/`).toString();
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), options.timeoutMs || SYNC_REQUEST_TIMEOUT_MS);
+    const timeout = setTimeout(() => controller.abort(), syncRequestTimeoutMs(options));
     const headers = {
         Accept: 'application/json',
         ...(options.headers || {})
@@ -1469,6 +2137,17 @@ async function syncRequestOnce(serverUrl, endpoint, options = {}) {
     try {
         response = await net.fetch(url, requestOptions);
         text = await response.text();
+    } catch (error) {
+        if (controller.signal.aborted) {
+            const timeoutError = new Error(syncNetworkUserMessage({ name: 'AbortError' }));
+            timeoutError.name = 'SyncTimeoutError';
+            timeoutError.code = 'SYNC_TIMEOUT';
+            timeoutError.cause = error;
+            throw timeoutError;
+        }
+        const userMessage = syncNetworkUserMessage(error);
+        if (userMessage && error && typeof error === 'object') error.userMessage = userMessage;
+        throw error;
     } finally {
         clearTimeout(timeout);
     }
@@ -1497,23 +2176,22 @@ function canRetrySyncRequest(endpoint, options, error) {
     const endpointPath = new URL(endpoint, 'http://notedown.local').pathname;
     const safeEndpoint = method === 'GET' || method === 'HEAD' || RETRYABLE_SYNC_ENDPOINTS.has(endpointPath);
     if (!safeEndpoint) return false;
-    const status = Number(error?.status) || 0;
-    return !status || status === 408 || status === 429 || status >= 500 || error?.name === 'AbortError';
+    return shouldRetrySyncNetworkError(error);
 }
 
 function isTransientSyncError(error) {
-    const status = Number(error?.status) || 0;
-    return !status || status === 408 || status === 429 || status >= 500 || error?.name === 'AbortError';
+    return isTransientSyncNetworkError(error);
 }
 
 async function syncRequest(serverUrl, endpoint, options = {}) {
     let lastError;
-    for (let attempt = 0; attempt < 2; attempt++) {
+    const maxAttempts = Math.max(1, Number(options.maxAttempts) || 2);
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
         try {
             return await syncRequestOnce(serverUrl, endpoint, options);
         } catch (error) {
             lastError = error;
-            if (attempt > 0 || !canRetrySyncRequest(endpoint, options, error)) throw error;
+            if (attempt + 1 >= maxAttempts || !canRetrySyncRequest(endpoint, options, error)) throw error;
             await new Promise(resolve => setTimeout(resolve, 300));
         }
     }
@@ -1523,7 +2201,9 @@ async function syncRequest(serverUrl, endpoint, options = {}) {
 function syncError(error, fallback = '동기화 작업 중 오류가 발생했습니다.') {
     return {
         ok: false,
-        error: error instanceof Error && error.message ? error.message : fallback,
+        error: error?.userMessage
+            || syncNetworkUserMessage(error)
+            || (error instanceof Error && error.message ? error.message : fallback),
         statusCode: error?.status,
         data: error?.data
     };
@@ -1536,6 +2216,28 @@ function planItemRelativePath(item = {}) {
         || item?.serverAttachment?.relativePath
         || item?.attachment?.relativePath
         || '';
+}
+
+function syncItemContentSize(item = {}) {
+    const candidates = [
+        item.size,
+        item.file?.size,
+        item.attachment?.size,
+        item.serverFile?.size,
+        item.serverAttachment?.size,
+        item.serverAttachmentMetadata?.size
+    ];
+    return candidates.map(Number).find(value => Number.isFinite(value) && value > 0) || 0;
+}
+
+function syncDownloadOptions(token, item = {}) {
+    const contentSize = syncItemContentSize(item);
+    return {
+        token,
+        ...(contentSize > 0
+            ? { expectedResponseBytes: Math.ceil((contentSize * 4) / 3) + 64 * 1024 }
+            : {})
+    };
 }
 
 function isSystemPlanItem(item) {
@@ -1634,10 +2336,29 @@ function serverDeleteLastKnownRevision(syncState = {}, item = {}, attachment = f
     }
 }
 
+function isPendingServerDelete(syncState = {}, item = {}, attachment = false) {
+    const relativePath = planItemRelativePath(item);
+    if (!relativePath || isSystemRelativePath(relativePath)) return false;
+    try {
+        const state = (attachment ? syncState.attachments : syncState.files)?.[
+            normalizeRelativePath(relativePath)
+        ];
+        return isPendingSyncDeleteState(state);
+    } catch (error) {
+        return false;
+    }
+}
+
 function filterUnsafeServerDeletes(plan = {}, syncState = {}) {
     const next = filterSyncPlan(plan);
-    next.deleteServerFiles = next.deleteServerFiles.filter(item => serverDeleteLastKnownRevision(syncState, item, false) > 0);
-    next.deleteServerAttachments = next.deleteServerAttachments.filter(item => serverDeleteLastKnownRevision(syncState, item, true) > 0);
+    next.deleteServerFiles = next.deleteServerFiles.filter(item => (
+        isPendingServerDelete(syncState, item, false)
+        && serverDeleteLastKnownRevision(syncState, item, false) > 0
+    ));
+    next.deleteServerAttachments = next.deleteServerAttachments.filter(item => (
+        isPendingServerDelete(syncState, item, true)
+        && serverDeleteLastKnownRevision(syncState, item, true) > 0
+    ));
     return next;
 }
 
@@ -1713,6 +2434,7 @@ async function localFileSyncInfo(storagePath, syncState, relativePath, storageRe
             state
         };
     } catch (error) {
+        if (error?.code !== 'ENOENT') throw error;
         return {
             exists: false,
             contentHash: null,
@@ -1824,8 +2546,16 @@ function findMetadataNote(metadata, relativePath, payloadNote) {
         if (byPath) return byPath;
     }
     if (payloadNote?.id) {
-        const byId = notes.find(note => note?.id === payloadNote.id);
+        const byId = notes.find(note => identityMatches(note, payloadNote.id));
         if (byId) return byId;
+    }
+    if (payloadNote?.storagePath) {
+        const safeStoragePath = normalizeRelativePath(payloadNote.storagePath);
+        const byStoragePath = notes.find(note => (
+            note?.relativePath
+            && noteStoragePath(note, note.relativePath) === safeStoragePath
+        ));
+        if (byStoragePath) return byStoragePath;
     }
     if (!payloadNote) return null;
     return {
@@ -1842,7 +2572,17 @@ function findMetadataNote(metadata, relativePath, payloadNote) {
 function notePayload(note, relativePath, storagePathOverride = '') {
     if (!note) return null;
     const workspaceId = noteWorkspaceId(note);
-    const { body: _body, ...metadataNote } = note;
+    const {
+        body: _body,
+        syncIdentityAliases: _syncIdentityAliases,
+        ...metadataNote
+    } = note;
+    if (Array.isArray(metadataNote.attachments)) {
+        metadataNote.attachments = metadataNote.attachments.map(attachment => {
+            const { syncIdentityAliases: _attachmentAliases, ...payloadAttachment } = attachment;
+            return payloadAttachment;
+        });
+    }
     const storagePath = storagePathOverride
         ? normalizeRelativePath(storagePathOverride)
         : noteStoragePath(note, relativePath);
@@ -1854,6 +2594,20 @@ function notePayload(note, relativePath, storagePathOverride = '') {
         fileName: path.posix.basename(storagePath),
         relativePath,
         storagePath
+    };
+}
+
+function metadataSyncPayload(metadata = {}) {
+    return {
+        ...metadata,
+        notes: (metadata.notes || []).map(note => {
+            const { syncIdentityAliases: _noteAliases, ...payloadNote } = note || {};
+            payloadNote.attachments = (note?.attachments || []).map(attachment => {
+                const { syncIdentityAliases: _attachmentAliases, ...payloadAttachment } = attachment;
+                return payloadAttachment;
+            });
+            return payloadNote;
+        })
     };
 }
 
@@ -1889,7 +2643,7 @@ function upsertMetadataNote(metadata, note) {
     if (existingById && existingByRelativePath && existingById !== existingByRelativePath) {
         throw new Error(`노트 ID와 경로가 서로 다른 기존 노트를 가리킵니다: ${requestedRelativePath}`);
     }
-    if (existingByRelativePath && requestedId && String(existingByRelativePath.id || '').trim() !== requestedId) {
+    if (existingByRelativePath && requestedId && !identityMatches(existingByRelativePath, requestedId)) {
         throw new Error(`노트 경로가 다른 ID에 연결되어 있습니다: ${requestedRelativePath}`);
     }
     const existing = existingById || existingByRelativePath;
@@ -1900,7 +2654,7 @@ function upsertMetadataNote(metadata, note) {
     const nextNote = {
         ...(existing || {}),
         ...note,
-        id: requestedId || existing?.id || note.id,
+        id: existing?.id || requestedId || note.id,
         folder: workspaceId,
         workspace: workspaceId,
         relativePath,
@@ -1944,7 +2698,8 @@ async function buildKnownFiles(storagePath, metadata, syncState) {
             });
             activePaths.add(relativePath);
         } catch (error) {
-            // Missing local files are represented by metadata differences in the plan response.
+            if (error?.code !== 'ENOENT') throw error;
+            // A genuinely missing file is recoverable from metadata/server state, but is never a delete intent.
         }
     }
 
@@ -1952,13 +2707,12 @@ async function buildKnownFiles(storagePath, metadata, syncState) {
         if (!rawRelativePath || isDeletedFlag(state?.deleted)) continue;
         const relativePath = normalizeRelativePath(rawRelativePath);
         const lastKnownRevision = Number(state?.lastKnownRevision) || 0;
-        if (lastKnownRevision <= 0 || activePaths.has(relativePath) || isSystemRelativePath(relativePath)) continue;
-        try {
-            const { absolutePath } = resolveStorageFile(storagePath, state.storagePath || relativePath);
-            await fs.stat(absolutePath);
-        } catch (error) {
-            files.push({ relativePath, deleted: true, lastKnownRevision });
-        }
+        if (
+            !isPendingSyncDeleteIntent(state)
+            || activePaths.has(relativePath)
+            || isSystemRelativePath(relativePath)
+        ) continue;
+        files.push({ relativePath, deleted: true, lastKnownRevision });
     }
 
     return files;
@@ -1967,13 +2721,11 @@ async function buildKnownFiles(storagePath, metadata, syncState) {
 async function buildKnownAttachments(storagePath, metadata, syncState) {
     const attachments = [];
     const activePaths = new Set();
-    const storagePaths = new Map();
     for (const note of metadata.notes || []) {
         for (const attachment of note.attachments || []) {
             if (!attachment?.relativePath || isDeletedFlag(attachment.deleted)) continue;
             const relativePath = normalizeRelativePath(attachment.relativePath);
             const storageRelativePath = normalizeRelativePath(attachment.storagePath || relativePath);
-            storagePaths.set(relativePath, storageRelativePath);
             try {
                 const { absolutePath } = resolveStorageFile(storagePath, storageRelativePath);
                 const content = await fs.readFile(absolutePath);
@@ -1987,7 +2739,8 @@ async function buildKnownAttachments(storagePath, metadata, syncState) {
                 });
                 activePaths.add(relativePath);
             } catch (error) {
-                // Missing local attachment bytes are handled through metadata differences and conflicts.
+                if (error?.code !== 'ENOENT') throw error;
+                // A genuinely missing attachment is recoverable, but is never a delete intent.
             }
         }
     }
@@ -1996,16 +2749,12 @@ async function buildKnownAttachments(storagePath, metadata, syncState) {
         if (!rawRelativePath || isDeletedFlag(state?.deleted)) continue;
         const relativePath = normalizeRelativePath(rawRelativePath);
         const lastKnownRevision = Number(state?.lastKnownRevision) || 0;
-        if (lastKnownRevision <= 0 || activePaths.has(relativePath) || isSystemRelativePath(relativePath)) continue;
-        try {
-            const { absolutePath } = resolveStorageFile(
-                storagePath,
-                storagePaths.get(relativePath) || state.storagePath || relativePath
-            );
-            await fs.stat(absolutePath);
-        } catch (error) {
-            attachments.push({ relativePath, deleted: true, lastKnownRevision });
-        }
+        if (
+            !isPendingSyncDeleteIntent(state)
+            || activePaths.has(relativePath)
+            || isSystemRelativePath(relativePath)
+        ) continue;
+        attachments.push({ relativePath, deleted: true, lastKnownRevision });
     }
 
     return attachments;
@@ -2013,6 +2762,7 @@ async function buildKnownAttachments(storagePath, metadata, syncState) {
 
 async function createSyncPlan(args = {}) {
     const { storagePath, serverUrl, token, clientId } = syncConfig(args);
+    const syncRecovery = await rebaseSyncStateIfServerReset(args);
     const metadata = await ensureMetadata(storagePath);
     const syncState = await readSyncState(storagePath);
     const syncHistoryExists = hasSyncHistory(syncState);
@@ -2027,7 +2777,7 @@ async function createSyncPlan(args = {}) {
             knownFiles,
             knownAttachments,
             metadata: {
-                body: metadata,
+                body: metadataSyncPayload(metadata),
                 lastKnownRevision: Number(syncState.metadataRevision) || 0
             }
         }
@@ -2040,6 +2790,7 @@ async function createSyncPlan(args = {}) {
     return {
         ok: true,
         ...response,
+        ...(syncRecovery.rebased ? { syncRecovery } : {}),
         summary: summarizePlan(response.plan)
     };
 }
@@ -2050,9 +2801,19 @@ async function prepareLocalFileUpload(args = {}, relativePathOverride = '') {
     const syncState = await readSyncState(storagePath);
     const payloadNote = args.note || null;
     const note = findMetadataNote(metadata, relativePathOverride || args.relativePath, payloadNote);
-    const relativePath = normalizeRelativePath(relativePathOverride || args.relativePath || note?.relativePath || relativePathForNote(payloadNote));
-    const fileState = syncState.files?.[relativePath] || {};
     const deleted = isDeletedFlag(args.deleted);
+    let relativePath = normalizeRelativePath(relativePathOverride || args.relativePath || note?.relativePath || relativePathForNote(payloadNote));
+    let fileState = syncState.files?.[relativePath] || {};
+    if (deleted && !isPendingSyncDeleteState(fileState)) {
+        const pendingState = pendingDeleteStateMatch(syncState, {
+            ...(payloadNote || note || {}),
+            relativePath
+        });
+        if (pendingState?.relativePath) {
+            relativePath = normalizeRelativePath(pendingState.relativePath);
+            fileState = syncState.files?.[relativePath] || pendingState;
+        }
+    }
     const lastKnownRevision = Number(args.lastKnownRevision) || Number(fileState.lastKnownRevision) || 0;
     if (deleted && lastKnownRevision <= 0) {
         throw new Error('서버 파일 삭제에는 lastKnownRevision이 필요합니다.');
@@ -2066,8 +2827,11 @@ async function prepareLocalFileUpload(args = {}, relativePathOverride = '') {
     if (deleted) body.deleted = true;
 
     if (note) {
-        body.note = notePayload(note, relativePath);
-        body.workspace = workspacePayload(metadata, note);
+        const canonicalNote = fileState.noteId
+            ? { ...note, id: fileState.noteId }
+            : note;
+        body.note = notePayload(canonicalNote, relativePath);
+        body.workspace = workspacePayload(metadata, canonicalNote);
     }
 
     if (!deleted) {
@@ -2083,23 +2847,64 @@ async function prepareLocalFileUpload(args = {}, relativePathOverride = '') {
     return { storagePath, serverUrl, token, syncState, body };
 }
 
+function preparedUploadCheckpointOptions(prepared, endpoint, options = {}) {
+    const relativePath = normalizeRelativePath(prepared.body.relativePath);
+    const attachment = String(endpoint || '').includes('/attachment');
+    const metadata = attachment ? prepared.body.attachment : prepared.body.note;
+    return {
+        ...options,
+        clearRebaseConflictPaths: [...new Set([
+            ...(Array.isArray(options.clearRebaseConflictPaths)
+                ? options.clearRebaseConflictPaths
+                : []),
+            relativePath
+        ])],
+        ...(metadata
+            ? {
+                acceptedMetadataByPath: {
+                    ...(options.acceptedMetadataByPath || {}),
+                    [relativePath]: metadata
+                }
+            }
+            : {})
+    };
+}
+
 async function sendPreparedSyncUpload(prepared, endpoint, writeState = true) {
-    let response;
+    const previousRecovery = await recoverPreviousUncertainSyncMutation(prepared, endpoint);
+    let response = previousRecovery?.response || null;
+    const journalKey = response
+        ? null
+        : await rememberUncertainSyncMutation(prepared, endpoint);
     try {
-        response = await syncRequest(prepared.serverUrl, endpoint, {
-            token: prepared.token,
-            body: prepared.body
-        });
+        if (!response) {
+            response = await syncRequest(prepared.serverUrl, endpoint, {
+                token: prepared.token,
+                body: prepared.body
+            });
+        }
     } catch (error) {
-        if (!isTransientSyncError(error)) throw error;
-        let manifest;
-        try {
-            manifest = await syncRequest(prepared.serverUrl, '/api/manifest', { token: prepared.token });
-        } catch (manifestError) {
+        if (!isTransientSyncError(error)) {
+            await forgetUncertainSyncMutation(prepared.storagePath, journalKey);
             throw error;
         }
-        const acknowledgedEntry = acknowledgedSyncUploadEntry(prepared.body, endpoint, manifest);
-        if (!acknowledgedEntry) throw error;
+        if (!shouldProbeMutationResult(error)) throw error;
+        const proof = await recoverMutationFromManifest({
+            loadManifest: () => fetchFreshSyncManifest(
+                prepared.serverUrl,
+                prepared.token,
+                prepared.body.baseRevision,
+                { timeoutMs: 8000, maxAttempts: 1 }
+            ),
+            acknowledged: manifest => acknowledgedSyncUploadEntry(
+                prepared.body,
+                endpoint,
+                manifest
+            )
+        });
+        if (!proof.acknowledged) throw error;
+        const manifest = proof.manifest;
+        const acknowledgedEntry = proof.entry;
         const attachment = endpoint.includes('/attachment');
         response = {
             status: 'ok',
@@ -2108,10 +2913,13 @@ async function sendPreparedSyncUpload(prepared, endpoint, writeState = true) {
             ...(attachment ? { attachment: acknowledgedEntry } : { file: acknowledgedEntry })
         };
     }
+    if (response.status === 'conflict' && journalKey) {
+        await forgetUncertainSyncMutation(prepared.storagePath, journalKey);
+    }
     if (writeState && response.manifest) {
         const checkpointOptions = response.status === 'conflict'
             ? syncConflictCheckpointOptions(response, prepared.body.relativePath)
-            : {};
+            : preparedUploadCheckpointOptions(prepared, endpoint);
         await writeSyncStateFromManifest(
             prepared.storagePath,
             response.manifest,
@@ -2134,10 +2942,21 @@ async function uploadLocalFile(args = {}, relativePathOverride = '') {
 
 function findMetadataAttachment(metadata, relativePath, fallback = null) {
     const safeRelativePath = relativePath ? normalizeRelativePath(relativePath) : '';
+    const fallbackId = String(fallback?.id || fallback?.attachmentId || '').trim();
+    const fallbackStoragePath = fallback?.storagePath
+        ? normalizeRelativePath(fallback.storagePath)
+        : '';
     for (const note of metadata.notes || []) {
         for (const attachment of note.attachments || []) {
             if (!attachment?.relativePath) continue;
-            if (normalizeRelativePath(attachment.relativePath) === safeRelativePath) {
+            if (
+                normalizeRelativePath(attachment.relativePath) === safeRelativePath
+                || (fallbackId && identityMatches(attachment, fallbackId))
+                || (
+                    fallbackStoragePath
+                    && normalizeRelativePath(attachment.storagePath || attachment.relativePath) === fallbackStoragePath
+                )
+            ) {
                 return normalizeAttachmentMetadata(attachment, note.relativePath ? normalizeRelativePath(note.relativePath) : '');
             }
         }
@@ -2164,17 +2983,43 @@ async function prepareLocalAttachmentUpload(args = {}, item = {}) {
     const { storagePath, serverUrl, token, clientId } = syncConfig(args);
     const metadata = await ensureMetadata(storagePath);
     const syncState = await readSyncState(storagePath);
-    const relativePath = normalizeRelativePath(item.relativePath || args.relativePath);
-    const state = syncState.attachments?.[relativePath] || {};
+    const requestedRelativePath = normalizeRelativePath(item.relativePath || args.relativePath);
     const deleted = isDeletedFlag(args.deleted) || isDeletedFlag(item.deleted);
-    const attachment = findMetadataAttachment(metadata, relativePath, item.attachment || args.attachment);
+    const attachment = findMetadataAttachment(
+        metadata,
+        requestedRelativePath,
+        item.attachment || args.attachment || item
+    );
+    let relativePath = normalizeRelativePath(attachment?.relativePath || requestedRelativePath);
+    let state = syncState.attachments?.[relativePath] || {};
+    if (deleted && !isPendingSyncDeleteState(state)) {
+        const pendingState = pendingDeleteStateMatch(syncState, {
+            ...(item.attachment || args.attachment || item || {}),
+            relativePath
+        }, true);
+        if (pendingState?.relativePath) {
+            relativePath = normalizeRelativePath(pendingState.relativePath);
+            state = syncState.attachments?.[relativePath] || pendingState;
+        }
+    }
     const note = findMetadataNoteByAttachment(metadata, attachment || item) || findMetadataNote(metadata, item.noteRelativePath || attachment?.noteRelativePath || args.noteRelativePath, item.note || args.note);
-    const rawNoteRelativePath = item.noteRelativePath
-        || attachment?.noteRelativePath
-        || note?.relativePath
-        || args.noteRelativePath
-        || state.noteRelativePath
-        || '';
+    const rawNoteRelativePath = deleted
+        ? (
+            state.noteRelativePath
+            || item.noteRelativePath
+            || attachment?.noteRelativePath
+            || note?.relativePath
+            || args.noteRelativePath
+            || ''
+        )
+        : (
+            item.noteRelativePath
+            || attachment?.noteRelativePath
+            || note?.relativePath
+            || args.noteRelativePath
+            || state.noteRelativePath
+            || ''
+        );
     const noteRelativePath = rawNoteRelativePath ? normalizeRelativePath(rawNoteRelativePath) : '';
     if (!deleted && !noteRelativePath) throw new Error('첨부 파일을 연결할 노트 경로가 필요합니다.');
     const lastKnownRevision = Number(args.lastKnownRevision) || Number(item.lastKnownRevision) || Number(state.lastKnownRevision) || 0;
@@ -2191,7 +3036,12 @@ async function prepareLocalAttachmentUpload(args = {}, item = {}) {
     if (deleted) body.deleted = true;
 
     if (attachment) {
-        body.attachment = normalizeAttachmentMetadata({ ...attachment, noteRelativePath }, noteRelativePath);
+        body.attachment = normalizeAttachmentMetadata({
+            ...attachment,
+            ...(state.attachmentId ? { id: state.attachmentId } : {}),
+            relativePath,
+            noteRelativePath
+        }, noteRelativePath);
         body.fileName = attachment.fileName;
         body.mimeType = attachment.mimeType || undefined;
     }
@@ -2241,6 +3091,29 @@ async function uploadLocalAttachment(args = {}, item = {}) {
 
 async function uploadLocalNoteWithAttachments(args = {}) {
     const { storagePath } = syncConfig(args);
+    const syncRecovery = await rebaseSyncStateIfServerReset(args);
+    if (syncRecovery.rebased) {
+        return {
+            ...localStorageChangedDuringSyncResult({ plan: {} }, null, false),
+            syncRecovery
+        };
+    }
+    if (isDeletedFlag(args.deleted)) {
+        const syncState = await readSyncState(storagePath);
+        const pendingDelete = pendingDeleteStateMatch(syncState, args.note || {});
+        if (pendingDelete?.rebaseConflict === true) {
+            const planResponse = await createSyncPlan(args);
+            const conflicts = nonSystemPlanItems(planResponse.plan?.conflicts);
+            return {
+                ...planResponse,
+                ok: false,
+                status: conflicts.length > 0 ? 'conflict' : 'error',
+                error: conflicts.length > 0
+                    ? ''
+                    : '서버 기준이 변경된 삭제 요청은 전체 동기화에서 확인한 뒤 적용해야 합니다.'
+            };
+        }
+    }
     const snapshot = await runStorageOperation(storagePath, async () => {
         const storageGeneration = storageMutationGeneration(storagePath);
         const noteUpload = await prepareLocalFileUpload(args);
@@ -2343,14 +3216,33 @@ async function uploadLocalNoteWithAttachments(args = {}) {
                 ...attachmentConflicts,
                 ...(noteResult.status === 'conflict' ? [noteResult.file || noteResult.attachment] : [])
             ];
+            const conflictOptions = syncConflictCheckpointOptions(
+                conflictItems,
+                noteResult.status === 'conflict' ? snapshot.noteUpload.body.relativePath : ''
+            );
+            const clearRebaseConflictPaths = [
+                ...(noteResult.status !== 'conflict'
+                    ? [snapshot.noteUpload.body.relativePath]
+                    : []),
+                ...uploadedAttachments.map(item => planItemRelativePath(item)).filter(Boolean)
+            ];
+            const acceptedPaths = new Set(clearRebaseConflictPaths.map(normalizeRelativePath));
+            const acceptedMetadataByPath = {};
+            for (const prepared of [snapshot.noteUpload, ...snapshot.attachmentUploads]) {
+                const preparedPath = normalizeRelativePath(prepared.body.relativePath);
+                if (!acceptedPaths.has(preparedPath)) continue;
+                const acceptedMetadata = prepared.body.note || prepared.body.attachment;
+                if (acceptedMetadata) acceptedMetadataByPath[preparedPath] = acceptedMetadata;
+            }
             await writeSyncStateFromManifest(
                 storagePath,
                 latestManifest,
                 snapshot.noteUpload.syncState,
-                syncConflictCheckpointOptions(
-                    conflictItems,
-                    noteResult.status === 'conflict' ? snapshot.noteUpload.body.relativePath : ''
-                )
+                {
+                    ...conflictOptions,
+                    clearRebaseConflictPaths,
+                    acceptedMetadataByPath
+                }
             );
         }
         return storageUnchanged;
@@ -2386,7 +3278,11 @@ async function downloadServerAttachment(args = {}, item, metadata, payloadOverri
     const { storagePath, serverUrl, token } = syncConfig(args);
     const relativePath = normalizeRelativePath(item.relativePath);
     const payload = payloadOverride === undefined
-        ? await syncRequest(serverUrl, `/api/attachments/${encodeRelativePathForUrl(relativePath)}`, { token })
+        ? await syncRequest(
+            serverUrl,
+            `/api/attachments/${encodeRelativePathForUrl(relativePath)}`,
+            syncDownloadOptions(token, item)
+        )
         : payloadOverride;
     validateMetadataStorageIdentities(metadata);
     const noteRelativePath = normalizeRelativePath(
@@ -2452,7 +3348,11 @@ async function downloadServerFile(args = {}, item, metadata, payloadOverride) {
     const { storagePath, serverUrl, token } = syncConfig(args);
     const relativePath = normalizeRelativePath(item.relativePath);
     const payload = payloadOverride === undefined
-        ? await syncRequest(serverUrl, `/api/files/${encodeRelativePathForUrl(relativePath)}`, { token })
+        ? await syncRequest(
+            serverUrl,
+            `/api/files/${encodeRelativePathForUrl(relativePath)}`,
+            syncDownloadOptions(token, item)
+        )
         : payloadOverride;
     validateMetadataStorageIdentities(metadata);
     const existingNote = findMetadataNote(metadata, relativePath, null);
@@ -2573,7 +3473,7 @@ async function readSyncConflictFile(args = {}) {
 
     try {
         const endpoint = isAttachment ? `/api/attachments/${encodeRelativePathForUrl(relativePath)}` : `/api/files/${encodeRelativePathForUrl(relativePath)}`;
-        const serverFile = await syncRequest(serverUrl, endpoint, { token });
+        const serverFile = await syncRequest(serverUrl, endpoint, syncDownloadOptions(token, args));
         result.serverFile = serverFile;
         result.serverContent = isAttachment
             ? `첨부 파일\n\n경로: ${relativePath}\n크기: ${serverFile.size || 0} bytes\nSHA-256: ${serverFile.contentHash || ''}\n수정: ${serverFile.serverUpdatedAt || ''}`
@@ -2603,8 +3503,72 @@ async function localSyncPathExists(storagePath, relativePath, isAttachment) {
     }
 }
 
-async function resolveSyncConflict(args = {}) {
+function checkpointServerResolvedEntry(syncState, relativePath, payload, metadataEntry, attachment) {
+    const entries = attachment
+        ? (syncState.attachments ||= {})
+        : (syncState.files ||= {});
+    const previous = entries[relativePath] || {};
+    const deleted = isDeletedFlag(payload.deleted);
+    const next = {
+        ...previous,
+        lastKnownRevision: Number(payload.revision) || Number(previous.lastKnownRevision) || 0,
+        contentHash: deleted ? null : (payload.contentHash || previous.contentHash || null),
+        updatedAtMs: Number(payload.clientUpdatedAtMs) || Number(previous.updatedAtMs) || null,
+        deleted
+    };
+    delete next.pendingDelete;
+    delete next.rebaseConflict;
+    if (metadataEntry && !deleted) {
+        next.localMetadataHash = syncLocalMetadataFingerprint(metadataEntry, attachment);
+    } else {
+        delete next.localMetadataHash;
+    }
+    entries[relativePath] = next;
+    syncState.updatedAt = new Date().toISOString();
+    return syncState;
+}
+
+function serverResolutionManifestEntry(manifest, relativePath, attachment) {
+    const entries = attachment ? manifest?.attachments : manifest?.files;
+    return (entries || []).find(entry => (
+        entry?.relativePath
+        && normalizeRelativePath(entry.relativePath) === relativePath
+    )) || null;
+}
+
+async function convergeAppliedSyncConflict(args, details = {}) {
+    try {
+        const planResponse = await convergeSyncAfterResolution(args);
+        return {
+            ...planResponse,
+            ...details,
+            didApply: true,
+            summary: planResponse.summary || summarizePlan(planResponse.plan || {})
+        };
+    } catch (error) {
+        return {
+            ok: false,
+            status: 'retry',
+            retryable: true,
+            didApply: true,
+            ...details,
+            error: syncNetworkUserMessage(error)
+                || (error instanceof Error ? error.message : '적용 결과를 다시 확인해야 합니다.')
+        };
+    }
+}
+
+async function resolveSyncConflict(args = {}, options = {}) {
     const { storagePath, serverUrl, token } = syncConfig(args);
+    const syncRecovery = options.rebase === false
+        ? { rebased: false }
+        : await rebaseSyncStateIfServerReset(args);
+    if (syncRecovery.rebased) {
+        return {
+            ...localStorageChangedDuringSyncResult({ plan: {} }, null, false),
+            syncRecovery
+        };
+    }
     const relativePath = normalizeRelativePath(args.relativePath);
     const resolution = String(args.resolution || '').trim();
     const isAttachment = args.type === 'attachment' || relativePath.includes('/.attachments/');
@@ -2621,7 +3585,17 @@ async function resolveSyncConflict(args = {}) {
         const endpoint = isAttachment
             ? `/api/attachments/${encodeRelativePathForUrl(relativePath)}`
             : `/api/files/${encodeRelativePathForUrl(relativePath)}`;
-        const payload = await syncRequest(serverUrl, endpoint, { token });
+        const serverDescriptor = isAttachment
+            ? (args.serverAttachment || args.serverFile)
+            : args.serverFile;
+        const payload = isDeletedFlag(serverDescriptor?.deleted)
+            ? {
+                ...serverDescriptor,
+                relativePath,
+                deleted: true,
+                revision: Number(serverDescriptor.revision) || Number(args.serverRevision) || 0
+            }
+            : await syncRequest(serverUrl, endpoint, syncDownloadOptions(token, args));
         const applyResult = await runStorageOperation(storagePath, async () => {
             if (storageMutationGeneration(storagePath) !== initialStorageGeneration) {
                 return { storageChanged: true };
@@ -2629,8 +3603,13 @@ async function resolveSyncConflict(args = {}) {
             const metadata = await ensureMetadata(storagePath);
             validateMetadataStorageIdentities(metadata);
             const appliedStorageGeneration = bumpStorageMutationGeneration(storagePath);
-            const file = isAttachment
-                ? await downloadServerAttachment(args, {
+            const file = !isAttachment && isDeletedFlag(payload.deleted)
+                ? await deleteLocalFile(storagePath, {
+                    relativePath,
+                    note: args.clientNote || args.serverNote || null
+                }, metadata)
+                : isAttachment
+                    ? await downloadServerAttachment(args, {
                 relativePath,
                 serverAttachment: args.serverAttachment || args.serverFile || null,
                 attachment: args.serverAttachmentMetadata || args.serverAttachment || null,
@@ -2646,6 +3625,18 @@ async function resolveSyncConflict(args = {}) {
                 }, metadata, payload);
             metadata.generatedAt = new Date().toISOString();
             await writeMetadata(storagePath, metadata);
+            const resolvedMetadata = isAttachment
+                ? findMetadataAttachment(metadata, relativePath, args.serverAttachmentMetadata || null)
+                : findMetadataNote(metadata, relativePath, args.serverNote || null);
+            const currentState = await readSyncState(storagePath);
+            checkpointServerResolvedEntry(
+                currentState,
+                relativePath,
+                payload,
+                resolvedMetadata,
+                isAttachment
+            );
+            await writeSyncState(storagePath, currentState);
             return { storageChanged: false, file, storageGeneration: appliedStorageGeneration };
         });
         if (applyResult.storageChanged) {
@@ -2656,10 +3647,38 @@ async function resolveSyncConflict(args = {}) {
             };
         }
 
-        const manifest = await syncRequest(serverUrl, '/api/manifest', { token });
+        let manifest;
+        try {
+            manifest = await fetchFreshSyncManifest(
+                serverUrl,
+                token,
+                previousState.serverRevision
+            );
+        } catch (error) {
+            return {
+                ok: false,
+                status: 'retry',
+                retryable: true,
+                didApply: true,
+                resolution,
+                resolvedPath: relativePath,
+                file: applyResult.file,
+                error: syncNetworkUserMessage(error)
+                    || (error instanceof Error ? error.message : '서버 버전 적용 결과를 다시 확인해야 합니다.')
+            };
+        }
         const wroteState = await runStorageOperation(storagePath, async () => {
             const storageUnchanged = storageMutationGeneration(storagePath) === applyResult.storageGeneration;
-            await writeSyncStateFromManifest(storagePath, manifest, previousState);
+            const manifestEntry = serverResolutionManifestEntry(
+                manifest,
+                relativePath,
+                isAttachment
+            );
+            await writeSyncStateFromManifest(storagePath, manifest, previousState, {
+                ...(serverResolutionStillCurrent(payload, manifestEntry)
+                    ? { clearRebaseConflictPaths: [relativePath] }
+                    : { preservePaths: [relativePath], preserveMetadata: true })
+            });
             return storageUnchanged;
         });
         if (!wroteState) {
@@ -2669,21 +3688,62 @@ async function resolveSyncConflict(args = {}) {
                 resolvedPath: relativePath
             };
         }
-        const planResponse = await convergeSyncAfterResolution(args);
-        return {
-            ...planResponse,
-            didApply: true,
+        const currentManifestEntry = serverResolutionManifestEntry(
+            manifest,
+            relativePath,
+            isAttachment
+        );
+        if (!serverResolutionStillCurrent(payload, currentManifestEntry)) {
+            const conflict = {
+                relativePath,
+                type: isAttachment ? 'attachment' : 'file',
+                reason: 'server_changed_during_conflict_resolution',
+                ...(isAttachment
+                    ? { serverAttachment: currentManifestEntry }
+                    : { serverFile: currentManifestEntry })
+            };
+            return {
+                ok: false,
+                status: 'retry',
+                retryable: true,
+                didApply: true,
+                resolution,
+                resolvedPath: relativePath,
+                file: applyResult.file,
+                conflicts: [conflict],
+                manifest,
+                summary: {
+                    uploadFiles: 0,
+                    downloadFiles: 0,
+                    deleteServerFiles: 0,
+                    deleteLocalFiles: 0,
+                    conflicts: 1
+                },
+                error: '적용 중 서버 버전이 다시 변경되어 최신 버전을 덮어쓰지 않았습니다. 다시 확인해 주세요.'
+            };
+        }
+        if (options.converge === false) {
+            return {
+                ok: true,
+                status: 'ok',
+                didApply: true,
+                resolution,
+                resolvedPath: relativePath,
+                file: applyResult.file,
+                manifest
+            };
+        }
+        return convergeAppliedSyncConflict(args, {
             resolution,
             resolvedPath: relativePath,
-            file: applyResult.file,
-            summary: planResponse.summary || summarizePlan(planResponse.plan || {})
-        };
+            file: applyResult.file
+        });
     }
 
     let lastKnownRevision = Number(args.serverRevision) || Number(args.serverFile?.revision) || Number(args.serverAttachment?.revision) || 0;
     if (!lastKnownRevision) {
         const endpoint = isAttachment ? `/api/attachments/${encodeRelativePathForUrl(relativePath)}` : `/api/files/${encodeRelativePathForUrl(relativePath)}`;
-        const serverFile = await syncRequest(serverUrl, endpoint, { token });
+        const serverFile = await syncRequest(serverUrl, endpoint, syncDownloadOptions(token, args));
         lastKnownRevision = Number(serverFile.revision) || 0;
     }
 
@@ -2724,7 +3784,10 @@ async function resolveSyncConflict(args = {}) {
                 preparedUpload.prepared.syncState,
                 uploadResult.status === 'conflict'
                     ? syncConflictCheckpointOptions(uploadResult, relativePath)
-                    : {}
+                    : preparedUploadCheckpointOptions(
+                        preparedUpload.prepared,
+                        isAttachment ? '/api/sync/attachment' : '/api/sync/file'
+                    )
             );
         }
         return storageUnchanged;
@@ -2755,15 +3818,146 @@ async function resolveSyncConflict(args = {}) {
         };
     }
 
-    const planResponse = await convergeSyncAfterResolution(args);
-    return {
-        ...planResponse,
-        didApply: true,
+    if (options.converge === false) {
+        return {
+            ok: true,
+            status: 'ok',
+            didApply: true,
+            resolution,
+            resolvedPath: relativePath,
+            file: uploadResult.file || uploadResult.attachment,
+            upload: uploadResult,
+            manifest: uploadResult.manifest
+        };
+    }
+    return convergeAppliedSyncConflict(args, {
         resolution,
         resolvedPath: relativePath,
         file: uploadResult.file || uploadResult.attachment,
-        upload: uploadResult,
-        summary: planResponse.summary || summarizePlan(planResponse.plan || {})
+        upload: uploadResult
+    });
+}
+
+function syncBatchConflictItems(batch, convergence) {
+    const items = [
+        ...(Array.isArray(convergence?.conflicts) ? convergence.conflicts : []),
+        ...(Array.isArray(convergence?.plan?.conflicts) ? convergence.plan.conflicts : []),
+        ...batch.resolved.flatMap(({ result }) => (
+            Array.isArray(result?.conflicts) ? result.conflicts : []
+        )),
+        ...batch.failed.flatMap(failure => (
+            Array.isArray(failure.result?.conflicts)
+                ? failure.result.conflicts
+                : [failure.item]
+        )),
+        ...batch.skipped
+    ];
+    const unique = new Map();
+    for (const item of nonSystemPlanItems(items)) {
+        const relativePath = planItemRelativePath(item);
+        if (!relativePath) continue;
+        const type = item.type
+            || (String(relativePath).includes('/.attachments/') ? 'attachment' : 'file');
+        const key = `${type}:${normalizeRelativePath(relativePath)}`;
+        unique.set(key, item);
+    }
+    return [...unique.values()];
+}
+
+async function resolveSyncConflicts(args = {}) {
+    const resolution = String(args.resolution || '').trim();
+    if (!['server', 'local'].includes(resolution)) {
+        throw new Error('일괄 적용할 충돌 버전을 선택하세요.');
+    }
+    const syncRecovery = await rebaseSyncStateIfServerReset(args);
+    if (syncRecovery.rebased) {
+        return {
+            ...localStorageChangedDuringSyncResult({ plan: { conflicts: args.conflicts || [] } }, null, false),
+            conflicts: nonSystemPlanItems(args.conflicts || []),
+            syncRecovery
+        };
+    }
+    const batchItems = [...(Array.isArray(args.conflicts) ? args.conflicts : [])];
+    if (resolution === 'local') {
+        batchItems.sort((left, right) => {
+            const leftAttachment = left?.type === 'attachment'
+                || String(left?.relativePath || '').includes('/.attachments/');
+            const rightAttachment = right?.type === 'attachment'
+                || String(right?.relativePath || '').includes('/.attachments/');
+            return Number(rightAttachment) - Number(leftAttachment);
+        });
+    }
+    const batch = await runSyncConflictBatch({
+        items: batchItems,
+        resolve: item => resolveSyncConflict(
+            { ...args, ...item, resolution },
+            { converge: false, rebase: false }
+        ),
+        shouldStop: (result, error) => (
+            Boolean(syncNetworkErrorKind(error))
+            || result?.status === 'retry'
+        ),
+        converge: () => convergeSyncAfterResolution(args)
+    });
+    const convergence = batch.convergence;
+    const conflicts = syncBatchConflictItems(batch, convergence);
+    const resolved = batch.resolved.map(({ item, result }) => ({
+        relativePath: item.relativePath,
+        type: item.type || '',
+        resolution,
+        status: result?.status || 'ok'
+    }));
+    const failed = batch.failed.map(({ item, result, error }) => ({
+        relativePath: item.relativePath,
+        type: item.type || '',
+        status: result?.status || 'error',
+        error: result?.error
+            || syncNetworkUserMessage(error)
+            || (error instanceof Error ? error.message : '충돌을 적용하지 못했습니다.')
+    }));
+    const skipped = batch.skipped.map(item => ({
+        relativePath: item.relativePath,
+        type: item.type || '',
+        error: '연결 또는 로컬 상태가 안정되지 않아 이번 일괄 적용에서 건너뛰었습니다.'
+    }));
+    const convergenceError = batch.convergenceError;
+    const retryable = batch.stopped
+        || Boolean(convergenceError)
+        || convergence?.status === 'retry';
+    const partial = resolved.length > 0 && (failed.length > 0 || skipped.length > 0 || retryable);
+    const status = retryable
+        ? (partial ? 'partial' : 'retry')
+        : conflicts.length > 0
+            ? (resolved.length > 0 ? 'partial' : 'conflict')
+            : failed.length > 0
+                ? (resolved.length > 0 ? 'partial' : 'error')
+                : 'ok';
+    return {
+        ...(convergence || {}),
+        ok: status === 'ok',
+        status,
+        didApply: resolved.length > 0,
+        retryable,
+        resolution,
+        resolved,
+        failed,
+        skipped,
+        conflicts,
+        error: convergenceError
+            ? syncNetworkUserMessage(convergenceError)
+                || (convergenceError instanceof Error
+                    ? convergenceError.message
+                    : '일괄 적용 결과를 다시 확인해야 합니다.')
+            : retryable
+                ? '연결 또는 로컬 상태가 변경되어 남은 충돌은 적용하지 않았습니다.'
+                : '',
+        summary: {
+            ...(convergence?.summary || summarizePlan(convergence?.plan || {})),
+            conflicts: conflicts.length,
+            resolved: resolved.length,
+            failed: failed.length,
+            skipped: skipped.length
+        }
     };
 }
 
@@ -2827,8 +4021,8 @@ async function runFullSync(args = {}) {
         storagePath,
         () => storageMutationGeneration(storagePath)
     );
-    const syncState = await readSyncState(storagePath);
     const planResponse = await createSyncPlan(args);
+    const syncState = await readSyncState(storagePath);
     const plan = planResponse.plan || {};
 
     if ((plan.conflicts || []).length > 0) {
@@ -2860,7 +4054,7 @@ async function runFullSync(args = {}) {
         const payload = await syncRequest(
             serverUrl,
             `/api/files/${encodeRelativePathForUrl(relativePath)}`,
-            { token }
+            syncDownloadOptions(token, item)
         );
         pendingFileDownloads.push({ item, payload });
     }
@@ -2871,7 +4065,7 @@ async function runFullSync(args = {}) {
         const payload = await syncRequest(
             serverUrl,
             `/api/attachments/${encodeRelativePathForUrl(relativePath)}`,
-            { token }
+            syncDownloadOptions(token, item)
         );
         pendingAttachmentDownloads.push({ item, payload });
     }
@@ -2927,7 +4121,14 @@ async function runFullSync(args = {}) {
         const checkpointed = await runStorageOperation(storagePath, async () => {
             const storageUnchanged = storageMutationGeneration(storagePath) === expectedStorageGeneration;
             const previousState = await readSyncState(storagePath);
-            await writeSyncStateFromManifest(storagePath, latestManifest, previousState);
+            await writeSyncStateFromManifest(storagePath, latestManifest, previousState, {
+                acceptPaths: [
+                    ...pendingFileDownloads.map(({ item }) => planItemRelativePath(item)),
+                    ...pendingAttachmentDownloads.map(({ item }) => planItemRelativePath(item)),
+                    ...(plan.deleteLocalFiles || []).map(item => planItemRelativePath(item)),
+                    ...(plan.deleteLocalAttachments || []).map(item => planItemRelativePath(item))
+                ].filter(Boolean)
+            });
             return storageUnchanged;
         });
         if (!checkpointed) {
@@ -2971,8 +4172,18 @@ async function runFullSync(args = {}) {
                     result.manifest,
                     staged.prepared.syncState,
                     conflictCheckpointPaths.size > 0
-                        ? { preservePaths: [...conflictCheckpointPaths], preserveMetadata: true }
-                        : {}
+                        ? {
+                            preservePaths: [...conflictCheckpointPaths],
+                            preserveMetadata: true,
+                            ...(result.status === 'conflict'
+                                ? {}
+                                : preparedUploadCheckpointOptions(staged.prepared, endpoint))
+                        }
+                        : (
+                            result.status === 'conflict'
+                                ? {}
+                                : preparedUploadCheckpointOptions(staged.prepared, endpoint)
+                        )
                 );
             }
             return storageUnchanged;
@@ -3288,6 +4499,14 @@ function registerSyncHandlers() {
             );
         } catch (error) {
             return syncError(error, '충돌을 적용하지 못했습니다.');
+        }
+    });
+
+    ipcMain.handle('notedown:sync:resolve-conflicts', async (_event, args = {}) => {
+        try {
+            return await runSyncOperation(args, () => resolveSyncConflicts(args));
+        } catch (error) {
+            return syncError(error, '선택한 충돌을 일괄 적용하지 못했습니다.');
         }
     });
 }
@@ -3996,7 +5215,10 @@ if (!hasSingleInstanceLock) {
         registerStorageHandlers();
         registerSyncHandlers();
         registerPdfHandlers();
-        const startHidden = appPreferences.keepInBackgroundOnClose && appPreferences.launchAtStartup && launchedAsHiddenLoginItem();
+        const startHidden = shouldStartHiddenLoginItem(
+            appPreferences,
+            launchedAsHiddenLoginItem()
+        );
         await createWindow({ show: !startHidden });
         if (startHidden && process.platform === 'darwin' && app.dock) app.dock.hide();
 

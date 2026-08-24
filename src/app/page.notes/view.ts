@@ -224,6 +224,7 @@ export class Component implements OnInit, OnDestroy {
     public hasUnsavedChanges = false;
     public saveBusy = false;
     public syncConflicts: SyncConflict[] = [];
+    public selectedSyncConflictKeys = new Set<string>();
     public selectedSyncConflictIndex = 0;
     public syncConflictDetail: SyncConflictDetail | null = null;
     public syncConflictBusy = false;
@@ -1300,6 +1301,46 @@ export class Component implements OnInit, OnDestroy {
         return this.syncConflicts[this.selectedSyncConflictIndex] || this.syncConflicts[0] || null;
     }
 
+    public syncConflictKey(conflict: SyncConflict) {
+        const type = conflict.type
+            || (conflict.relativePath.includes('/.attachments/') ? 'attachment' : 'file');
+        return `${type}:${conflict.relativePath}`;
+    }
+
+    public isSyncConflictChecked(conflict: SyncConflict) {
+        return this.selectedSyncConflictKeys.has(this.syncConflictKey(conflict));
+    }
+
+    public selectedSyncConflictCount() {
+        return this.syncConflicts.filter(conflict => this.isSyncConflictChecked(conflict)).length;
+    }
+
+    public allSyncConflictsSelected() {
+        return this.syncConflicts.length > 0
+            && this.selectedSyncConflictCount() === this.syncConflicts.length;
+    }
+
+    public toggleSyncConflictSelection(conflict: SyncConflict, event?: Event) {
+        event?.stopPropagation();
+        const key = this.syncConflictKey(conflict);
+        if (this.selectedSyncConflictKeys.has(key)) this.selectedSyncConflictKeys.delete(key);
+        else this.selectedSyncConflictKeys.add(key);
+        this.syncConflictResolveMessage = '';
+        this.requestViewUpdate();
+    }
+
+    public toggleAllSyncConflicts() {
+        if (this.allSyncConflictsSelected()) {
+            this.selectedSyncConflictKeys.clear();
+        } else {
+            this.selectedSyncConflictKeys = new Set(
+                this.syncConflicts.map(conflict => this.syncConflictKey(conflict))
+            );
+        }
+        this.syncConflictResolveMessage = '';
+        this.requestViewUpdate();
+    }
+
     public selectSyncConflict(index: number) {
         if (index < 0 || index >= this.syncConflicts.length) return;
         this.selectedSyncConflictIndex = index;
@@ -1311,7 +1352,7 @@ export class Component implements OnInit, OnDestroy {
     }
 
     public syncConflictButtonClass(index: number) {
-        const base = 'flex w-full min-w-0 items-center justify-between gap-2 rounded-md px-2.5 py-2 text-left text-[12px] font-medium transition-colors';
+        const base = 'flex min-w-0 flex-1 items-center justify-between gap-2 rounded-md px-2.5 py-2 text-left text-[12px] font-medium transition-colors';
         if (this.selectedSyncConflictIndex === index) return `${base} bg-amber-100 text-amber-950 dark:bg-amber-500/25 dark:text-amber-100`;
         return `${base} text-stone-600 hover:bg-stone-100 hover:text-stone-950 dark:text-zinc-300 dark:hover:bg-zinc-800 dark:hover:text-zinc-50`;
     }
@@ -1326,6 +1367,7 @@ export class Component implements OnInit, OnDestroy {
         if (reason === 'same_path_without_sync_history') return '동기화 이력이 없는 같은 경로의 파일이 서버와 로컬에 모두 있습니다.';
         if (reason === 'server_file_changed_after_client_delete') return '로컬에서 삭제한 뒤 다른 기기에서 문서가 변경되었습니다.';
         if (reason === 'server_attachment_changed_after_client_delete') return '로컬에서 삭제한 뒤 다른 기기에서 첨부 파일이 변경되었습니다.';
+        if (reason === 'server_changed_during_conflict_resolution') return '적용 중 다른 기기에서 서버 버전이 다시 변경되었습니다.';
         if (reason === 'conflict') return '서버와 로컬 버전이 충돌했습니다.';
         return reason || '서버와 로컬 버전을 수동으로 비교해야 합니다.';
     }
@@ -1376,31 +1418,24 @@ export class Component implements OnInit, OnDestroy {
 
         try {
             const result = await api.resolveConflict(this.syncPayload({
-                relativePath,
-                type: conflict.type || '',
-                resolution: this.syncConflictResolveChoice,
-                localDeleted: conflict.localDeleted === true || this.syncConflictDetail?.localDeleted === true,
-                clientDeleted: conflict.clientDeleted === true,
-                serverRevision: this.syncConflictServerRevision(conflict),
-                serverFile: conflict.serverFile || this.syncConflictDetail?.serverFile || null,
-                serverAttachment: conflict.serverAttachment || null,
-                serverAttachmentMetadata: conflict.serverAttachmentMetadata || null,
-                clientAttachment: conflict.clientAttachment || null,
-                clientNote: conflict.clientNote || null,
-                noteRelativePath: conflict.serverAttachmentMetadata?.noteRelativePath || conflict.clientAttachment?.noteRelativePath || '',
-                serverNote: conflict.serverNote || null,
-                serverWorkspace: conflict.serverWorkspace || null
+                ...this.syncConflictResolutionPayload(conflict, this.syncConflictDetail),
+                resolution: this.syncConflictResolveChoice
             }));
 
             if (!result?.didApply && !result?.ok) {
                 this.setSyncConflictResolveMessage(result?.error || '충돌을 적용하지 못했습니다.', 'error');
-                if (result?.status === 'conflict' || result?.conflicts?.length) this.storeStartupSyncResult(result);
+                if (result?.status === 'conflict' || result?.conflicts?.length) {
+                    this.storeStartupSyncResult(this.retainUnresolvedSyncConflicts(result));
+                }
                 return;
             }
 
             if (result?.status === 'retry' || result?.status === 'error') {
                 if (result?.didApply) await this.reloadNotesAfterSyncResolution();
-                this.storeStartupSyncResult(result);
+                this.storeStartupSyncResult(this.retainUnresolvedSyncConflicts(
+                    result,
+                    result?.didApply ? [relativePath] : []
+                ));
                 this.setSyncConflictResolveMessage(
                     result?.error || '충돌은 적용했지만 최신 상태 확인이 필요합니다. 다시 동기화해 주세요.',
                     result?.status === 'retry' ? 'warning' : 'error'
@@ -1409,8 +1444,8 @@ export class Component implements OnInit, OnDestroy {
             }
 
             await this.reloadNotesAfterSyncResolution();
-            this.storeStartupSyncResult(result);
-            const remaining = this.startupSyncConflictCount(result);
+            this.storeStartupSyncResult(this.retainUnresolvedSyncConflicts(result, [relativePath]));
+            const remaining = this.syncConflicts.length;
             this.setSyncConflictResolveMessage(
                 remaining > 0 ? `선택한 충돌을 적용했습니다. 남은 충돌 ${remaining}건` : '선택한 충돌을 적용하고 동기화했습니다.',
                 remaining > 0 ? 'warning' : 'success'
@@ -1423,10 +1458,74 @@ export class Component implements OnInit, OnDestroy {
         }
     }
 
+    public async resolveCheckedSyncConflicts(resolution: SyncConflictResolution) {
+        const conflicts = this.syncConflicts.filter(conflict => this.isSyncConflictChecked(conflict));
+        const api = this.syncApi();
+        if (conflicts.length === 0 || this.syncConflictResolveBusy) return;
+        if (!api?.resolveConflicts) {
+            this.setSyncConflictResolveMessage('충돌 일괄 적용은 최신 Electron 앱에서 사용할 수 있습니다.', 'warning');
+            return;
+        }
+
+        this.syncConflictResolveBusy = true;
+        this.setSyncConflictResolveMessage(
+            `${conflicts.length}개 충돌을 ${resolution === 'server' ? '서버' : '로컬'} 기준으로 적용하는 중입니다...`,
+            'info'
+        );
+        try {
+            const result = await api.resolveConflicts(this.syncPayload({
+                resolution,
+                conflicts: conflicts.map(conflict => this.syncConflictResolutionPayload(conflict))
+            }));
+            if (result?.didApply) await this.reloadNotesAfterSyncResolution();
+            const resolvedPaths = (Array.isArray(result?.resolved) ? result.resolved : [])
+                .map((item: any) => String(item?.relativePath || ''))
+                .filter(Boolean);
+            this.storeStartupSyncResult(this.retainUnresolvedSyncConflicts(result, resolvedPaths));
+            const unresolvedPaths = new Set([
+                ...(Array.isArray(result?.failed) ? result.failed : []),
+                ...(Array.isArray(result?.skipped) ? result.skipped : [])
+            ].map((item: any) => String(item?.relativePath || '')).filter(Boolean));
+            for (const conflict of this.syncConflicts) {
+                if (unresolvedPaths.has(conflict.relativePath)) {
+                    this.selectedSyncConflictKeys.add(this.syncConflictKey(conflict));
+                }
+            }
+            const resolved = Number(result?.resolved?.length) || 0;
+            const failed = (Number(result?.failed?.length) || 0) + (Number(result?.skipped?.length) || 0);
+            const remaining = this.syncConflicts.length;
+            if (failed > 0 || result?.status === 'partial' || result?.status === 'retry') {
+                this.setSyncConflictResolveMessage(
+                    `${resolved}개 적용, ${failed || remaining}개 보류. 보류 항목은 선택 상태로 남겼습니다.`,
+                    resolved > 0 ? 'warning' : 'error'
+                );
+                return;
+            }
+            this.setSyncConflictResolveMessage(
+                remaining > 0
+                    ? `${resolved}개를 적용했습니다. 남은 충돌 ${remaining}건`
+                    : `${resolved}개 충돌을 모두 적용했습니다.`,
+                remaining > 0 ? 'warning' : 'success'
+            );
+        } catch (error) {
+            this.setSyncConflictResolveMessage(
+                this.errorMessage(error, '선택한 충돌을 일괄 적용하지 못했습니다.'),
+                'error'
+            );
+        } finally {
+            this.syncConflictResolveBusy = false;
+            this.renderSyncConflictDiffSoon();
+            this.requestViewUpdate();
+        }
+    }
+
     public syncConflictServerText() {
         const conflict = this.selectedSyncConflict();
         if (!conflict) return '';
         if (this.syncConflictBusy) return '서버 파일을 불러오는 중입니다...';
+        if (conflict.serverFile?.deleted === true || conflict.serverAttachment?.deleted === true) {
+            return '서버에서 삭제된 항목입니다.\n\n서버 선택 시 로컬 문서와 연결된 첨부 파일을 함께 정리합니다.';
+        }
         if (this.syncConflictDetail?.serverError) return `서버 파일을 읽지 못했습니다.\n\n${this.syncConflictDetail.serverError}`;
         if (typeof this.syncConflictDetail?.serverContent === 'string') return this.syncConflictDetail.serverContent;
         return JSON.stringify(conflict.serverNote || conflict.serverFile || {}, null, 2);
@@ -2057,9 +2156,29 @@ export class Component implements OnInit, OnDestroy {
             const relativePath = item?.relativePath || item?.serverFile?.relativePath || '';
             if (!relativePath) continue;
             if (this.isSystemSyncPath(relativePath)) continue;
-            conflicts.set(`${relativePath}:${item.reason || item.status || ''}`, this.compactSyncConflict(item));
+            const type = item.type || (relativePath.includes('/.attachments/') ? 'attachment' : 'file');
+            conflicts.set(`${type}:${relativePath}`, this.compactSyncConflict(item));
         }
         return Array.from(conflicts.values());
+    }
+
+    private retainUnresolvedSyncConflicts(result: any, resolvedPaths: string[] = []) {
+        const resolved = new Set(resolvedPaths.map(value => String(value || '')).filter(Boolean));
+        const remaining = this.syncConflicts.filter(conflict => !resolved.has(conflict.relativePath));
+        const explicit = this.extractSyncConflicts(result);
+        const unique = new Map<string, SyncConflict>();
+        for (const conflict of [...remaining, ...explicit] as SyncConflict[]) {
+            unique.set(this.syncConflictKey(conflict), conflict);
+        }
+        const conflicts = [...unique.values()];
+        return {
+            ...result,
+            conflicts,
+            summary: {
+                ...(result?.summary || {}),
+                conflicts: conflicts.length
+            }
+        };
     }
 
     private isSystemSyncPath(relativePath: string) {
@@ -2102,6 +2221,10 @@ export class Component implements OnInit, OnDestroy {
         }
 
         this.syncConflicts = conflicts;
+        const availableKeys = new Set(conflicts.map(conflict => this.syncConflictKey(conflict)));
+        this.selectedSyncConflictKeys = new Set(
+            [...this.selectedSyncConflictKeys].filter(key => availableKeys.has(key))
+        );
         if (this.selectedSyncConflictIndex >= this.syncConflicts.length) this.selectedSyncConflictIndex = 0;
         this.syncConflictDetail = null;
         this.syncConflictDiffReady = false;
@@ -2113,6 +2236,7 @@ export class Component implements OnInit, OnDestroy {
     private clearSyncConflictViewer() {
         if (this.syncConflicts.length === 0) return;
         this.syncConflicts = [];
+        this.selectedSyncConflictKeys.clear();
         this.selectedSyncConflictIndex = 0;
         this.syncConflictDetail = null;
         this.syncConflictBusy = false;
@@ -2140,12 +2264,39 @@ export class Component implements OnInit, OnDestroy {
             || 0;
     }
 
-    private syncConflictServerRevision(conflict = this.selectedSyncConflict()) {
+    private syncConflictServerRevision(
+        conflict = this.selectedSyncConflict(),
+        detail: SyncConflictDetail | null = null
+    ) {
         return Number(conflict?.serverRevision)
             || Number(conflict?.serverFile?.revision)
             || Number(conflict?.serverAttachment?.revision)
-            || Number(this.syncConflictDetail?.serverFile?.revision)
+            || Number(detail?.serverFile?.revision)
             || 0;
+    }
+
+    private syncConflictResolutionPayload(
+        conflict: SyncConflict,
+        detail: SyncConflictDetail | null = null
+    ) {
+        return {
+            relativePath: conflict.relativePath,
+            type: conflict.type || '',
+            reason: conflict.reason || '',
+            localDeleted: conflict.localDeleted === true || detail?.localDeleted === true,
+            clientDeleted: conflict.clientDeleted === true,
+            serverRevision: this.syncConflictServerRevision(conflict, detail),
+            serverFile: conflict.serverFile || detail?.serverFile || null,
+            serverAttachment: conflict.serverAttachment || null,
+            serverAttachmentMetadata: conflict.serverAttachmentMetadata || null,
+            clientAttachment: conflict.clientAttachment || null,
+            clientNote: conflict.clientNote || null,
+            noteRelativePath: conflict.serverAttachmentMetadata?.noteRelativePath
+                || conflict.clientAttachment?.noteRelativePath
+                || '',
+            serverNote: conflict.serverNote || null,
+            serverWorkspace: conflict.serverWorkspace || null
+        };
     }
 
     private setSyncConflictResolveMessage(message: string, tone: SyncConflictResolveTone) {

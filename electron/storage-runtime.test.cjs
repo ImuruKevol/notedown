@@ -95,6 +95,43 @@ test('storage identity reuses canonical storagePath by note id', () => {
     assert.equal(prepared.note.body, 'changed');
 });
 
+test('storage identity accepts a stale UI id alias after sync identity rebasing', () => {
+    const normalizeRelativePath = value => String(value);
+    const relativePathForNote = note => note.relativePath;
+    const previous = [{
+        id: 'server-note-id',
+        syncIdentityAliases: ['local-note-id'],
+        relativePath: 'memo/server-note.md',
+        storagePath: '메모/문서.md',
+        attachments: [{
+            id: 'server-attachment-id',
+            syncIdentityAliases: ['local-attachment-id'],
+            relativePath: 'memo/.attachments/server-note/image.png',
+            storagePath: '메모/attachments/문서/image.png',
+            noteRelativePath: 'memo/server-note.md'
+        }]
+    }];
+    const [prepared] = prepareNoteStorageIdentities([{
+        id: 'local-note-id',
+        relativePath: '메모/문서.md',
+        storagePath: '메모/문서.md',
+        attachments: [{
+            id: 'local-attachment-id',
+            relativePath: '메모/attachments/문서/image.png',
+            storagePath: '메모/attachments/문서/image.png'
+        }]
+    }], previous, { normalizeRelativePath, relativePathForNote });
+
+    assert.equal(prepared.note.id, 'server-note-id');
+    assert.equal(prepared.relativePath, 'memo/server-note.md');
+    assert.equal(prepared.note.storagePath, '메모/문서.md');
+    assert.equal(prepared.note.attachments[0].id, 'server-attachment-id');
+    assert.equal(
+        prepared.note.attachments[0].relativePath,
+        'memo/.attachments/server-note/image.png'
+    );
+});
+
 test('storage identity rejects duplicate ids and logical paths before writes', () => {
     const normalizeRelativePath = value => String(value);
     const relativePathForNote = note => note.relativePath;

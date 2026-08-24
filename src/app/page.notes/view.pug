@@ -147,11 +147,24 @@ section(class="flex h-full min-h-0 flex-col bg-white text-stone-950 dark:bg-zinc
                             button(type="button", [class]="syncConflictResolveChoiceButtonClass('server')", (click)="setSyncConflictResolveChoice('server')") 서버 버전 사용
                             button(type="button", [class]="syncConflictResolveChoiceButtonClass('local')", (click)="setSyncConflictResolveChoice('local')") {{selectedSyncConflict()?.localDeleted || syncConflictDetail?.localDeleted ? '로컬 삭제 유지' : '로컬 버전 사용'}}
                         button(type="button", [class]="syncConflictApplyButtonClass()", (click)="resolveSelectedSyncConflict()", [disabled]="syncConflictResolveBusy || syncConflictBusy || !selectedSyncConflict()?.relativePath", [attr.aria-busy]="syncConflictResolveBusy") {{syncConflictResolveBusy ? '적용 중...' : '선택 버전 적용'}}
+                div(*ngIf="selectedSyncConflictCount() > 0", class="flex shrink-0 flex-wrap items-center justify-between gap-2 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 dark:border-amber-500/25 dark:bg-amber-500/10")
+                    p(class="text-[12px] font-semibold text-amber-900 dark:text-amber-100") {{selectedSyncConflictCount()}}개 충돌 선택됨
+                    div(class="flex flex-wrap items-center gap-2")
+                        button(type="button", class="h-8 rounded-md border border-amber-300 bg-white px-3 text-[12px] font-semibold text-amber-900 transition hover:bg-amber-100 disabled:cursor-not-allowed disabled:opacity-50 dark:border-amber-500/40 dark:bg-zinc-900 dark:text-amber-100 dark:hover:bg-amber-500/20", (click)="resolveCheckedSyncConflicts('server')", [disabled]="syncConflictResolveBusy || syncConflictBusy") 선택 항목 서버 기준 적용
+                        button(type="button", class="h-8 rounded-md bg-amber-500 px-3 text-[12px] font-semibold text-white transition hover:bg-amber-600 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-amber-400 dark:text-zinc-950 dark:hover:bg-amber-300", (click)="resolveCheckedSyncConflicts('local')", [disabled]="syncConflictResolveBusy || syncConflictBusy") 선택 항목 로컬 기준 적용
                 div(class="grid min-h-0 flex-1 overflow-hidden gap-3 lg:grid-cols-[260px_minmax(0,1fr)]")
                     nav(class="h-full min-h-0 space-y-1 overflow-y-auto rounded-md border border-stone-200 bg-stone-50/80 p-1.5 dark:border-zinc-800 dark:bg-zinc-900/60")
-                        button(type="button", *ngFor="let conflict of syncConflicts; let i = index", [class]="syncConflictButtonClass(i)", (click)="selectSyncConflict(i)")
-                            span(class="min-w-0 truncate") {{syncConflictPathLabel(conflict)}}
-                            span(class="shrink-0 text-[11px] tabular-nums") {{'#' + (i + 1)}}
+                        div(class="flex items-center justify-between gap-2 border-b border-stone-200 px-1.5 pb-1.5 dark:border-zinc-800")
+                            button(type="button", class="h-7 rounded px-2 text-[11px] font-semibold text-stone-600 transition hover:bg-white hover:text-stone-950 dark:text-zinc-300 dark:hover:bg-zinc-800 dark:hover:text-zinc-50", (click)="toggleAllSyncConflicts()") {{allSyncConflictsSelected() ? '전체 선택 해제' : '전체 선택'}}
+                            span(class="text-[11px] tabular-nums text-stone-400 dark:text-zinc-500") {{selectedSyncConflictCount()}} / {{syncConflicts.length}}
+                        div(*ngFor="let conflict of syncConflicts; let i = index", class="flex min-w-0 items-center gap-1")
+                            button(type="button", class="flex size-8 shrink-0 items-center justify-center rounded-md text-stone-400 transition hover:bg-white hover:text-amber-700 dark:text-zinc-500 dark:hover:bg-zinc-800 dark:hover:text-amber-300", [attr.aria-label]="syncConflictPathLabel(conflict) + ' 선택'", [attr.aria-pressed]="isSyncConflictChecked(conflict)", (click)="toggleSyncConflictSelection(conflict, $event)")
+                                span([class]="isSyncConflictChecked(conflict) ? 'flex size-4 items-center justify-center rounded border border-amber-500 bg-amber-500 text-white dark:border-amber-300 dark:bg-amber-300 dark:text-zinc-950' : 'block size-4 rounded border border-stone-300 bg-white dark:border-zinc-600 dark:bg-zinc-900'")
+                                    svg(*ngIf="isSyncConflictChecked(conflict)", xmlns="http://www.w3.org/2000/svg", viewBox="0 0 24 24", fill="none", stroke="currentColor", stroke-width="2.5", stroke-linecap="round", stroke-linejoin="round", class="size-3")
+                                        path(d="m5 12 4 4L19 6")
+                            button(type="button", [class]="syncConflictButtonClass(i)", (click)="selectSyncConflict(i)")
+                                span(class="min-w-0 truncate") {{syncConflictPathLabel(conflict)}}
+                                span(class="shrink-0 text-[11px] tabular-nums") {{'#' + (i + 1)}}
                     div(class="flex min-h-0 min-w-0 flex-col overflow-hidden rounded-md border border-stone-200 bg-white dark:border-zinc-800 dark:bg-zinc-950")
                         div(class="grid shrink-0 border-b border-stone-200 text-[12px] font-semibold text-stone-600 dark:border-zinc-800 dark:text-zinc-300 lg:grid-cols-2")
                             div(class="border-b border-stone-200 px-3 py-2 dark:border-zinc-800 lg:border-b-0 lg:border-r") 서버 버전

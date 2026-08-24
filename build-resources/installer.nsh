@@ -45,6 +45,11 @@ Var NotedownLaunchAtStartupCheckbox
 !macro customInstall
   ${If} $NotedownIsUpdate != "true"
     Call NotedownWriteInstallerSettings
+    ${If} $NotedownLaunchAtStartup == "true"
+      WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "Notedown" '$\"$INSTDIR\Notedown.exe$\" --notedown-start-hidden'
+    ${Else}
+      DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "Notedown"
+    ${EndIf}
   ${EndIf}
 !macroend
 
@@ -139,3 +144,7 @@ Function NotedownWriteInstallerSettings
   WriteINIStr "$APPDATA\Notedown\installer-settings.ini" "settings" "tabSize" "2"
 FunctionEnd
 !endif
+
+!macro customUnInstall
+  DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "Notedown"
+!macroend

@@ -139,3 +139,8 @@
 | 2026-08-19 | 001 | 다중 기기 동기화 및 삭제 충돌 수렴 로직 보강 | [상세](devlog/2026-08-19/001-sync-convergence-delete-conflict-hardening.md) |
 | 2026-08-19 | 002 | Android 제거 및 자동 동기화·다중 기기 충돌 기준 보강 | [상세](devlog/2026-08-19/002-remove-android-focus-sync-audit.md) |
 | 2026-08-19 | 003 | Notedown 0.2.5 데스크톱 릴리스 | [상세](devlog/2026-08-19/003-release-0-2-5.md) |
+| 2026-08-19 | 004 | Notedown 0.2.5 Electron 멀티플랫폼 설치 파일 빌드 | [상세](devlog/2026-08-19/004-build-electron-0-2-5.md) |
+| 2026-08-24 | 001 | 서버 리비전 역전 복구 및 오인 삭제·반복 충돌 방지 | [상세](devlog/2026-08-24/001-sync-revision-reset-delete-conflict-recovery.md) |
+| 2026-08-24 | 002 | 오프라인·저속 동기화 복구 및 Windows startup 보강 | [상세](devlog/2026-08-24/002-sync-network-windows-startup-hardening.md) |
+| 2026-08-24 | 003 | 다중 기기 기준선 보호 및 충돌 일괄 해결 UX | [상세](devlog/2026-08-24/003-multi-device-bulk-conflict-resolution.md) |
+| 2026-08-24 | 004 | Notedown 0.2.6 데스크톱 안정화 릴리스 | [상세](devlog/2026-08-24/004-release-0-2-6.md) |

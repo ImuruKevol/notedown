@@ -45,7 +45,8 @@ contextBridge.exposeInMainWorld('notedown', {
         runFull: (payload) => ipcRenderer.invoke('notedown:sync:run-full', payload),
         uploadNote: (payload) => ipcRenderer.invoke('notedown:sync:upload-note', payload),
         readFile: (payload) => ipcRenderer.invoke('notedown:sync:read-file', payload),
-        resolveConflict: (payload) => ipcRenderer.invoke('notedown:sync:resolve-conflict', payload)
+        resolveConflict: (payload) => ipcRenderer.invoke('notedown:sync:resolve-conflict', payload),
+        resolveConflicts: (payload) => ipcRenderer.invoke('notedown:sync:resolve-conflicts', payload)
     },
     pdf: {
         saveNote: (payload) => ipcRenderer.invoke('notedown:pdf:save-note', payload)

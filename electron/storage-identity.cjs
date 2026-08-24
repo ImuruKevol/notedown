@@ -4,6 +4,19 @@ function normalizedOptional(value, normalizeRelativePath) {
     return value ? normalizeRelativePath(value) : '';
 }
 
+function identityAliases(value = {}) {
+    return Array.isArray(value.syncIdentityAliases)
+        ? value.syncIdentityAliases.map(alias => String(alias || '').trim()).filter(Boolean)
+        : [];
+}
+
+function identityMatches(value, requestedId) {
+    const id = String(requestedId || '').trim();
+    if (!id) return false;
+    return String(value?.id || value?.attachmentId || '').trim() === id
+        || identityAliases(value).includes(id);
+}
+
 function putPreviousIdentity(map, key, value, message) {
     if (!key) return;
     const previous = map.get(key);
@@ -23,6 +36,9 @@ function indexPreviousNoteIdentities(previousNotes = [], normalizeRelativePath) 
         const storagePath = normalizedOptional(note.storagePath || relativePath, normalizeRelativePath);
 
         putPreviousIdentity(byId, id, note, '기존 메타데이터에 중복 노트 ID가 있습니다');
+        for (const alias of identityAliases(note)) {
+            putPreviousIdentity(byId, alias, note, '기존 메타데이터에 중복 노트 ID 별칭이 있습니다');
+        }
         putPreviousIdentity(byRelativePath, relativePath, note, '기존 메타데이터에 중복 노트 경로가 있습니다');
         putPreviousIdentity(byStoragePath, storagePath, note, '기존 메타데이터에 중복 실제 노트 경로가 있습니다');
     }
@@ -50,6 +66,9 @@ function indexPreviousAttachmentIdentities(previousNotes = [], normalizeRelative
                 noteRelativePath: normalizedOptional(attachment.noteRelativePath || noteRelativePath, normalizeRelativePath)
             };
             putPreviousIdentity(byId, identity.id, identity, '기존 메타데이터에 중복 첨부 ID가 있습니다');
+            for (const alias of identityAliases(attachment)) {
+                putPreviousIdentity(byId, alias, identity, '기존 메타데이터에 중복 첨부 ID 별칭이 있습니다');
+            }
             putPreviousIdentity(byRelativePath, identity.relativePath, identity, '기존 메타데이터에 중복 첨부 경로가 있습니다');
             putPreviousIdentity(byStoragePath, identity.storagePath, identity, '기존 메타데이터에 중복 실제 첨부 경로가 있습니다');
             all.push(identity);
@@ -74,20 +93,26 @@ function prepareAttachmentStorageIdentities(
         const requestedRelativePath = normalizedOptional(attachment?.relativePath, normalizeRelativePath);
         if (!requestedRelativePath) throw new Error('첨부 경로가 비어 있습니다.');
         const requestedId = String(attachment?.id || attachment?.attachmentId || '').trim();
+        const requestedStoragePath = normalizedOptional(attachment?.storagePath, normalizeRelativePath);
         const existingById = requestedId ? previousAttachments.byId.get(requestedId) || null : null;
         const existingByRelativePath = previousAttachments.byRelativePath.get(requestedRelativePath) || null;
 
         if (existingById && existingByRelativePath && existingById !== existingByRelativePath) {
             throw new Error(`첨부 ID와 경로가 서로 다른 기존 첨부를 가리킵니다: ${requestedRelativePath}`);
         }
-        if (existingById && existingById.relativePath !== requestedRelativePath) {
+        if (
+            existingById
+            && existingById.relativePath !== requestedRelativePath
+            && !identityAliases(existingById.attachment).includes(requestedId)
+            && (!requestedStoragePath || requestedStoragePath !== existingById.storagePath)
+        ) {
             throw new Error(`첨부 ID가 다른 경로에 연결되어 있습니다: ${requestedId}`);
         }
         if (
             existingByRelativePath
             && requestedId
             && existingByRelativePath.id
-            && existingByRelativePath.id !== requestedId
+            && !identityMatches(existingByRelativePath.attachment, requestedId)
         ) {
             throw new Error(`첨부 경로가 다른 ID에 연결되어 있습니다: ${requestedRelativePath}`);
         }
@@ -101,8 +126,8 @@ function prepareAttachmentStorageIdentities(
         }
         if (existing) matchedExisting.add(existing);
 
-        const id = requestedId || existing?.id || '';
-        const requestedStoragePath = normalizedOptional(attachment?.storagePath, normalizeRelativePath);
+        const id = existing?.id || requestedId || '';
+        const relativePath = existing?.relativePath || requestedRelativePath;
         const existingStoragePath = existing?.storagePath || '';
         if (existing && requestedStoragePath && existingStoragePath && requestedStoragePath !== existingStoragePath) {
             throw new Error(`첨부 실제 저장 경로가 기존 메타데이터와 다릅니다: ${requestedRelativePath}`);
@@ -122,11 +147,11 @@ function prepareAttachmentStorageIdentities(
             throw new Error(`기존 첨부가 다른 노트 경로에 연결되어 있습니다: ${requestedRelativePath}`);
         }
 
-        registerPreparedAttachmentIdentity(id, requestedRelativePath, storagePath, seen, noteStoragePaths);
+        registerPreparedAttachmentIdentity(id, relativePath, storagePath, seen, noteStoragePaths);
         const merged = {
             ...(existing?.attachment || {}),
             ...attachment,
-            relativePath: requestedRelativePath,
+            relativePath,
             storagePath,
             noteRelativePath
         };
@@ -214,8 +239,9 @@ function selectMissingPreviousNotes(
 
     return (previousNotes || []).filter(note => {
         const id = String(note?.id || '').trim();
-        if (id && deletedIds.has(id)) return false;
-        if (id && incomingIds.has(id)) return false;
+        const aliases = identityAliases(note);
+        if ((id && deletedIds.has(id)) || aliases.some(alias => deletedIds.has(alias))) return false;
+        if ((id && incomingIds.has(id)) || aliases.some(alias => incomingIds.has(alias))) return false;
         const relativePath = normalizedOptional(note?.relativePath, normalizeRelativePath);
         return !relativePath || !incomingRelativePaths.has(relativePath);
     });
@@ -250,20 +276,21 @@ function prepareNoteStorageIdentities(notes = [], previousNotes = [], helpers = 
     };
 
     const preparedNotes = (notes || []).map(note => {
-        const id = String(note?.id || '').trim();
-        if (!id) throw new Error('노트 ID가 비어 있습니다.');
-        if (seenIds.has(id)) throw new Error(`중복 노트 ID가 있습니다: ${id}`);
+        const requestedId = String(note?.id || '').trim();
+        if (!requestedId) throw new Error('노트 ID가 비어 있습니다.');
 
         const requestedRelativePath = normalizeRelativePath(relativePathForNote(note));
-        const existingById = previous.byId.get(id) || null;
+        const existingById = previous.byId.get(requestedId) || null;
         const existingByRelativePath = previous.byRelativePath.get(requestedRelativePath) || null;
         if (existingById && existingByRelativePath && existingById !== existingByRelativePath) {
             throw new Error(`노트 ID와 경로가 서로 다른 기존 노트를 가리킵니다: ${requestedRelativePath}`);
         }
-        if (existingByRelativePath && String(existingByRelativePath.id || '').trim() !== id) {
+        if (existingByRelativePath && !identityMatches(existingByRelativePath, requestedId)) {
             throw new Error(`노트 경로가 다른 ID에 연결되어 있습니다: ${requestedRelativePath}`);
         }
         const existing = existingById || existingByRelativePath;
+        const id = String(existing?.id || requestedId).trim();
+        if (seenIds.has(id)) throw new Error(`중복 노트 ID가 있습니다: ${id}`);
         const relativePath = existing?.relativePath
             ? normalizeRelativePath(existing.relativePath)
             : requestedRelativePath;
@@ -331,6 +358,7 @@ function prepareNoteStorageIdentities(notes = [], previousNotes = [], helpers = 
 }
 
 module.exports = {
+    identityMatches,
     indexPreviousNoteIdentities,
     indexPreviousAttachmentIdentities,
     prepareNoteStorageIdentities,
